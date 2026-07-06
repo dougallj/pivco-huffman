@@ -6,7 +6,19 @@
  * which led to silent drift (scalar+NEON added the FSE marker byte in
  * 2026-05-13, x86+AVX-512 didn't — broke scalar↔SSE cross-decoding).
  *
- * Wire format (v0.5+):
+ * Wire format (v0.6 — post-order records, pre-order splits; branch
+ * postorder-bitmaps, 2026-07-02):
+ *
+ * Strictly, the layout is an Euler-tour hybrid, not pure post-order:
+ * each node's bytes land in two places — the K_right varint at its
+ * PRE-order position (on the way down; forward parsing of
+ * variable-size regions requires sizing information in prefix
+ * position), and the marker+bitmap record (the bulk) at its POST-order
+ * position (on the way up, where the merge consumes it).  A pure
+ * post-order stream would need every subtree region to be
+ * self-delimiting, i.e. a length at every terminal instead of one per
+ * recursion site — more slots, plus explicit zero-lengths for symbols
+ * absent from a block.
  *
  * Per-block header (once, at the very start of each encoded block):
  *   [block_N: uint16 LE, 2 bytes]                  symbol count N for this
@@ -17,8 +29,13 @@
  *                                                  65535 — no longer pinned
  *                                                  to PIVCO_BLOCK_SIZE.
  *
- * Per non-flat internal node:
- *   [optional K_right_header: uint16 LE, 2 bytes]   if kr_header_needed()
+ * Per non-flat internal node — the node's record comes AFTER its
+ * children's regions:
+ *
+ *   [optional K_right: LEB128 varint, 1-3 bytes]   if kr_header_needed();
+ *                                                  emitted BEFORE the child
+ *                                                  regions (at node entry)
+ *   [left child region][right child region]        recursively, same layout
  *   [FSE marker byte:        uint8,    1 byte]    always
  *   [bitmap body]                                  marker == 0: raw n-bit
  *                                                  bitmap, ceil(n/8) bytes
@@ -26,8 +43,26 @@
  *                                                  fse_len + fse_len bytes
  *                                                  of FSE-compressed bytes
  *
- * Flat-subtree nodes do NOT use this header — they emit n·D packed bits
- * directly.  See pivco_huffman.h:flat_depth.
+ * Rationale: the BU decoder CONSUMES each bitmap only at merge time,
+ * after both children are decoded.  v0.5's pre-order layout therefore
+ * loaded bitmaps backwards (each merge reached behind the cursor to a
+ * region it skipped earlier), keeping the whole compressed block live
+ * in cache.  Post-order puts every record exactly where the decode
+ * consumes it: the stream is read strictly forward, each byte touched
+ * once, so the L1 working set is a moving window instead of the block.
+ *
+ * The K_right varint is consumed at node entry (before the children)
+ * because the recursion needs both child counts up front to carve the
+ * scratch arena.  Same slot set as v0.5's u16 headers (one per
+ * recursion site into a non-leaf child, kr_header_needed()); LEB128
+ * (7 bits/byte, LSB-first) instead of fixed u16 shaves the common
+ * K_right < 128 case to 1 byte.  Leaf-only nodes (BOTH_LEAVES, HALF_*
+ * with a leaf child) carry no length in either scheme, and empty
+ * subtrees (n == 0) emit nothing at all.
+ *
+ * Flat-subtree nodes do NOT use the per-node record — they emit n·D
+ * packed bits directly (post-order position, but they have no children
+ * so it is the same place).  See pivco_huffman.h:flat_depth.
  *
  * Internal header, not part of the public API.
  */
@@ -69,28 +104,33 @@ static inline int wire_read_block_n(const uint8_t **in_ptr)
     return (int)v;
 }
 
-/* ---------- Encode side: reserve / commit slots ----------
+/* ---------- K_right varint (LEB128, LSB-first 7-bit groups) ----------
  *
- * The encoder reserves the header slot(s) BEFORE knowing n_right, then
- * commits the value afterwards.  Returns pointer to where the K_right
- * uint16 should be written (NULL if no header was reserved). */
-static inline uint8_t *wire_reserve_kr_header(const pivco_huffman_table_t *table,
-                                               int16_t node_id,
-                                               uint8_t **out_ptr)
+ * Unlike v0.5's reserve/commit u16 (the value wasn't known until the
+ * partition ran), the post-order encoder writes the varint directly:
+ * the partition runs before anything is emitted for the node.
+ * K_right <= n <= PIVCO_WIRE_MAX_N (65535) => at most 3 bytes. */
+static inline void wire_write_kr_varint(uint8_t **out_ptr, int v)
 {
-    if (!kr_header_needed(table, node_id)) return NULL;
-    uint8_t *slot = *out_ptr;
-    *out_ptr += KR_HEADER_BYTES;
-    return slot;
+    while (v >= 0x80) {
+        *(*out_ptr)++ = (uint8_t)(v | 0x80);
+        v >>= 7;
+    }
+    *(*out_ptr)++ = (uint8_t)v;
 }
 
-/* Write the K_right value into a previously-reserved slot.  No-op if
- * `slot` is NULL (header wasn't reserved for this node). */
-static inline void wire_commit_kr_header(uint8_t *slot, int n_right)
+static inline int wire_read_kr_varint(const uint8_t **in_ptr)
 {
-    if (!slot) return;
-    slot[0] = (uint8_t)(n_right & 0xFF);
-    slot[1] = (uint8_t)((n_right >> 8) & 0xFF);
+    PROF_TIC();
+    int v = 0, shift = 0;
+    uint8_t b;
+    do {
+        b = *(*in_ptr)++;
+        v |= (int)(b & 0x7F) << shift;
+        shift += 7;
+    } while (b & 0x80);
+    PROF_TOC(PROF_WIRE_KR, 1);
+    return v;
 }
 
 /* Note: the FSE marker byte + bitmap (or FSE payload) is emitted by
@@ -104,22 +144,6 @@ static inline void wire_commit_kr_header(uint8_t *slot, int n_right)
  * `wire_read_bitmap` below is the corresponding decoder. */
 
 /* ---------- Decode side ---------- */
-
-/* Skip the K_right header bytes, returning the value as an int.  If no
- * header is present for this node, returns -1.  (Top-down decoders
- * don't use the value; bottom-up ones do.) */
-static inline int wire_read_kr_header(const pivco_huffman_table_t *table,
-                                       int16_t node_id,
-                                       const uint8_t **in_ptr)
-{
-    if (!kr_header_needed(table, node_id)) return -1;
-    PROF_TIC();
-    uint16_t v;
-    memcpy(&v, *in_ptr, 2);
-    *in_ptr += KR_HEADER_BYTES;
-    PROF_TOC(PROF_WIRE_KR, 1);
-    return (int)v;
-}
 
 /* Read the per-node bitmap body (marker + payload).  Returns a pointer
  * to the usable n-bit bitmap (either pointing into the input stream

@@ -80,21 +80,24 @@ static inline int bitmap_bytes(int n)
     return (n + 7) >> 3;
 }
 
-/* K_right wire-format header decision (2026-05-12).
+/* K_right wire-format slot decision (2026-05-12; slot moved to a LEB128
+ * varint at the node's post-order entry in wire v0.6, 2026-07-02).
  *
- * Wire format: at each non-flat internal node whose bitmap is followed by
- * recursion into at least one non-leaf child, the encoder writes a 2-byte
- * little-endian uint16 K_right header immediately before the bitmap.  The
- * BU decoder reads this directly instead of running popcount; the TD
- * decoder skips it (still computes splits inline per stride).
+ * Wire format: at each non-flat internal node that recurses into at
+ * least one non-leaf child, the encoder writes a K_right varint (v0.5:
+ * 2-byte LE uint16 before the bitmap).  The BU decoder reads it at node
+ * entry instead of running popcount, and uses it to size both children
+ * before their post-order regions arrive.
  *
  * Condition: node has at least one child that's NOT a leaf.  Encodes the
  * exact set of popcount call sites in the BU decoder.  Both-leaf cases
- * and HALF_*-with-leaf cases get no header (decoder uses merge_cst_cst
+ * and HALF_*-with-leaf cases get no slot (decoder uses merge_cst_cst
  * directly).
  *
- * The "needs header" decision is a pure function of the tree topology and
- * matches across encoder and decoder via this shared helper. */
+ * The "needs slot" decision is a pure function of the tree topology and
+ * matches across encoder and decoder via this shared helper.
+ * KR_HEADER_BYTES is the v0.5 fixed width — kept for the ph-td fork
+ * (extras/ph-td), which still round-trips its own v0.5-style streams. */
 static inline int kr_header_needed(const pivco_huffman_table_t *table,
                                     int16_t node_id)
 {
