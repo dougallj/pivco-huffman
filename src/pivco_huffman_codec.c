@@ -548,18 +548,30 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
      * across blocks) and only the root's own merge, whose writes are
      * exact, targets `symbols`.
      *
-     * Arena bound: (MAX_CODE_LEN+2)·N is the pre-ping-pong carve
-     * allocator's loose bound, kept verbatim for this commit; the
-     * ping-pong walk's true high-water is under 1.5·N and the arena
-     * shrinks to it in the next commit. */
-    size_t need = (size_t)N * (PIVCO_MAX_CODE_LEN + 2) + MERGE_OVERREAD;
+     * Arena bound.  A ping-pong walk of K symbols into (out, tmp)
+     * touches out[0,K) plus at most floor(K/2) bytes from tmp (see the
+     * walk's header comment); only the root split is known when the
+     * arena is sized, so the per-subtree floor(K/2) worst case is what
+     * the bound must assume.  With the root's larger child B at the
+     * arena base (partner = the smaller sibling's slot, then spill)
+     * and the smaller child S at [B, N) (partner beyond N), the
+     * high-water is
+     *
+     *   need = max(B + B/2, N + S/2) + MERGE_OVERREAD
+     *
+     * S <= N/2 makes the second term <= 1.25·N, so the arena stays
+     * within 1.25·N + overread for any root split up to 5/6 lopsided
+     * (all real trees measured); the pathological ceiling — a >5/6
+     * root split whose larger child then splits evenly — is 1.5·N. */
 
     if ((pivco_node_type_t)table->node_type[table->tree_root]
         == PIVCO_NODE_LEAF_LEFT) {
         /* One internal child: it decodes at the arena base with the
          * space after it as ping-pong partner; the cst_vec merge fills
-         * symbols. */
+         * symbols.  (The leaf side contributes no buffer, so the bound
+         * is the walk's own: K_right + floor(K_right/2).) */
         int K_right = wire_read_kr_header(table, table->tree_root, &ptr);
+        size_t need = (size_t)K_right + (size_t)K_right / 2 + MERGE_OVERREAD;
         uint8_t *scratch = decode_scratch_ensure(need);
         if (!scratch) return PIVCO_ERR_NULL;
         codec_decode_subtree(table, root->right, K_right,
@@ -584,6 +596,12 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
      * fresh partner beyond N. */
     int K_right = wire_read_kr_header(table, table->tree_root, &ptr);
     int K_left  = N - K_right;
+    size_t B = (size_t)(K_right > K_left ? K_right : K_left);
+    size_t S = (size_t)N - B;
+    size_t need_big   = B + B / 2;
+    size_t need_small = (size_t)N + S / 2;
+    size_t need = (need_big > need_small ? need_big : need_small)
+                  + MERGE_OVERREAD;
     uint8_t *scratch = decode_scratch_ensure(need);
     if (!scratch) return PIVCO_ERR_NULL;
 
