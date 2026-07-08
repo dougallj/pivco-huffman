@@ -29,9 +29,12 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Backend lifecycle.  Lazily build the compress_tab + expand_tab pre-
- * bake tables that the NEON partition / merge primitives index
- * into.  Idempotent and cheap after the first call. */
+/* Backend lifecycle.  Lazily build the compress_tab pre-bake the NEON
+ * partition primitives index into, plus the merge shuffle pair.
+ * Of the expand tables only expand_popcnt (256 B) is still read by the
+ * shipped kernels (merge-tail cursor advance); expand_tab/expand_tab_pre
+ * stay built for the bench prim_variants that index them.  Idempotent
+ * and cheap after the first call. */
 static void init_merge_tables(void);   /* two-table merge_vec_vec shuffles (below) */
 static inline void codec_init_neon(void)
 {
@@ -85,15 +88,22 @@ static inline int popcount_K_right_neon(const uint8_t *bm, int nbytes, int K)
     return K_right;
 }
 
-/* ---- merge_vec_vec_neon: two-table SABD merge, 64 bytes/iter ----
+/* ---- merge_vec_vec_neon: two-table SABD merge, 128 bytes/iter ----
  *
  * One 2-source vqtbl2q over {R16, L16} per 16-byte chunk; the cross-half
  * cursor offset is folded into the shuffle index by SABD (|shuf0 - shuf1|),
- * so no explicit add.  Four chunks per 64-byte iter share one vcnt + 64-bit
- * multiply prefix-sum for the per-chunk cursor splits and the L/R advance.  The
+ * so no explicit add.  Eight chunks per 128-byte iter share ONE 16-byte
+ * SIMD bitmap load + vcntq; masks and popcount prefix-sums leave via
+ * SIMD->GPR lane moves (never GPR->SIMD: that fmov costs a load-port
+ * uop and the loop is load-port bound).  Per-chunk cursor splits use a
+ * 64-bit multiply prefix-sum per half.  The
  * two 256x16 index tables (g_merge_shuf0/1, 8 KiB) are built once in
- * codec_init_neon.  Tail (K mod 64) falls back to the expand_tab
- * stride-16/-8/scalar ladder. */
+ * codec_init_neon.  Tail (K mod 64) runs the same SABD merge at 16- and
+ * 8-wide on the same tables (the 8-wide form stores the low half only),
+ * so the whole kernel touches only g_merge_shuf0/1 plus the 256-byte
+ * expand_popcnt (tail cursor advance; aarch64 has no GPR popcount) --
+ * the old expand_tab/expand_tab_pre ladder dragged up to 20 KiB of
+ * cold table lines into L1 for at most two tail iterations per node. */
 static int8_t g_merge_shuf0[256 * 16] __attribute__((aligned(16)));
 static int8_t g_merge_shuf1[256 * 16] __attribute__((aligned(16)));
 static void init_merge_tables(void)
@@ -129,6 +139,23 @@ static inline void merge_neon_16B(uint8_t *dest, const uint8_t *l_list,
     src.val[1] = vld1q_u8(l_list);
     vst1q_u8(dest, vqtbl2q_u8(src, shuf));
 }
+/* 8-byte residue on the same tables: the 16-bit-mask path with the high
+ * mask byte zero (tab1 row 0), storing only the low 8 output lanes.
+ * Both sides consume <= 8 bytes and every lane index stays in its
+ * half's low 8 lanes, so 8-byte D-register loads suffice (they
+ * zero-extend for free) -- no over-read past cursor+8. */
+static inline void merge_neon_8B_lo(uint8_t *dest, const uint8_t *l_list,
+                                    const uint8_t *r_list, intptr_t m8,
+                                    const int8_t *tab0, const int8_t *tab1)
+{
+    int8x16_t shuf0 = vld1q_s8(&tab0[(m8 << 4) & 0xff0]);
+    int8x16_t shuf1 = vld1q_s8(&tab1[0]);
+    uint8x16_t shuf = vreinterpretq_u8_s8(vabdq_s8(shuf0, shuf1));
+    uint8x16x2_t src;
+    src.val[0] = vcombine_u8(vld1_u8(r_list), vdup_n_u8(0));
+    src.val[1] = vcombine_u8(vld1_u8(l_list), vdup_n_u8(0));
+    vst1_u8(dest, vget_low_u8(vqtbl2q_u8(src, shuf)));
+}
 static inline void merge_vec_vec_neon(const uint8_t *bm, int K,
                                      const uint8_t *left,
                                      const uint8_t *right,
@@ -137,66 +164,71 @@ static inline void merge_vec_vec_neon(const uint8_t *bm, int K,
     PROF_TIC();
     const uint8_t *l_list = left, *r_list = right;
     intptr_t i = 0;
-    for (; i + 64 <= K; i += 64) {
-        uint64_t mask; memcpy(&mask, bm + (i >> 3), 8);
-        uint8x8_t vmask = vcreate_u8(mask);
-        uint8x8_t pop8  = vcnt_u8(vmask);
-        /* Per-chunk cursor splits: move the 8 byte-popcounts to a GPR and
-         * prefix-sum them with a single 64-bit multiply (offloads to the scalar
-         * pipe; cheaper than the SIMD vpadd+vmul fold).  Byte k of the product
-         * holds sum(pop8[0..k]), so bytes 1/3/5/7 are the 16-bit chunk
-         * boundaries c0, c0+c1, c0+c1+c2, total. */
-        uint64_t all_pop = vget_lane_u64(vreinterpret_u64_u8(pop8), 0);
-        uint64_t pfx = all_pop * 0x0101010101010101ull;
-        intptr_t pop0 = (pfx >> 8)  & 0xff;
-        intptr_t pop1 = (pfx >> 24) & 0xff;
-        intptr_t pop2 = (pfx >> 40) & 0xff;
-        intptr_t pop3 =  pfx >> 56;
-        merge_neon_16B(out + i,      l_list,             r_list,        mask,       g_merge_shuf0, g_merge_shuf1);
-        merge_neon_16B(out + i + 16, l_list + 16 - pop0, r_list + pop0, mask >> 16, g_merge_shuf0, g_merge_shuf1);
-        merge_neon_16B(out + i + 32, l_list + 32 - pop1, r_list + pop1, mask >> 32, g_merge_shuf0, g_merge_shuf1);
-        merge_neon_16B(out + i + 48, l_list + 48 - pop2, r_list + pop2, mask >> 48, g_merge_shuf0, g_merge_shuf1);
-        r_list += pop3; l_list += 64 - pop3;
+    /* One 64-byte half: 4 SABD-merged chunks + cursor advance.  The
+     * per-chunk cursor splits come from a 64-bit multiply prefix-sum of
+     * the byte popcounts (byte k of the product holds sum(pop[0..k]), so
+     * bytes 1/3/5/7 are the 16-bit chunk boundaries; offloads to the
+     * scalar pipe -- cheaper than the SIMD vpadd+vmul fold). */
+#define PIVCO_MVV_HALF(mask, pfx, base) do {                              \
+        intptr_t pop0 = ((pfx) >> 8)  & 0xff;                             \
+        intptr_t pop1 = ((pfx) >> 24) & 0xff;                             \
+        intptr_t pop2 = ((pfx) >> 40) & 0xff;                             \
+        intptr_t pop3 =  (pfx) >> 56;                                     \
+        merge_neon_16B(out + (base),      l_list,             r_list,        (mask),       g_merge_shuf0, g_merge_shuf1); \
+        merge_neon_16B(out + (base) + 16, l_list + 16 - pop0, r_list + pop0, (mask) >> 16, g_merge_shuf0, g_merge_shuf1); \
+        merge_neon_16B(out + (base) + 32, l_list + 32 - pop1, r_list + pop1, (mask) >> 32, g_merge_shuf0, g_merge_shuf1); \
+        merge_neon_16B(out + (base) + 48, l_list + 48 - pop2, r_list + pop2, (mask) >> 48, g_merge_shuf0, g_merge_shuf1); \
+        r_list += pop3; l_list += 64 - pop3;                              \
+    } while (0)
+    /* 128 bytes per iter off ONE 16-byte SIMD bitmap load + one
+     * vcntq: mask and popcounts leave via SIMD->GPR lane moves only.
+     * The GPR-load + fmov-to-SIMD form costs a load-port uop for the
+     * fmov (Apple runs GPR->SIMD on the load pipes), and this loop is
+     * load-port bound: measured 7.2 -> 6.7 cyc/64B on M4. */
+    for (; i + 128 <= K; i += 128) {
+        uint8x16_t m2 = vld1q_u8(bm + (i >> 3));
+        uint8x16_t p2 = vcntq_u8(m2);
+        uint64_t maskA = vgetq_lane_u64(vreinterpretq_u64_u8(m2), 0);
+        uint64_t maskB = vgetq_lane_u64(vreinterpretq_u64_u8(m2), 1);
+        uint64_t pfxA  = vgetq_lane_u64(vreinterpretq_u64_u8(p2), 0)
+                         * 0x0101010101010101ull;
+        uint64_t pfxB  = vgetq_lane_u64(vreinterpretq_u64_u8(p2), 1)
+                         * 0x0101010101010101ull;
+        PIVCO_MVV_HALF(maskA, pfxA, i);
+        PIVCO_MVV_HALF(maskB, pfxB, i + 64);
     }
-    int lc = (int)(l_list - left), rc = (int)(r_list - right);
+    if (i + 64 <= K) {          /* K mod 128 half */
+        uint64_t mask; memcpy(&mask, bm + (i >> 3), 8);
+        uint8x8_t pop8 = vcnt_u8(vcreate_u8(mask));
+        uint64_t pfx = vget_lane_u64(vreinterpret_u64_u8(pop8), 0)
+                       * 0x0101010101010101ull;
+        PIVCO_MVV_HALF(mask, pfx, i);
+        i += 64;
+    }
+#undef PIVCO_MVV_HALF
     int j = (int)i;
 
-    /* V4 stride-16 fallback for the residual (handles K mod 128). */
+    /* Residue on the main tables: 16-wide, then 8-wide (low half). */
     for (; j + 16 <= K; j += 16) {
-        uint8x16_t L_full = vld1q_u8(left  + lc);
-        uint8x16_t R_full = vld1q_u8(right + rc);
-
-        uint8_t m0 = bm[j >> 3];
-        uint8x16_t both0 = vcombine_u8(vget_low_u8(L_full),
-                                        vget_low_u8(R_full));
-        uint8x8_t  shuf0 = vld1_u8(expand_tab[m0]);
-        uint8x8_t  o0    = vqtbl1_u8(both0, shuf0);
-        vst1_u8(out + j, o0);
-        int nr0 = expand_popcnt[m0];
-
-        uint8_t m1 = bm[(j >> 3) + 1];
-        uint8x16x2_t src = {{ L_full, R_full }};
-        uint8x8_t shuf1  = vld1_u8(expand_tab_pre[nr0][m1]);
-        uint8x8_t o1     = vqtbl2_u8(src, shuf1);
-        vst1_u8(out + j + 8, o1);
-        int nr1 = expand_popcnt[m1];
-
-        rc += nr0 + nr1;
-        lc += (16 - nr0 - nr1);
+        uint16_t m16; memcpy(&m16, bm + (j >> 3), 2);
+        merge_neon_16B(out + j, l_list, r_list, (intptr_t)m16,
+                       g_merge_shuf0, g_merge_shuf1);
+        /* expand_popcnt, not __builtin_popcount: aarch64 has no GPR
+         * popcount (fmov+cnt+addv+fmov, ~7cy) and this sits on the
+         * serial cursor chain between tail iterations. */
+        int pop = expand_popcnt[m16 & 0xff] + expand_popcnt[m16 >> 8];
+        r_list += pop; l_list += 16 - pop;
     }
-    for (; j + 8 <= K; j += 8) {
-        uint8_t m  = bm[j >> 3];
-        uint8x8_t  L    = vld1_u8(left + lc);
-        uint8x8_t  R    = vld1_u8(right + rc);
-        uint8x16_t both = vcombine_u8(L, R);
-        uint8x8_t  shuf = vld1_u8(expand_tab[m]);
-        uint8x8_t  o    = vqtbl1_u8(both, shuf);
-        vst1_u8(out + j, o);
-        int nr = expand_popcnt[m];
-        rc += nr;
-        lc += (8 - nr);
+    if (j + 8 <= K) {
+        intptr_t m8 = bm[j >> 3];
+        merge_neon_8B_lo(out + j, l_list, r_list, m8,
+                         g_merge_shuf0, g_merge_shuf1);
+        int pop = expand_popcnt[m8];
+        r_list += pop; l_list += 8 - pop;
+        j += 8;
     }
     /* Scalar tail (1..7 leftover). */
+    int lc = (int)(l_list - left), rc = (int)(r_list - right);
     for (; j < K; j++) {
         int mb = (bm[j >> 3] >> (j & 7)) & 1;
         out[j] = mb ? right[rc++] : left[lc++];
@@ -219,25 +251,29 @@ static inline void merge_cst_vec_neon(const uint8_t *bm, int K,
     uint8x16_t Lb = vdupq_n_u8(left_sym);
     const uint8_t *r_list = right;
     intptr_t i = 0;
-    for (; i + 64 <= K; i += 64) {
-        uint64_t mask; memcpy(&mask, bm + (i >> 3), 8);
-        uint8x8_t pop8 = vcnt_u8(vcreate_u8(mask));
-        uint64_t pfx = vget_lane_u64(vreinterpret_u64_u8(pop8), 0) * 0x0101010101010101ull;
-        intptr_t p0 = (pfx >> 8) & 0xff, p1 = (pfx >> 24) & 0xff, p2 = (pfx >> 40) & 0xff, p3 = pfx >> 56;
 #define _MCV(off, rd, mk) do {                                                   \
         int8x16_t s0 = vld1q_s8(&g_merge_shuf0[(((intptr_t)(mk)) << 4) & 0xff0]); \
         int8x16_t s1 = vld1q_s8(&g_merge_shuf1[(((intptr_t)(mk)) >> 4) & 0xff0]); \
         uint8x16_t sh = vreinterpretq_u8_s8(vabdq_s8(s0, s1));                    \
         uint8x16x2_t src; src.val[0] = vld1q_u8(rd); src.val[1] = Lb;            \
-        vst1q_u8(out + i + (off), vqtbl2q_u8(src, sh));                          \
+        vst1q_u8(out + (off), vqtbl2q_u8(src, sh));                              \
     } while (0)
-        _MCV(0,  r_list,      mask);
-        _MCV(16, r_list + p0, mask >> 16);
-        _MCV(32, r_list + p1, mask >> 32);
-        _MCV(48, r_list + p2, mask >> 48);
-#undef _MCV
+    /* Unlike merge_vec_vec, this loop is NOT load-port bound (no L data
+     * loads), and the 128B vld1q-bitmap restructure measured ~5% slower
+     * on the all-cst distributions (proba80) -- keep the 64B GPR-mask
+     * form here. */
+    for (; i + 64 <= K; i += 64) {
+        uint64_t mask; memcpy(&mask, bm + (i >> 3), 8);
+        uint8x8_t pop8 = vcnt_u8(vcreate_u8(mask));
+        uint64_t pfx = vget_lane_u64(vreinterpret_u64_u8(pop8), 0) * 0x0101010101010101ull;
+        intptr_t p0 = (pfx >> 8) & 0xff, p1 = (pfx >> 24) & 0xff, p2 = (pfx >> 40) & 0xff, p3 = pfx >> 56;
+        _MCV(i,      r_list,      mask);
+        _MCV(i + 16, r_list + p0, mask >> 16);
+        _MCV(i + 32, r_list + p1, mask >> 32);
+        _MCV(i + 48, r_list + p2, mask >> 48);
         r_list += p3;
     }
+#undef _MCV
     int j = (int)i;
     for (; j + 16 <= K; j += 16) {   /* 16-byte ryg tail before the scalar mop-up */
         uint16_t m16; memcpy(&m16, bm + (j >> 3), 2);
@@ -246,7 +282,21 @@ static inline void merge_cst_vec_neon(const uint8_t *bm, int K,
         uint8x16_t sh = vreinterpretq_u8_s8(vabdq_s8(s0, s1));
         uint8x16x2_t src; src.val[0] = vld1q_u8(r_list); src.val[1] = Lb;
         vst1q_u8(out + j, vqtbl2q_u8(src, sh));
-        r_list += __builtin_popcount(m16);
+        r_list += expand_popcnt[m16 & 0xff] + expand_popcnt[m16 >> 8];
+    }
+    if (j + 8 <= K) {   /* 8-wide residue: high mask byte 0, store low half.
+                         * 8B D-load on R -- consumes <= 8, no wider
+                         * over-read than the scalar loop it replaces. */
+        intptr_t m8 = bm[j >> 3];
+        int8x16_t s0 = vld1q_s8(&g_merge_shuf0[(m8 << 4) & 0xff0]);
+        int8x16_t s1 = vld1q_s8(&g_merge_shuf1[0]);
+        uint8x16_t sh = vreinterpretq_u8_s8(vabdq_s8(s0, s1));
+        uint8x16x2_t src;
+        src.val[0] = vcombine_u8(vld1_u8(r_list), vdup_n_u8(0));
+        src.val[1] = Lb;
+        vst1_u8(out + j, vget_low_u8(vqtbl2q_u8(src, sh)));
+        r_list += expand_popcnt[m8];
+        j += 8;
     }
     int rc = (int)(r_list - right);
     for (; j < K; j++) { int mb = (bm[j >> 3] >> (j & 7)) & 1; out[j] = mb ? right[rc++] : left_sym; }
