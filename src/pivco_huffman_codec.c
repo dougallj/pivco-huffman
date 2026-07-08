@@ -592,6 +592,13 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
      * bound comes with the arena-shrink step). */
     dec_flag("PIVCO_DEC_CARVE",   &g_dec_carve);
     dec_flag("PIVCO_DEC_INPLACE", &g_dec_inplace);
+#ifdef PIVCO_PRIM_HAVE_OVERLAP_FLAG
+    /* In-place tails place a child where merge reads run only just
+     * ahead of the stores; the overlapped tail merge re-reads behind
+     * the cursor and must be disabled (see the tail-machinery note in
+     * the backend header). */
+    pivco_prim_merge_overlap_ok = !g_dec_inplace;
+#endif
     size_t need = (size_t)N * (PIVCO_MAX_CODE_LEN + 2);
     if (g_dec_carve || g_dec_inplace)
         need = 2 * need + SCRATCH_PAGE + MERGE_OVERREAD;

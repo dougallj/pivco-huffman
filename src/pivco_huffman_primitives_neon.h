@@ -31,10 +31,10 @@
 
 /* Backend lifecycle.  Lazily build the compress_tab pre-bake the NEON
  * partition primitives index into, plus the merge shuffle pair.
- * Of the expand tables only expand_popcnt (256 B) is still read by the
- * shipped kernels (merge-tail cursor advance); expand_tab/expand_tab_pre
- * stay built for the bench prim_variants that index them.  Idempotent
- * and cheap after the first call. */
+ * No expand table is read by any shipped decode kernel anymore (merge
+ * tails run on g_merge_shuf0/1 with SWAR popcounts); expand_tab* stay
+ * built for the bench prim_variants that index them.  Idempotent and
+ * cheap after the first call. */
 static void init_merge_tables(void);   /* two-table merge_vec_vec shuffles (below) */
 static inline void codec_init_neon(void)
 {
@@ -98,12 +98,13 @@ static inline int popcount_K_right_neon(const uint8_t *bm, int nbytes, int K)
  * uop and the loop is load-port bound).  Per-chunk cursor splits use a
  * 64-bit multiply prefix-sum per half.  The
  * two 256x16 index tables (g_merge_shuf0/1, 8 KiB) are built once in
- * codec_init_neon.  Tail (K mod 64) runs the same SABD merge at 16- and
- * 8-wide on the same tables (the 8-wide form stores the low half only),
- * so the whole kernel touches only g_merge_shuf0/1 plus the 256-byte
- * expand_popcnt (tail cursor advance; aarch64 has no GPR popcount) --
- * the old expand_tab/expand_tab_pre ladder dragged up to 20 KiB of
- * cold table lines into L1 for at most two tail iterations per node. */
+ * codec_init_neon.  Tail (K mod 64) runs the same SABD merge at 16-wide
+ * plus ONE overlapped 16-wide merge at K-16 (cursors rewound by the
+ * popcount of the overlap bits; the overlap bytes recompute to identical
+ * values), with popcounts from a SWAR multiply -- the whole kernel
+ * touches no table but g_merge_shuf0/1.  The old expand_tab/
+ * expand_tab_pre/expand_popcnt ladder dragged up to 20 KiB of cold
+ * table lines into L1 for at most two tail iterations per node. */
 static int8_t g_merge_shuf0[256 * 16] __attribute__((aligned(16)));
 static int8_t g_merge_shuf1[256 * 16] __attribute__((aligned(16)));
 static void init_merge_tables(void)
@@ -156,6 +157,61 @@ static inline void merge_neon_8B_lo(uint8_t *dest, const uint8_t *l_list,
     src.val[1] = vcombine_u8(vld1_u8(l_list), vdup_n_u8(0));
     vst1_u8(dest, vget_low_u8(vqtbl2q_u8(src, shuf)));
 }
+/* ---- merge tail machinery (K mod 64) -------------------------------
+ *
+ * The residual bitmap is grabbed as ONE word (never reading outside
+ * [bm, bm + ceil(K/8))), per-byte popcounts + running prefix come from
+ * a SWAR multiply, and the final 4..15 stragglers are handled by ONE
+ * overlapped 16-wide merge at bit position K-16 with the cursors
+ * rewound by the popcount of the overlap bits -- the overlap bytes are
+ * recomputed to identical values.  The tails read no table beyond the
+ * main loop's g_merge_shuf0/1 (no expand_* tables).
+ *
+ * The overlapped form re-reads input bytes behind the cursor, which is
+ * NOT safe when a child was decoded in-place into out's tail (reads
+ * there are only ever just ahead of the stores; see place_tail in
+ * codec.c) -- the decode entry clears pivco_prim_merge_overlap_ok when
+ * PIVCO_DEC_INPLACE is on, and the tails fall back to forward-only
+ * 8-wide + scalar stragglers. */
+#define PIVCO_PRIM_HAVE_OVERLAP_FLAG 1
+static int pivco_prim_merge_overlap_ok = 1;
+
+static inline uint64_t bytepop_prefix64(uint64_t w)
+{
+    uint64_t t = w - ((w >> 1) & 0x5555555555555555ull);
+    t = (t & 0x3333333333333333ull) + ((t >> 2) & 0x3333333333333333ull);
+    t = (t + (t >> 4)) & 0x0f0f0f0f0f0f0f0full;
+    return t * 0x0101010101010101ull;   /* byte k = pop(bytes 0..k) */
+}
+static inline int pop16_swar(uint32_t v)
+{
+    v = v - ((v >> 1) & 0x5555u);
+    v = (v & 0x3333u) + ((v >> 2) & 0x3333u);
+    v = (v + (v >> 4)) & 0x0f0fu;
+    return (int)((v + (v >> 8)) & 0x1f);
+}
+/* bits [j, K) of bm with bm bit j at bit 0; j % 8 == 0.  Reads stay
+ * inside [bm, bm + ceil(K/8)) -- backward load when the bitmap has 8+
+ * bytes, exact byte ladder for tiny nodes. */
+static inline uint64_t bm_tail_word(const uint8_t *bm, int j, int K)
+{
+    int jb = j >> 3;
+    int nbytes = (K + 7) >> 3;
+    int have = nbytes - jb;             /* 1..8 */
+    uint64_t w;
+    if (have >= 8) { memcpy(&w, bm + jb, 8); return w; }
+    if (nbytes >= 8) {
+        memcpy(&w, bm + nbytes - 8, 8);
+        return w >> ((8 - have) * 8);
+    }
+    w = 0;
+    int o = 0;
+    if (have & 4) { uint32_t v; memcpy(&v, bm + jb, 4); w = v; o = 4; }
+    if (have & 2) { uint16_t v; memcpy(&v, bm + jb + o, 2); w |= (uint64_t)v << (o * 8); o += 2; }
+    if (have & 1) { w |= (uint64_t)bm[jb + o] << (o * 8); }
+    return w;
+}
+
 static inline void merge_vec_vec_neon(const uint8_t *bm, int K,
                                      const uint8_t *left,
                                      const uint8_t *right,
@@ -208,30 +264,55 @@ static inline void merge_vec_vec_neon(const uint8_t *bm, int K,
 #undef PIVCO_MVV_HALF
     int j = (int)i;
 
-    /* Residue on the main tables: 16-wide, then 8-wide (low half). */
-    for (; j + 16 <= K; j += 16) {
-        uint16_t m16; memcpy(&m16, bm + (j >> 3), 2);
-        merge_neon_16B(out + j, l_list, r_list, (intptr_t)m16,
+    /* Tail on the main loop's tables: 16-wide off a SWAR pop prefix,
+     * overlapped final merge (see the tail-machinery note above). */
+    if (j >= K) { PROF_TOC(PROF_BU_MERGE_VEC_VEC, K); return; }
+    if (K < 8) {                         /* tiny node: no SIMD possible */
+        uint32_t mb = bm[0];
+        for (; j < K; j++) {
+            if ((mb >> j) & 1) out[j] = *r_list++; else out[j] = *l_list++;
+        }
+        PROF_TOC(PROF_BU_MERGE_VEC_VEC, K);
+        return;
+    }
+    int j0 = j;
+    uint64_t w = bm_tail_word(bm, j0, K);
+    uint64_t pfx = bytepop_prefix64(w);
+    int q = 0;
+    for (; j + 16 <= K; j += 16, q += 16) {
+        int a = (int)((pfx >> (q + 8)) & 0xff);
+        int b = q ? (int)((pfx >> (q - 8)) & 0xff) : 0;
+        merge_neon_16B(out + j, l_list, r_list,
+                       (intptr_t)((w >> q) & 0xffff),
                        g_merge_shuf0, g_merge_shuf1);
-        /* expand_popcnt, not __builtin_popcount: aarch64 has no GPR
-         * popcount (fmov+cnt+addv+fmov, ~7cy) and this sits on the
-         * serial cursor chain between tail iterations. */
-        int pop = expand_popcnt[m16 & 0xff] + expand_popcnt[m16 >> 8];
+        int pop = a - b;
         r_list += pop; l_list += 16 - pop;
     }
-    if (j + 8 <= K) {
-        intptr_t m8 = bm[j >> 3];
-        merge_neon_8B_lo(out + j, l_list, r_list, m8,
-                         g_merge_shuf0, g_merge_shuf1);
-        int pop = expand_popcnt[m8];
-        r_list += pop; l_list += 8 - pop;
-        j += 8;
-    }
-    /* Scalar tail (1..7 leftover). */
-    int lc = (int)(l_list - left), rc = (int)(r_list - right);
-    for (; j < K; j++) {
-        int mb = (bm[j >> 3] >> (j & 7)) & 1;
-        out[j] = mb ? right[rc++] : left[lc++];
+    if (j < K) {
+        if (K >= 16 && pivco_prim_merge_overlap_ok) {
+            int jj = K - 16;             /* overlapped final 16 */
+            int base = jj & ~7;          /* jj may precede j0 when r<16 */
+            uint64_t w2 = (base == j0) ? w : bm_tail_word(bm, base, K);
+            uint32_t m16f = (uint32_t)((w2 >> (jj - base)) & 0xffff);
+            int ovbits = j - jj;         /* 1..15 */
+            int rp = pop16_swar(m16f & ((1u << ovbits) - 1));
+            merge_neon_16B(out + jj, l_list - (ovbits - rp), r_list - rp,
+                           (intptr_t)m16f, g_merge_shuf0, g_merge_shuf1);
+        } else {                         /* forward-only: 8-wide + scalar */
+            if (j + 8 <= K) {
+                merge_neon_8B_lo(out + j, l_list, r_list,
+                                 (intptr_t)((w >> q) & 0xff),
+                                 g_merge_shuf0, g_merge_shuf1);
+                int a = (int)((pfx >> q) & 0xff);
+                int b = q ? (int)((pfx >> (q - 8)) & 0xff) : 0;
+                int pop = a - b;
+                r_list += pop; l_list += 8 - pop;
+                j += 8; q += 8;
+            }
+            for (; j < K; j++, q++) {
+                if ((w >> q) & 1) out[j] = *r_list++; else out[j] = *l_list++;
+            }
+        }
     }
     PROF_TOC(PROF_BU_MERGE_VEC_VEC, K);
 }
@@ -273,33 +354,57 @@ static inline void merge_cst_vec_neon(const uint8_t *bm, int K,
         _MCV(i + 48, r_list + p2, mask >> 48);
         r_list += p3;
     }
-#undef _MCV
     int j = (int)i;
-    for (; j + 16 <= K; j += 16) {   /* 16-byte ryg tail before the scalar mop-up */
-        uint16_t m16; memcpy(&m16, bm + (j >> 3), 2);
-        int8x16_t s0 = vld1q_s8(&g_merge_shuf0[((intptr_t)m16 << 4) & 0xff0]);
-        int8x16_t s1 = vld1q_s8(&g_merge_shuf1[((intptr_t)m16 >> 4) & 0xff0]);
-        uint8x16_t sh = vreinterpretq_u8_s8(vabdq_s8(s0, s1));
-        uint8x16x2_t src; src.val[0] = vld1q_u8(r_list); src.val[1] = Lb;
-        vst1q_u8(out + j, vqtbl2q_u8(src, sh));
-        r_list += expand_popcnt[m16 & 0xff] + expand_popcnt[m16 >> 8];
+    /* Same tail structure as merge_vec_vec_neon's (SWAR pop prefix +
+     * overlapped final 16 on the same tables), R cursor only. */
+    if (j >= K) { PROF_TOC(PROF_BU_MERGE_CST_VEC, K); return; }
+    if (K < 8) {
+        uint32_t mb = bm[0];
+        for (; j < K; j++)
+            out[j] = ((mb >> j) & 1) ? *r_list++ : left_sym;
+        PROF_TOC(PROF_BU_MERGE_CST_VEC, K);
+        return;
     }
-    if (j + 8 <= K) {   /* 8-wide residue: high mask byte 0, store low half.
-                         * 8B D-load on R -- consumes <= 8, no wider
-                         * over-read than the scalar loop it replaces. */
-        intptr_t m8 = bm[j >> 3];
-        int8x16_t s0 = vld1q_s8(&g_merge_shuf0[(m8 << 4) & 0xff0]);
-        int8x16_t s1 = vld1q_s8(&g_merge_shuf1[0]);
-        uint8x16_t sh = vreinterpretq_u8_s8(vabdq_s8(s0, s1));
-        uint8x16x2_t src;
-        src.val[0] = vcombine_u8(vld1_u8(r_list), vdup_n_u8(0));
-        src.val[1] = Lb;
-        vst1_u8(out + j, vget_low_u8(vqtbl2q_u8(src, sh)));
-        r_list += expand_popcnt[m8];
-        j += 8;
+    int j0 = j;
+    uint64_t w = bm_tail_word(bm, j0, K);
+    uint64_t pfx = bytepop_prefix64(w);
+    int q = 0;
+    for (; j + 16 <= K; j += 16, q += 16) {   /* 16-byte ryg tail */
+        int a = (int)((pfx >> (q + 8)) & 0xff);
+        int b = q ? (int)((pfx >> (q - 8)) & 0xff) : 0;
+        _MCV(j, r_list, (w >> q) & 0xffff);
+        r_list += a - b;
     }
-    int rc = (int)(r_list - right);
-    for (; j < K; j++) { int mb = (bm[j >> 3] >> (j & 7)) & 1; out[j] = mb ? right[rc++] : left_sym; }
+    if (j < K) {
+        if (K >= 16 && pivco_prim_merge_overlap_ok) {
+            int jj = K - 16;             /* overlapped final 16 */
+            int base = jj & ~7;
+            uint64_t w2 = (base == j0) ? w : bm_tail_word(bm, base, K);
+            uint32_t m16f = (uint32_t)((w2 >> (jj - base)) & 0xffff);
+            int rp = pop16_swar(m16f & ((1u << (j - jj)) - 1));
+            const uint8_t *rr = r_list - rp;
+            _MCV(jj, rr, m16f);
+        } else {
+            if (j + 8 <= K) {            /* 8-wide: high mask byte 0,
+                                          * store low half, 8B D-load */
+                intptr_t m8 = (intptr_t)((w >> q) & 0xff);
+                int8x16_t s0 = vld1q_s8(&g_merge_shuf0[(m8 << 4) & 0xff0]);
+                int8x16_t s1 = vld1q_s8(&g_merge_shuf1[0]);
+                uint8x16_t sh = vreinterpretq_u8_s8(vabdq_s8(s0, s1));
+                uint8x16x2_t src;
+                src.val[0] = vcombine_u8(vld1_u8(r_list), vdup_n_u8(0));
+                src.val[1] = Lb;
+                vst1_u8(out + j, vget_low_u8(vqtbl2q_u8(src, sh)));
+                int a = (int)((pfx >> q) & 0xff);
+                int b = q ? (int)((pfx >> (q - 8)) & 0xff) : 0;
+                r_list += a - b;
+                j += 8; q += 8;
+            }
+            for (; j < K; j++, q++)
+                out[j] = ((w >> q) & 1) ? *r_list++ : left_sym;
+        }
+    }
+#undef _MCV
     PROF_TOC(PROF_BU_MERGE_CST_VEC, K);
 }
 
@@ -335,16 +440,40 @@ static inline void merge_cst_cst_neon(const uint8_t *bm, int K,
         uint8x16_t idx     = vandq_u8(shifted, one_v);
         vst1q_u8(out + j, vqtbl1q_u8(c2s_vec, idx));
     }
-    for (; j + 8 <= K; j += 8) {
-        uint8x8_t bm_v = vdup_n_u8(bm[j >> 3]);
-        uint8x8_t dup     = vtbl1_u8(bm_v, vget_low_u8(dup_v));
-        uint8x8_t shifted = vshl_u8(dup, vget_low_s8(shift_v));
-        uint8x8_t idx     = vand_u8(shifted, vget_low_u8(one_v));
-        vst1_u8(out + j, vtbl1_u8(vget_low_u8(c2s_vec), idx));
-    }
-    for (; j < K; j++) {
-        int mb = (bm[j >> 3] >> (j & 7)) & 1;
-        out[j] = mb ? right_sym : left_sym;
+    /* No cursors, so the overlapped tail is unconditionally safe:
+     * redo the final 16 (or 8) outputs at K-16 (K-8) off a bit window
+     * extracted with bm_tail_word.  Scalar only for K < 8. */
+    if (j < K) {
+        if (K >= 16) {
+            int jj = K - 16, base = jj & ~7;
+            uint64_t w2 = bm_tail_word(bm, base, K);
+            uint16_t m16f = (uint16_t)((w2 >> (jj - base)) & 0xffff);
+            uint8x16_t bm_lo = vreinterpretq_u8_u16(
+                vsetq_lane_u16(m16f, vdupq_n_u16(0), 0));
+            uint8x16_t dup     = vqtbl1q_u8(bm_lo, dup_v);
+            uint8x16_t shifted = vshlq_u8(dup, shift_v);
+            uint8x16_t idx     = vandq_u8(shifted, one_v);
+            vst1q_u8(out + jj, vqtbl1q_u8(c2s_vec, idx));
+        } else if (K >= 8) {            /* 8-wide + overlapped 8 at K-8 */
+            uint64_t w2 = bm_tail_word(bm, 0, K);
+            uint8x8_t b0      = vdup_n_u8((uint8_t)w2);
+            uint8x8_t dup     = vtbl1_u8(b0, vget_low_u8(dup_v));
+            uint8x8_t shifted = vshl_u8(dup, vget_low_s8(shift_v));
+            uint8x8_t idx     = vand_u8(shifted, vget_low_u8(one_v));
+            vst1_u8(out, vtbl1_u8(vget_low_u8(c2s_vec), idx));
+            if (K > 8) {
+                int jj = K - 8;
+                uint8x8_t b1 = vdup_n_u8((uint8_t)(w2 >> jj));
+                dup     = vtbl1_u8(b1, vget_low_u8(dup_v));
+                shifted = vshl_u8(dup, vget_low_s8(shift_v));
+                idx     = vand_u8(shifted, vget_low_u8(one_v));
+                vst1_u8(out + jj, vtbl1_u8(vget_low_u8(c2s_vec), idx));
+            }
+        } else {
+            uint32_t mb = bm[0];
+            for (; j < K; j++)
+                out[j] = ((mb >> j) & 1) ? right_sym : left_sym;
+        }
     }
     PROF_TOC(PROF_BU_MERGE_CST_CST, K);
 }
