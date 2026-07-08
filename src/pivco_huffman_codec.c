@@ -42,10 +42,21 @@ static __thread size_t   g_decode_scratch_cap = 0;
 static uint8_t *decode_scratch_ensure(size_t need)
 {
     if (need > g_decode_scratch_cap) {
-        uint8_t *p = (uint8_t *)realloc(g_decode_scratch, need);
+        /* Floor the allocation at 1 MB.  The ping-pong arena's ~1.25·N
+         * is small enough to be served from the allocator's small-object
+         * heap, where its page placement depends on the process's prior
+         * allocation history — measured on Sapphire Rapids as a lottery
+         * costing 4-7% on skewed distributions (proba80, calgary_pic)
+         * in unlucky layouts.  Above the mmap threshold the arena gets
+         * its own fresh page-aligned mapping and placement is
+         * deterministic (the pre-ping-pong 13·N arena was always in
+         * that regime).  Virtual size only — pages beyond the analytic
+         * bound are never touched, so they are never committed. */
+        size_t cap = need < ((size_t)1 << 20) ? ((size_t)1 << 20) : need;
+        uint8_t *p = (uint8_t *)realloc(g_decode_scratch, cap);
         if (!p) return NULL;
         g_decode_scratch     = p;
-        g_decode_scratch_cap = need;
+        g_decode_scratch_cap = cap;
     }
     return g_decode_scratch;
 }
