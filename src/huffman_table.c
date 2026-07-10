@@ -331,13 +331,16 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
  * them mid-tree, reported as PIVCO_ERR_CORRUPT by the caller (the
  * lengths typically come off the wire). */
 
+/* 6 bytes/chunk: the three fields every consumer reads fit a byte each
+ * (depth <= PIVCO_MAX_CODE_LEN, bit <= 8, sym_idx <= 255); the chunk's
+ * width is always 1 << bit (recomputed, not stored), and its length L
+ * (= depth + bit) has no consumer since codeword generation was retired.
+ * root_code is written/read by CANONICAL_FLAT's full build only. */
 typedef struct {
-    uint16_t L;
-    uint16_t bit;       /* 0..PIVCO_MAX_CODE_LEN */
-    uint16_t depth;     /* tree-depth of chunk root */
-    uint16_t n_syms;    /* 1 << bit */
+    uint8_t  depth;     /* tree-depth of chunk root */
+    uint8_t  bit;       /* log2 of chunk width, 0..8 */
+    uint8_t  sym_idx;   /* index into the length-sorted symbol array */
     uint16_t root_code; /* canonical code of the chunk root (CANONICAL_FLAT) */
-    int      sym_idx;   /* index into the length-sorted symbol array */
 } chunk_t;
 
 typedef struct {
@@ -510,11 +513,9 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             int c = sym_count[L];
             int cur = per_len_start[L];
             for (int i = 0; i < c; i++) {
-                chunks[n_chunks].L       = (uint16_t)L;
                 chunks[n_chunks].bit     = 0;
-                chunks[n_chunks].depth   = (uint16_t)L;
-                chunks[n_chunks].n_syms  = 1;
-                chunks[n_chunks].sym_idx = cur + i;
+                chunks[n_chunks].depth   = (uint8_t)L;
+                chunks[n_chunks].sym_idx = (uint8_t)(cur + i);
                 n_chunks++;
             }
         }
@@ -528,20 +529,16 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             int n_pairs = c / 2;
             int n_singletons = c & 1;
             for (int i = 0; i < n_pairs; i++) {
-                chunks[n_chunks].L       = (uint16_t)L;
                 chunks[n_chunks].bit     = 1;
-                chunks[n_chunks].depth   = (uint16_t)(L - 1);
-                chunks[n_chunks].n_syms  = 2;
-                chunks[n_chunks].sym_idx = cur;
+                chunks[n_chunks].depth   = (uint8_t)(L - 1);
+                chunks[n_chunks].sym_idx = (uint8_t)cur;
                 cur += 2;
                 n_chunks++;
             }
             for (int i = 0; i < n_singletons; i++) {
-                chunks[n_chunks].L       = (uint16_t)L;
                 chunks[n_chunks].bit     = 0;
-                chunks[n_chunks].depth   = (uint16_t)L;
-                chunks[n_chunks].n_syms  = 1;
-                chunks[n_chunks].sym_idx = cur;
+                chunks[n_chunks].depth   = (uint8_t)L;
+                chunks[n_chunks].sym_idx = (uint8_t)cur;
                 cur++;
                 n_chunks++;
             }
@@ -574,12 +571,10 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 /* Safety: chunk depth = L-k must be >= 0; since k <= log2(remaining) <= log2(c) <= L-1
                    under any valid Kraft length distribution, this is always true. */
                 int n = 1 << k;
-                chunks[n_chunks].L        = (uint16_t)L;
-                chunks[n_chunks].bit      = (uint16_t)k;
-                chunks[n_chunks].depth    = (uint16_t)(L - k);
-                chunks[n_chunks].n_syms   = (uint16_t)n;
+                chunks[n_chunks].bit       = (uint8_t)k;
+                chunks[n_chunks].depth     = (uint8_t)(L - k);
                 chunks[n_chunks].root_code = (uint16_t)(C >> k);
-                chunks[n_chunks].sym_idx  = cur;
+                chunks[n_chunks].sym_idx   = (uint8_t)cur;
                 cur += n;
                 n_chunks++;
                 C += (uint32_t)n;
@@ -601,11 +596,9 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                     if      (bit >= 2) depth = L - bit;
                     else if (bit == 1) depth = L - 1;
                     else               depth = L;
-                    chunks[n_chunks].L      = (uint16_t)L;
-                    chunks[n_chunks].bit    = (uint16_t)bit;
-                    chunks[n_chunks].depth  = (uint16_t)depth;
-                    chunks[n_chunks].n_syms = (uint16_t)n;
-                    chunks[n_chunks].sym_idx = cur;
+                    chunks[n_chunks].bit     = (uint8_t)bit;
+                    chunks[n_chunks].depth   = (uint8_t)depth;
+                    chunks[n_chunks].sym_idx = (uint8_t)cur;
                     cur += n;
                     n_chunks++;
                 }
@@ -631,7 +624,7 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             unsigned rank = 0;
             for (int ci = 0; ci < n_chunks; ci++) {
                 int bit = chunks[ci].bit;
-                int n   = chunks[ci].n_syms;
+                int n   = 1 << bit;
                 uint16_t root = chunks[ci].root_code;
                 for (int i = 0; i < n; i++) {
                     uint8_t sym = items[chunks[ci].sym_idx + i];
@@ -672,7 +665,7 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 int d = chunks[ci].depth;
                 if (d > prev_depth) code <<= (d - prev_depth);
                 int bit = chunks[ci].bit;
-                int n   = chunks[ci].n_syms;
+                int n   = 1 << bit;
                 for (int i = 0; i < n; i++) {
                     uint8_t sym = items[chunks[ci].sym_idx + i];
                     full->code[sym] = (uint16_t)((code << bit) | (uint32_t)i);
