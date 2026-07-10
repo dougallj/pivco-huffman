@@ -149,11 +149,21 @@ static inline int wire_read_kr_header(const pivco_huffman_table_t *table,
  * for marker==0, or into the caller-provided `scratch` for the FSE
  * path).  Advances *in_ptr past the whole record.
  *
- * scratch must hold at least bitmap_bytes(n) bytes and stay live for
- * the entire span where the returned pointer is dereferenced. */
+ * scratch must hold at least bitmap_bytes(n) + 16 bytes and stay live
+ * for the entire span where the returned pointer is dereferenced.
+ *
+ * `in_end` = one past the last readable input byte.  The tail-free
+ * merges' mask reads are 2-byte pairs at even offsets, ending exactly
+ * at 2*ceil(n/16) — equal to bitmap_bytes(n) whenever n is a multiple
+ * of 16 (every production block size), and +1 otherwise.  A raw bitmap
+ * whose read requirement passes in_end (only possible for odd-sized
+ * final blocks flush against the buffer end) is bounced into `scratch`
+ * so no kernel read ever passes in_end.  Exact backends (SRC_SLACK ==
+ * 0) fold the check away entirely. */
 static inline const uint8_t *wire_read_bitmap(const uint8_t **in_ptr,
                                                 int n,
-                                                uint8_t *scratch)
+                                                uint8_t *scratch,
+                                                const uint8_t *in_end)
 {
     PROF_TIC();
     int nbytes = bitmap_bytes(n);
@@ -162,6 +172,11 @@ static inline const uint8_t *wire_read_bitmap(const uint8_t **in_ptr,
     if (marker == 0) {
         const uint8_t *bm = *in_ptr;
         *in_ptr += nbytes;
+        if (PIVCO_PRIM_DEC_SRC_SLACK > 0
+            && bm + 2 * (((size_t)n + 15) / 16) > in_end) {
+            memcpy(scratch, bm, (size_t)nbytes);
+            bm = scratch;
+        }
         PROF_TOC(PROF_WIRE_BITMAP_RAW, n);
         return bm;
     }
