@@ -439,6 +439,32 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         }
     }
 
+    /* n_used is the bin sum — the callers' former 256-entry pre-count
+       pass was redundant with the histogram above.  The 0/1-symbol
+       dispatch lives here so no caller needs its own scan. */
+    int n_used = 0;
+    for (int L = 1; L <= PIVCO_MAX_CODE_LEN; L++)
+        n_used += sym_count[L];
+    if (n_used == 0) return PIVCO_ERR_EMPTY;
+    if (full) full->num_symbols = (uint16_t)n_used;
+    if (n_used == 1) {
+        int sym = 0;
+        for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++)
+            if (lengths[s]) { sym = s; break; }
+        if (full) {
+            /* Degenerate convention: the lone symbol codes as one bit,
+               whatever length the input claimed. */
+            full->code[sym] = 0;
+            full->code_len[sym] = 1;
+            full->max_len = 1;
+            full->min_len = 1;
+            memset(full->sym_count, 0, sizeof(full->sym_count));
+            full->sym_count[1] = 1;
+        }
+        build_single_symbol_decode(sym, dt);
+        return PIVCO_OK;
+    }
+
     /* Derive min/max code length from the (<=11) length bins. */
     uint8_t max_len = 0, min_len = PIVCO_MAX_CODE_LEN + 1;
     for (int L = 1; L <= PIVCO_MAX_CODE_LEN; L++) {
@@ -723,17 +749,6 @@ int pivco_huffman_build_decode_table(const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
                                      pivco_huffman_decode_table_t *dt)
 {
     if (!code_lens || !dt) return PIVCO_ERR_NULL;
-
-    int n_used = 0, last = 0;
-    for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++)
-        if (code_lens[s] > 0) { n_used++; last = s; }
-    if (n_used == 0) return PIVCO_ERR_EMPTY;
-
-    if (n_used == 1) {
-        if (code_lens[last] > PIVCO_MAX_CODE_LEN) return PIVCO_ERR_CORRUPT;
-        build_single_symbol_decode(last, dt);
-        return PIVCO_OK;
-    }
     return build_core(code_lens, dt, NULL);
 }
 
@@ -752,16 +767,8 @@ int pivco_huffman_build_table_from_code_lens(
      * for it, so zeroing it here is wasted work -- see the struct doc. */
     memset(table, 0, offsetof(pivco_huffman_table_t, decode_sym));
 
-    int n_used = 0, last = 0;
-    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++)
-        if (code_lens[i] > 0) { n_used++; last = i; }
-    if (n_used == 0) return PIVCO_ERR_EMPTY;
-    table->num_symbols = (uint16_t)n_used;
-
-    if (n_used == 1) {
-        build_single_symbol_table(last, table);
-        return PIVCO_OK;
-    }
+    /* n_used counting and the 0/1-symbol dispatch live in build_core
+       (they fall out of its histogram); num_symbols is set there too. */
     return build_table_finish(code_lens, table);
 }
 
