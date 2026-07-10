@@ -25,9 +25,21 @@ static double now_sec(void)
 
 /* ---- Configuration ---- */
 #define TOTAL_SYMBOLS (4 * 1024 * 1024)  /* 4M symbol sequence */
+
+/* Runtime block size (--blk=N).  Defaults to PIVCO_BLOCK_SIZE; other
+ * values exercise the codec's non-default paths — in particular
+ * unaligned N (e.g. --blk=16383), where the tail-free decoder's root
+ * merge takes its exact-tail epilogue instead of writing pure
+ * 16-byte-aligned stores.  The sequence is carved into floor(4M/blk)
+ * whole blocks; throughput and checksums cover that effective total
+ * (for the default sizes it equals 4M exactly). */
+static int    g_blk       = PIVCO_BLOCK_SIZE;
+static int    g_nblocks   = TOTAL_SYMBOLS / PIVCO_BLOCK_SIZE;
+static size_t g_eff_total = TOTAL_SYMBOLS;
 #define DEFAULT_REPEATS 25               /* passes over 4M per timed run */
-#define BLK           PIVCO_BLOCK_SIZE   /* our block size */
-#define NBLOCKS       (TOTAL_SYMBOLS / BLK)
+#define BLK           g_blk              /* our block size (runtime, --blk=N) */
+#define NBLOCKS       g_nblocks
+#define EFF_TOTAL     g_eff_total        /* NBLOCKS * BLK; == 4M for defaults */
 #define RUNS          5
 #define DROP_WORST    2
 #define MAX_SPREAD    0.05
@@ -84,8 +96,15 @@ int main(int argc, char **argv)
             tdbu_only = 1;
         } else if (strcmp(argv[i], "--no-fse") == 0) {
             pivco_huffman_set_fse_enabled(0);
+        } else if (strncmp(argv[i], "--blk=", 6) == 0) {
+            int b = atoi(argv[i] + 6);
+            if (b < 1 || b > PIVCO_WIRE_MAX_N) {
+                fprintf(stderr, "--blk must be in [1, %d]\n", PIVCO_WIRE_MAX_N);
+                return 1;
+            }
+            g_blk = b;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [repeats] [--all] [--tdbu] [--no-fse]\n"
+            printf("Usage: %s [repeats] [--all] [--tdbu] [--no-fse] [--blk=N]\n"
                    "  repeats   passes over 4M symbols per timed run (default %d)\n"
                    "  --all     run every distribution AND every comparator\n"
                    "            (default MAIN: 9 distributions; pivco_s/n/bu,\n"
@@ -95,8 +114,11 @@ int main(int argc, char **argv)
                    "            keeps the full 5-run methodology.  Use for prof-on/off\n"
                    "            A/B without paying for trad / huf0 timing.\n"
                    "  --no-fse  disable the encoder's FSE dispatch at runtime\n"
-                   "            (still v0.2+ wire format; marker stays 0).\n",
-                   argv[0], DEFAULT_REPEATS);
+                   "            (still v0.2+ wire format; marker stays 0).\n"
+                   "  --blk=N   PIVCO block size (default %d).  Unaligned values\n"
+                   "            (e.g. %d) exercise the exact-tail root epilogue.\n",
+                   argv[0], DEFAULT_REPEATS, PIVCO_BLOCK_SIZE,
+                   PIVCO_BLOCK_SIZE - 1);
             return 0;
         } else {
             int r = atoi(argv[i]);
@@ -104,6 +126,8 @@ int main(int argc, char **argv)
         }
     }
     if (repeats < 1) repeats = 1;
+    g_nblocks   = TOTAL_SYMBOLS / g_blk;
+    g_eff_total = (size_t)g_nblocks * (size_t)g_blk;
 
     /* PIVCO_BENCH_QUICK: skip every comparator (run only pivco_n), reduce
        runs to 2 (no drop).  ~5-10x faster wall, used for iteration; the
@@ -325,9 +349,9 @@ int main(int argc, char **argv)
         t0 = now_sec(); \
         for (int rep = 0; rep < repeats; rep++) { block; } \
         t1 = now_sec(); \
-        runs_arr[r] = (double)TOTAL_SYMBOLS * repeats / (t1 - t0) / 1e6; \
-        if (r == 0) cksum_first = fnv1a(dec_buf, TOTAL_SYMBOLS); \
-        if (r == runs - 1) cksum_last = fnv1a(dec_buf, TOTAL_SYMBOLS); \
+        runs_arr[r] = (double)EFF_TOTAL * repeats / (t1 - t0) / 1e6; \
+        if (r == 0) cksum_first = fnv1a(dec_buf, EFF_TOTAL); \
+        if (r == runs - 1) cksum_last = fnv1a(dec_buf, EFF_TOTAL); \
     } \
     if (cksum_first != cksum_last) { \
         fprintf(stderr, "  ERROR: %s checksum mismatch between runs!\n", label); \
@@ -359,7 +383,7 @@ int main(int argc, char **argv)
                 pivco_enc_off[b+1] - pivco_enc_off[b],
                 table, dec_buf + (size_t)b * BLK, &consumed);
         }
-        uint64_t expected_cksum = fnv1a(dec_buf, TOTAL_SYMBOLS);
+        uint64_t expected_cksum = fnv1a(dec_buf, EFF_TOTAL);
 
 #if defined(PIVCO_HAS_NEON) || defined(PIVCO_HAS_SSE4) || defined(PIVCO_HAS_AVX512) || defined(PIVCO_HAS_SVE)
         BENCH(p_dec_n, {
