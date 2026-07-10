@@ -346,9 +346,11 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
 /* Build ONLY the ~1 KB decode table from code lengths — the minimal
  * decode-side setup (no explicit tree, no encode/trad fields, no memset).
  * Deterministic from the lengths, so it matches any encoder-side
- * pivco_huffman_build_table over the same lengths.  Rejects lengths over
- * PIVCO_MAX_CODE_LEN with PIVCO_ERR_CORRUPT (the lengths typically come
- * off the wire). */
+ * pivco_huffman_build_table over the same lengths.
+ *
+ * Rejects any length over PIVCO_MAX_CODE_LEN with PIVCO_ERR_CORRUPT
+ * (by bin accounting — no separate validation pass), and
+ * non-Kraft-complete lengths likewise via the schedule generation. */
 int pivco_huffman_build_decode_table(const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
                                      pivco_huffman_decode_table_t *dt);
 

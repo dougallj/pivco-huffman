@@ -4,6 +4,16 @@
 #include <stddef.h>
 #include "pivco_check.h"
 
+/* The length histogram is the hottest part of the decode-table build and
+ * is SIMD-friendly (256 bytes, <= 12 bins), so it gets a NEON path here —
+ * a deliberate exception to the "intrinsics live in the primitives
+ * headers" rule, since this file is backend-agnostic and compiled once.
+ * -DPIVCO_HISTO_PORTABLE forces the portable path (for A/B). */
+#if (defined(__aarch64__) || defined(__ARM_NEON)) && !defined(PIVCO_HISTO_PORTABLE)
+#define PIVCO_HISTO_NEON 1
+#include <arm_neon.h>
+#endif
+
 /* ---------- Code lengths via van Leeuwen's two-queue method ----------
  * Replaces the index-indirected binary min-heap.  The heap spent ~⅔ of the
  * whole table build pointer-chasing (nodes[indices[i]].freq is two dependent
@@ -236,6 +246,74 @@ static void fill_enc_init_aux(pivco_huffman_table_t *table)
 #endif
 }
 
+/* ---------- Code-length histogram ----------
+ *
+ * The scalar bin-increment histogram is a store-to-load-forwarding trap:
+ * a run of same-length symbols (uniform256 = 256 increments of ONE bin)
+ * serializes on the ~6-cycle forward latency.  The variants below break
+ * that chain.  Returns n_used (the sum of bins 1..PIVCO_MAX_CODE_LEN),
+ * or -1 if any length is invalid (> PIVCO_MAX_CODE_LEN — the lengths
+ * come off the wire).  Validation is by bin ACCOUNTING, not a max
+ * sweep: zeros are counted too, and any byte outside 0..MAX makes
+ * n_used + n_zero fall short of 256.
+ * sym_count[1..PIVCO_MAX_CODE_LEN] must be zeroed by the caller. */
+#ifdef PIVCO_HISTO_NEON
+/* Per-bin equality counting: one cmeq/accumulate sweep of the 256 bytes
+ * per bin (12 sweeps counting the zero bin), all lanes independent — no
+ * scatter, no chains, inherently in-bounds for ANY input byte. */
+static int length_histogram(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
+                            uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1])
+{
+    int seen = 0, n_used = 0;
+    for (int L = 0; L <= PIVCO_MAX_CODE_LEN; L++) {
+        const uint8x16_t target = vdupq_n_u8((uint8_t)L);
+        uint8x16_t acc = vdupq_n_u8(0);   /* lane counts <= 16 chunks, no overflow */
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
+            acc = vsubq_u8(acc, vceqq_u8(vld1q_u8(lengths + i), target));
+        unsigned cnt = vaddlvq_u8(acc);
+        seen += (int)cnt;
+        if (L > 0) {
+            sym_count[L] = (uint16_t)cnt;
+            n_used += (int)cnt;
+        }
+    }
+    return (seen == PIVCO_MAX_SYMBOLS) ? n_used : -1;
+}
+#else
+/* Four interleaved sub-histograms: same-bin runs split across four
+ * independent forwarding chains.  Bytes >= 16 are rejected before
+ * indexing (they'd store past the 16-wide bins); semantic garbage in
+ * (MAX, 16) lands in bins the accounting sum exposes.  The len>0 guard
+ * stays — it skips the zero runs of sparse alphabets outright (a bin-0
+ * pileup was measured 5x slower than the well-predicted branch, back
+ * when this was a single scalar loop). */
+static int length_histogram(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
+                            uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1])
+{
+    uint16_t h0[16] = {0};
+    uint16_t h1[16] = {0};
+    uint16_t h2[16] = {0};
+    uint16_t h3[16] = {0};
+    int n_zero = 0;
+    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 4) {
+        uint8_t a = lengths[i],     b = lengths[i + 1];
+        uint8_t c = lengths[i + 2], d = lengths[i + 3];
+        if ((a | b | c | d) > 15) return -1;   /* any byte >= 16 sets a high bit */
+        n_zero += (a == 0) + (b == 0) + (c == 0) + (d == 0);
+        if (a) h0[a]++;
+        if (b) h1[b]++;
+        if (c) h2[c]++;
+        if (d) h3[d]++;
+    }
+    int n_used = 0;
+    for (int L = 1; L <= PIVCO_MAX_CODE_LEN; L++) {
+        sym_count[L] = (uint16_t)(h0[L] + h1[L] + h2[L] + h3[L]);
+        n_used += sym_count[L];
+    }
+    return (n_used + n_zero == PIVCO_MAX_SYMBOLS) ? n_used : -1;
+}
+#endif
+
 /* Single-symbol degenerate decode table: a fabricated pair of two ranks
  * holding the same symbol, so the walk needs no degenerate special case —
  * root range [0,2) is a plain both-leaves node.  The schedule is a single
@@ -425,32 +503,18 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                       pivco_huffman_decode_table_t *dt,
                       pivco_huffman_table_t *full)
 {
-    /* Histogram code lengths (local scratch; copied to the full table at
-       the end).  The len>0 guard isn't about correctness (bin 0 is unread
-       scratch) -- it keeps the unused symbols from all piling onto bin 0,
-       whose serial store-to-load-forward chain was 5x slower than the
-       (well-predicted) branch on sparse alphabets.  Oversized lengths are
-       rejected here (they reach this path from the wire). */
+    /* Histogram code lengths + validate + count used symbols (n_used is
+       the bin sum, so no caller needs its own pre-count pass).  The
+       0/1-symbol dispatch lives here too. */
     uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1] = {0};
-    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++) {
-        if (lengths[i] > 0) {
-            if (lengths[i] > PIVCO_MAX_CODE_LEN) return PIVCO_ERR_CORRUPT;
-            sym_count[lengths[i]]++;
-        }
-    }
-
-    /* n_used is the bin sum — the callers' former 256-entry pre-count
-       pass was redundant with the histogram above.  The 0/1-symbol
-       dispatch lives here so no caller needs its own scan. */
-    int n_used = 0;
-    for (int L = 1; L <= PIVCO_MAX_CODE_LEN; L++)
-        n_used += sym_count[L];
+    int n_used = length_histogram(lengths, sym_count);
+    if (n_used < 0) return PIVCO_ERR_CORRUPT;
     if (n_used == 0) return PIVCO_ERR_EMPTY;
     if (full) full->num_symbols = (uint16_t)n_used;
     if (n_used == 1) {
         int sym = 0;
         for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++)
-            if (lengths[s]) { sym = s; break; }
+            if (lengths[s] && lengths[s] <= PIVCO_MAX_CODE_LEN) { sym = s; break; }
         if (full) {
             /* Degenerate convention: the lone symbol codes as one bit,
                whatever length the input claimed. */
