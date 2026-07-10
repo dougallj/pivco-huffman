@@ -462,6 +462,92 @@ static inline void codec_flat_region(uint8_t *out, int K,
     }
 }
 
+/* ---------- Exact-tail root epilogue (tail-free backends) ----------
+ *
+ * A tail-free merge stores ceilq(K) bytes, so for K not a quantum
+ * multiple it cannot target the caller's `symbols` directly.  Instead
+ * of bouncing the whole block through scratch, split at n1 = K & ~15:
+ * the prefix merge's stores are exact (n1 is chunk-aligned) and bit
+ * n1 is byte-aligned in the bitmap, so the remaining n2 = K - n1
+ * (1..15) symbols decode as an independent sub-merge into a 16-byte
+ * temp, memcpy'd out.  Cursors are recovered O(1) from the wire's
+ * K_right and a popcount of the <=15 tail bits.  Only the entry's
+ * root merges (the only ones targeting `symbols`) use these. */
+
+/* popcount of bitmap bits [n1, n1+n2), n1 chunk-aligned, n2 <= 15.
+ * The 2-byte read is within the merges' 2*ceil(K/16) bitmap read
+ * bound, so it is covered by wire_read_bitmap's bounce decision. */
+static inline int codec_bm_tail_pop(const uint8_t *bm, int n1, int n2)
+{
+    uint16_t w;
+    memcpy(&w, bm + (n1 >> 3), 2);
+    return __builtin_popcount((unsigned)w & ((1u << n2) - 1u));
+}
+
+static void codec_merge_vec_vec_exact(const uint8_t *bm, int K, int K_right,
+                                      const uint8_t *left,
+                                      const uint8_t *right,
+                                      uint8_t *out)
+{
+    int n1 = K & ~15, n2 = K - n1;
+    prim_merge_vec_vec(bm, n1, left, right, out);
+    int r  = codec_bm_tail_pop(bm, n1, n2);
+    int rc = K_right - r;
+    int lc = (K - K_right) - (n2 - r);
+    uint8_t t[16];
+    prim_merge_vec_vec(bm + (n1 >> 3), n2, left + lc, right + rc, t);
+    memcpy(out + n1, t, (size_t)n2);
+}
+
+static void codec_merge_cst_vec_exact(const uint8_t *bm, int K, int K_right,
+                                      uint8_t left_sym,
+                                      const uint8_t *right,
+                                      uint8_t *out)
+{
+    int n1 = K & ~15, n2 = K - n1;
+    prim_merge_cst_vec(bm, n1, left_sym, right, out);
+    int rc = K_right - codec_bm_tail_pop(bm, n1, n2);
+    uint8_t t[16];
+    prim_merge_cst_vec(bm + (n1 >> 3), n2, left_sym, right + rc, t);
+    memcpy(out + n1, t, (size_t)n2);
+}
+
+static void codec_merge_cst_cst_exact(const uint8_t *bm, int K,
+                                      uint8_t left_sym, uint8_t right_sym,
+                                      uint8_t *out)
+{
+    int n1 = K & ~15, n2 = K - n1;
+    prim_merge_cst_cst(bm, n1, left_sym, right_sym, out);
+    uint8_t t[16];
+    prim_merge_cst_cst(bm + (n1 >> 3), n2, left_sym, right_sym, t);
+    memcpy(out + n1, t, (size_t)n2);
+}
+
+/* codec_flat_region with EXACT stores for the flat-root-into-symbols
+ * case: chunk-aligned prefix direct, <=15 tail codes from a small
+ * stack copy into a 16-byte temp.  D == 8 is a memcpy kernel — exact
+ * both ways. */
+static void codec_flat_region_exact(uint8_t *out, int K,
+                                    const uint8_t *bm, int D,
+                                    const uint8_t *c2s,
+                                    const uint8_t *in_end,
+                                    uint8_t *slab)
+{
+    if (D == 8) {
+        prim_merge_flat(out, K, bm, D, c2s);
+        return;
+    }
+    int n1 = K & ~15, n2 = K - n1;
+    codec_flat_region(out, n1, bm, D, c2s, in_end, slab);
+    size_t b1 = (size_t)n1 * (size_t)D / 8;
+    size_t tail_len = (size_t)((K * D + 7) >> 3) - b1;
+    uint8_t src[32];   /* <=15 codes * <=7 bits: 14 B data + 16 B kernel lookahead */
+    memcpy(src, bm + b1, tail_len);
+    uint8_t t[16];
+    prim_merge_flat(t, n2, src, D, c2s);
+    memcpy(out + n1, t, (size_t)n2);
+}
+
 static void codec_decode_subtree(const pivco_huffman_table_t *table,
                                    int16_t node_id, int K,
                                    uint8_t *out, uint8_t *out_end,
@@ -635,8 +721,6 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
      *   [walk_off, bump_off)     bump spill region for placements that
      *                            fail the ceilq end-invariant
      *   [bump_off, +N+16)        in_bounce slab (end-of-input regions)
-     *   [bump_off+N+16, +N+16)   dst slab (root output when
-     *                            N % STORE_QUANTUM != 0)
      * plus MERGE_OVERREAD trailing read slack. */
     const size_t slab_sz  = (size_t)N + 16;
     const size_t walk_off = 2 * (size_t)N + 2 * DEC_SLOP + 512;
@@ -646,9 +730,13 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
      * the per-slice headroom (dominant for tiny N). */
     const size_t bump_off = walk_off + (size_t)N * (PIVCO_MAX_CODE_LEN + 2)
                           + 2 * (PIVCO_MAX_CODE_LEN + 2) * (DEC_SLOP + 64);
-    const size_t need     = bump_off + 2 * slab_sz + MERGE_OVERREAD;
+    const size_t need     = bump_off + slab_sz + MERGE_OVERREAD;
 
-    const int dst_bounce_needed =
+    /* Root merge stores are exact iff N is a store-quantum multiple;
+     * otherwise the entry's root merges run the exact-tail epilogue
+     * (chunk-aligned prefix direct + <=15-symbol sub-merge via a
+     * 16-byte temp) — no block-sized bounce, no unaligned-N cliff. */
+    const int root_tail =
         (PIVCO_PRIM_DEC_STORE_QUANTUM > 1)
         && ((size_t)N % DEC_Q) != 0;
 
@@ -658,53 +746,53 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
      * codec_decode_subtree machinery (switch dispatch + bm_scratch
      * stack frame + scratch TLS reference / arena ensure).  Worth −26%
      * on two_sym decode on older narrow x86 (IvyBridge), noise on
-     * modern hosts.  (The arena is touched here only for the rare
-     * bounced short block.) */
+     * modern hosts.  (Still no arena reference: the unaligned-N
+     * epilogue works on stack temps.) */
     if ((pivco_node_type_t)table->node_type[table->tree_root]
         == PIVCO_NODE_BOTH_LEAVES) {
-        uint8_t *out_buf = symbols;
-        if (dst_bounce_needed) {
-            uint8_t *scratch = decode_scratch_ensure(need);
-            if (!scratch) return PIVCO_ERR_NULL;
-            out_buf = scratch + bump_off + slab_sz;
-        }
         uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
         const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch, in_end);
         const pivco_tree_node_t *left_child  = &table->tree[root->left];
         const pivco_tree_node_t *right_child = &table->tree[root->right];
-        prim_merge_cst_cst(bm, N,
+        if (root_tail)
+            codec_merge_cst_cst_exact(bm, N,
                                (uint8_t)left_child->symbol,
                                (uint8_t)right_child->symbol,
-                               out_buf);
-        if (dst_bounce_needed) memcpy(symbols, out_buf, (size_t)N);
+                               symbols);
+        else
+            prim_merge_cst_cst(bm, N,
+                               (uint8_t)left_child->symbol,
+                               (uint8_t)right_child->symbol,
+                               symbols);
         *consumed = (size_t)(ptr - in);
         return PIVCO_OK;
     }
 
     /* Flat root: the whole tree is one packed-bits region, decoded
-     * straight into symbols (no merge, no walk).  Bounces through the
-     * arena only when the region abuts in_end (src) or N isn't a
-     * store-quantum multiple (dst). */
+     * straight into symbols (no merge, no walk).  The arena is needed
+     * only when the region abuts in_end (src split); the unaligned-N
+     * epilogue works on stack temps. */
     if ((pivco_node_type_t)table->node_type[table->tree_root]
         == PIVCO_NODE_INTERNAL_FLAT) {
         int D = table->flat_depth[table->tree_root];
         int total_bytes = (N * D + 7) >> 3;
         const uint8_t *bm = ptr;
         ptr += total_bytes;
-        uint8_t *out_buf = symbols;
+        const uint8_t *c2s =
+            &table->flat_code_to_sym[table->flat_offset[table->tree_root]];
         const int src_split_needed =
             PIVCO_PRIM_DEC_SRC_SLACK > 0 && D != 8
             && bm + total_bytes + PIVCO_PRIM_DEC_SRC_SLACK > in_end;
-        uint8_t *scratch = NULL;
-        if (dst_bounce_needed || src_split_needed) {
-            scratch = decode_scratch_ensure(need);
+        uint8_t *slab = NULL;
+        if (src_split_needed) {
+            uint8_t *scratch = decode_scratch_ensure(need);
             if (!scratch) return PIVCO_ERR_NULL;
-            if (dst_bounce_needed) out_buf = scratch + bump_off + slab_sz;
+            slab = scratch + bump_off;
         }
-        codec_flat_region(out_buf, N, bm, D,
-                          &table->flat_code_to_sym[table->flat_offset[table->tree_root]],
-                          in_end, scratch ? scratch + bump_off : NULL);
-        if (dst_bounce_needed) memcpy(symbols, out_buf, (size_t)N);
+        if (root_tail)
+            codec_flat_region_exact(symbols, N, bm, D, c2s, in_end, slab);
+        else
+            codec_flat_region(symbols, N, bm, D, c2s, in_end, slab);
         *consumed = (size_t)(ptr - in);
         return PIVCO_OK;
     }
@@ -723,8 +811,6 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
                           scratch + bump_off,
                           scratch + bump_off };
     uint8_t *bump_base = scratch + walk_off;
-    uint8_t *root_out  = dst_bounce_needed ? scratch + bump_off + slab_sz
-                                           : symbols;
 
     if ((pivco_node_type_t)table->node_type[table->tree_root]
         == PIVCO_NODE_LEAF_LEFT) {
@@ -741,10 +827,14 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
 
         uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
         const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch, in_end);
-        prim_merge_cst_vec(bm, N,
+        if (root_tail)
+            codec_merge_cst_vec_exact(bm, N, K_right,
                            (uint8_t)table->tree[root->left].symbol,
-                           scratch, root_out);
-        if (dst_bounce_needed) memcpy(symbols, root_out, (size_t)N);
+                           scratch, symbols);
+        else
+            prim_merge_cst_vec(bm, N,
+                           (uint8_t)table->tree[root->left].symbol,
+                           scratch, symbols);
         *consumed = (size_t)(ptr - in);
         return PIVCO_OK;
     }
@@ -785,8 +875,11 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
 
     uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
     const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch, in_end);
-    prim_merge_vec_vec(bm, N, buf_left, buf_right, root_out);
-    if (dst_bounce_needed) memcpy(symbols, root_out, (size_t)N);
+    if (root_tail)
+        codec_merge_vec_vec_exact(bm, N, K_right,
+                                  buf_left, buf_right, symbols);
+    else
+        prim_merge_vec_vec(bm, N, buf_left, buf_right, symbols);
 
     *consumed = (size_t)(ptr - in);
     return PIVCO_OK;
