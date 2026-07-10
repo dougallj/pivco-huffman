@@ -173,3 +173,43 @@ is 0/1, which automatically enforces "B_L is a set" (§2).  ~70 × 257 ×
    practice?
 5. Robustness: lengths are chosen from file-global n_s but decode cost
    is realized per block.  Does optimizing the expectation suffice?
+
+---
+
+## Post-review addendum (2026-07-10, after RESPONSE.md)
+
+Review verdicts folded in: Claim 1 is exact for the FREE-assignment
+variant (what the implementation computes); with kernel terms
+kappa_b it needs monotonicity condition (M): kappa_{b+1} - kappa_b
+<= 1, which real kernel timings plausibly violate at b=4->5 — the
+likely mechanism behind the geometric regression, since the current
+implementation sets kappa = 0.  gamma must be a fixed take-charge per
+item, not amortized into slot cost.  Kraft equality stays for the
+production decoder (the deficit counterexample requires nonmonotone
+kappa).  The lambda sweep finds only SUPPORTED Pareto points; hard
+ratio budgets need epsilon-constraint search.  Variant A has an exact
+route: histogram enumeration in B_free lower-bound order + per-
+histogram chain-shuffle A* with the free relaxation as admissible
+heuristic.  Bonus identity (review §8): ideal merge-bitmap size is
+tree-arrangement INVARIANT (multinomial cancellation), strengthening
+K4.  Better within-class orders without full rank bytes: permutation
+codebook (4-8 bit profile per tree) or hash order.
+
+## Realistic-workload results (Silesia zstd literals, tables per window)
+
+M4, 12 .lits files, per-window table build + 16K-block encode/decode,
+ratio INCLUDES the 128-byte lengths header per window, lambda = 0.1:
+
+| G    | decode      | encode      | ratio          | adopted    |
+|------|-------------|-------------|----------------|------------|
+| 16 K | +63.4 % gm  | +70.1 % gm  | +0.08 % (worst +0.41 %) | 91 % of windows |
+| 64 K | +37.6 % gm  | +34.5 % gm  | +0.14 % (worst +0.54 %) | 79 % of windows |
+
+No real-data regressions (min −1.8 % at 16 K, +1.1 % at 64 K); some
+files get SMALLER (nci −0.67 %).  The blocker for this cadence is
+table-build cost: ~6 ms/window vs 15-26 us baseline (~230-2900x the
+window's own encode time).  Productization requires the fast DP
+(sparse states / feasibility bounds / drop the 16 B-per-state masks)
+or a heuristic with the DP as offline reference; until then the knob
+is data-bake-for-distribution grade, per the review's complexity
+caveat.

@@ -1,0 +1,60 @@
+===== G=16K baseline =====
+G=16K lambda=0.00 reps=5
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6609      1726       629       55.6      2.16x      0/44
+mozilla.lits   0.9471      6421      2267       26.1      3.62x      0/691
+mr.lits        0.7986      7293      3012       16.1      2.98x      0/97
+nci.lits       0.5292      8951      3521       10.2      2.23x      0/52
+ooffice.lits   0.9215      7113      2902       11.7      2.07x      0/107
+osdb.lits      0.8969      8833      3031        9.5      1.76x      0/126
+reymont.lits   0.7064     10659      4549        8.4      2.37x      0/23
+samba.lits     0.8925      9751      4226        8.2      2.12x      0/146
+sao.lits       0.9729      8770      4153        7.5      1.91x      0/240
+webster.lits   0.6718      8506      3328        8.3      1.69x      0/177
+x-ray.lits     0.8524      7988      3701       13.4      3.03x      0/296
+xml.lits       0.6973      9735      4204        8.6      2.34x      0/12
+===== G=16K joint=0.1 =====
+G=16K lambda=0.10 reps=5
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6618     13676      5556     2411.0    828.77x     44/44
+mozilla.lits   0.9487     13720      5737     8312.5   2911.29x    663/691
+mr.lits        0.7990      9907      4475     8489.8   2339.52x     80/97
+nci.lits       0.5268     10017      4145     1344.6    344.43x     49/52
+ooffice.lits   0.9242     10669      4999     8664.2   2648.77x    107/107
+osdb.lits      0.9006     11828      4935     8932.1   2698.90x    126/126
+reymont.lits   0.7058     14348      5921     2957.1   1079.57x     17/23
+samba.lits     0.8935     21434      7904     5966.7   2894.16x    136/146
+sao.lits       0.9730      8616      4243     7857.4   2040.89x    130/240
+webster.lits   0.6719     12628      4764     2959.9    863.10x    177/177
+x-ray.lits     0.8544      9544      4287     8489.1   2221.72x    287/296
+xml.lits       0.6978     13211      5440     2541.0    896.82x     10/12
+===== G=64K baseline =====
+G=64K lambda=0.00 reps=5
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6572      9002      3907       23.8      1.44x      0/11
+mozilla.lits   0.9489      8161      3423       22.4      1.17x      0/173
+mr.lits        0.7980      6940      2896       34.6      1.59x      0/25
+nci.lits       0.5248      9246      3611       27.6      1.54x      0/13
+ooffice.lits   0.9223      6782      2845       21.9      0.96x      0/27
+osdb.lits      0.8914      8265      3471       20.3      1.09x      0/32
+reymont.lits   0.7023      9565      4192       24.0      1.62x      0/6
+samba.lits     0.8924      7700      3694       22.9      1.32x      0/37
+sao.lits       0.9761      7397      3317       19.2      0.97x      0/60
+webster.lits   0.6671      8146      3268       23.7      1.20x      0/45
+x-ray.lits     0.8475      7770      3750       42.1      2.41x      0/74
+xml.lits       0.7113      7398      3699       24.0      1.44x      0/3
+===== G=64K joint=0.1 =====
+G=64K lambda=0.10 reps=5
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6575     13418      5429     2821.1    236.89x     11/11
+mozilla.lits   0.9507     12145      5211     8242.7    656.53x    139/173
+mr.lits        0.7976      7361      3309     8346.9    438.39x     18/25
+nci.lits       0.5213     10017      4026     1618.0    100.64x     13/13
+ooffice.lits   0.9261      9458      4568     8546.6    602.50x     27/27
+osdb.lits      0.8962     12035      5291     8924.8    734.17x     32/32
+reymont.lits   0.7047     14922      5739     3539.7    326.74x      3/6
+samba.lits     0.8934     15058      6180     6676.2    641.61x     32/37
+sao.lits       0.9762      7481      3500     7813.2    418.56x     12/60
+webster.lits   0.6671     11950      4927     3093.6    237.16x     45/45
+x-ray.lits     0.8498      9183      4151     8504.9    538.84x     67/74
+xml.lits       0.7146     12331      4867     2986.7    235.79x      3/3
