@@ -9,7 +9,8 @@
  * Two responsibilities only:
  *
  *   1. Walk the Huffman tree (encode recursion + BU decode recursion).
- *      The tree is IMPLICIT (issue #7): the walk streams table->sched[],
+ *      The tree is IMPLICIT (issue #7): the walk streams the decode
+ *      table's sched[] (embedded in the full table as table->dec),
  *      the pre-order program rendered from the rank-range form at
  *      build-table time -- see the walk note below.  table->tree[] is
  *      never read here.
@@ -207,17 +208,21 @@ extern uint64_t g_pivco_fse_bytes_out[PIVCO_FSE_STATS_SLOTS];
 /* ---------- Backend → entry-point name ---------- */
 
 #if defined(PIVCO_BACKEND_SCALAR)
-#  define CODEC_ENCODE_ENTRY pivco_huffman_encode_scalar
-#  define CODEC_DECODE_ENTRY pivco_huffman_decode_scalar
+#  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_scalar
+#  define CODEC_DECODE_ENTRY    pivco_huffman_decode_scalar
+#  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_scalar_dt
 #elif defined(PIVCO_BACKEND_NEON)
-#  define CODEC_ENCODE_ENTRY pivco_huffman_encode_neon
-#  define CODEC_DECODE_ENTRY pivco_huffman_decode_bu_neon
+#  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_neon
+#  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_neon
+#  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_neon_dt
 #elif defined(PIVCO_BACKEND_X86)
-#  define CODEC_ENCODE_ENTRY pivco_huffman_encode_x86
-#  define CODEC_DECODE_ENTRY pivco_huffman_decode_bu_x86
+#  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_x86
+#  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_x86
+#  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_x86_dt
 #elif defined(PIVCO_BACKEND_AVX512)
-#  define CODEC_ENCODE_ENTRY pivco_huffman_encode_avx512
-#  define CODEC_DECODE_ENTRY pivco_huffman_decode_bu_avx512
+#  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_avx512
+#  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_avx512
+#  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_avx512_dt
 #else
 #  error "pivco_huffman_codec.c needs PIVCO_BACKEND_{SCALAR,NEON,X86,AVX512}"
 #endif
@@ -346,7 +351,7 @@ static void codec_encode_node(const pivco_huffman_table_t *table,
 {
     PROF_COUNT_ONLY(PROF_ENC_NODE_VISIT, n);
 
-    const pivco_sched_rec_t *rec = &table->sched[(*cursor)++];
+    const pivco_sched_rec_t *rec = &table->dec.sched[(*cursor)++];
     const unsigned kind = rec->kd & 3u;
 
     /* Flat-subtree fast path: pack n*D bits, no marker, no K_right. */
@@ -412,14 +417,14 @@ static void codec_encode_node(const pivco_huffman_table_t *table,
             codec_encode_node(table, cursor, ranks, n_left, depth + 1,
                                out_ptr, tmp + n_right);
         else
-            *cursor += table->sched[*cursor].skip;
+            *cursor += table->dec.sched[*cursor].skip;
     }
     if (kind != PIVCO_SCHED_PAIR) {
         if (n_right > 0)
             codec_encode_node(table, cursor, tmp, n_right, depth + 1,
                                out_ptr, tmp + n_right);
         else
-            *cursor += table->sched[*cursor].skip;
+            *cursor += table->dec.sched[*cursor].skip;
     }
 }
 
@@ -492,13 +497,13 @@ int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
  * is on.  The root call passes 0 -- the caller's output buffer has no
  * over-read slack. */
 
-static void codec_decode_subtree(const pivco_huffman_table_t *table,
+static void codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
                                    unsigned *cursor, int K,
                                    uint8_t *out_buf,
                                    const uint8_t **in_ptr,
                                    uint8_t *scratch_top, int tail_ok)
 {
-    const pivco_sched_rec_t *rec = &table->sched[(*cursor)++];
+    const pivco_sched_rec_t *rec = &dt->sched[(*cursor)++];
     const unsigned kind = rec->kd & 3u;
 
     if (kind == PIVCO_SCHED_FLAT) {
@@ -508,7 +513,7 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
         int total_bytes = (K * D + 7) >> 3;
         const uint8_t *bm = *in_ptr;
         *in_ptr += total_bytes;
-        prim_merge_flat(out_buf, K, bm, D, &table->rank_to_sym[rec->param]);
+        prim_merge_flat(out_buf, K, bm, D, &dt->rank_to_sym[rec->param]);
         return;
     }
 
@@ -517,8 +522,8 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
         uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
         const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch);
         prim_merge_cst_cst(bm, K,
-                           table->rank_to_sym[rec->param],
-                           table->rank_to_sym[rec->param + 1],
+                           dt->rank_to_sym[rec->param],
+                           dt->rank_to_sym[rec->param + 1],
                            out_buf);
         return;
     }
@@ -534,13 +539,13 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
             ? place_tail(out_buf, K - K_right, K_right, &scratch_top)
             : scratch_carve(&scratch_top, K_right);
         if (K_right > 0)
-            codec_decode_subtree(table, cursor, K_right,
+            codec_decode_subtree(dt, cursor, K_right,
                                   right_buf, in_ptr, scratch_top,
                                   g_dec_inplace);
         else
-            *cursor += table->sched[*cursor].skip;
+            *cursor += dt->sched[*cursor].skip;
         prim_merge_cst_vec(bm, K,
-                           table->rank_to_sym[rec->param],
+                           dt->rank_to_sym[rec->param],
                            right_buf, out_buf);
         return;
     }
@@ -565,23 +570,23 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
     }
 
     if (K_left > 0)
-        codec_decode_subtree(table, cursor, K_left,
+        codec_decode_subtree(dt, cursor, K_left,
                               left_buf,  in_ptr, scratch_top, g_dec_inplace);
     else
-        *cursor += table->sched[*cursor].skip;
+        *cursor += dt->sched[*cursor].skip;
     if (K_right > 0)
-        codec_decode_subtree(table, cursor, K_right,
+        codec_decode_subtree(dt, cursor, K_right,
                               right_buf, in_ptr, scratch_top, g_dec_inplace);
     else
-        *cursor += table->sched[*cursor].skip;
+        *cursor += dt->sched[*cursor].skip;
     prim_merge_vec_vec(bm, K, left_buf, right_buf, out_buf);
 }
 
-int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
-                       const pivco_huffman_table_t *table,
-                       uint8_t *symbols, size_t *consumed)
+int CODEC_DECODE_DT_ENTRY(const uint8_t *in, size_t in_len,
+                          const pivco_huffman_decode_table_t *dt,
+                          uint8_t *symbols, size_t *consumed)
 {
-    if (!in || !table || !symbols || !consumed) return PIVCO_ERR_NULL;
+    if (!in || !dt || !symbols || !consumed) return PIVCO_ERR_NULL;
     (void)in_len;
     prim_codec_init();
 
@@ -598,12 +603,12 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
      * ensure).  Worth −26% on two_sym decode on older narrow x86
      * (IvyBridge), noise on modern hosts.  TODO: consider removing this
      * extreme-case optimization. */
-    if (table->num_ranks == 2) {
+    if (dt->num_ranks == 2) {
         uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
         const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch);
         prim_merge_cst_cst(bm, N,
-                               table->rank_to_sym[0],
-                               table->rank_to_sym[1],
+                               dt->rank_to_sym[0],
+                               dt->rank_to_sym[1],
                                symbols);
         *consumed = (size_t)(ptr - in);
         return PIVCO_OK;
@@ -626,9 +631,18 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
     g_scratch_pad_left = PIVCO_SCRATCH_PAD_BUDGET;
 
     unsigned sched_cursor = 0;
-    codec_decode_subtree(table, &sched_cursor, N,
+    codec_decode_subtree(dt, &sched_cursor, N,
                           symbols, &ptr, scratch, /*tail_ok=*/0);
 
     *consumed = (size_t)(ptr - in);
     return PIVCO_OK;
+}
+
+/* Full-table shim: the decode core is embedded as table->dec. */
+int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
+                       const pivco_huffman_table_t *table,
+                       uint8_t *symbols, size_t *consumed)
+{
+    if (!table) return PIVCO_ERR_NULL;
+    return CODEC_DECODE_DT_ENTRY(in, in_len, &table->dec, symbols, consumed);
 }

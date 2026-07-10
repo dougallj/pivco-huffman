@@ -216,6 +216,8 @@ static void limit_code_lengths(uint8_t *lengths, int n_symbols, int max_len)
  * (lengths come straight off the wire).  The explicit tree is NOT built --
  * see pivco_huffman_build_explicit_tree.  Assumes `table` is already zeroed
  * and table->num_symbols is set; caller handles n_used <= 1. */
+/* Full build downstream of the code lengths -- defined after build_core
+ * below; forward-declared for pivco_huffman_build_table. */
 static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                               pivco_huffman_table_t *table);
 
@@ -234,10 +236,24 @@ static void fill_enc_init_aux(pivco_huffman_table_t *table)
 #endif
 }
 
-/* Single-symbol degenerate table: a fabricated pair of two ranks holding
- * the same symbol (codewords 0/1 at length 1), so the walk needs no
- * degenerate special case — root range [0,2) is a plain both-leaves node.
- * Assumes `table` is zeroed. */
+/* Single-symbol degenerate decode table: a fabricated pair of two ranks
+ * holding the same symbol, so the walk needs no degenerate special case —
+ * root range [0,2) is a plain both-leaves node.  The schedule is a single
+ * PAIR record (thr == rank_begin == 0). */
+static void build_single_symbol_decode(int sym,
+                                       pivco_huffman_decode_table_t *dt)
+{
+    dt->rank_to_sym[0] = (uint8_t)sym;
+    dt->rank_to_sym[1] = (uint8_t)sym;
+    dt->num_ranks = 2;
+    dt->sched[0].kd    = (uint8_t)PIVCO_SCHED_PAIR;
+    dt->sched[0].param = 0;
+    dt->sched[0].skip  = 1;
+    dt->sched_len = 1;
+}
+
+/* Full-table single-symbol build (codewords 0/1 at length 1).
+ * Assumes `table`'s head is zeroed. */
 static void build_single_symbol_table(int sym, pivco_huffman_table_t *table)
 {
     table->code[sym] = 0;
@@ -245,19 +261,7 @@ static void build_single_symbol_table(int sym, pivco_huffman_table_t *table)
     table->max_len = 1;
     table->min_len = 1;
     table->sym_count[1] = 1;
-    table->first_code[1] = 0;
-    table->first_sym_idx[1] = 0;
-    table->sorted_symbols[0] = (uint8_t)sym;
-    table->rank_to_sym[0] = (uint8_t)sym;
-    table->rank_to_sym[1] = (uint8_t)sym;
-    table->rank_to_codeword[0] = 0x0000;
-    table->rank_to_codeword[1] = 0x8000;
-    table->num_ranks = 2;
-    /* Walk schedule: a single PAIR record (thr == rank_begin == 0). */
-    table->sched[0].kd    = (uint8_t)PIVCO_SCHED_PAIR;
-    table->sched[0].param = 0;
-    table->sched[0].skip  = 1;
-    table->sched_len = 1;
+    build_single_symbol_decode(sym, &table->dec);
     fill_enc_init_aux(table);   /* sym_to_rank is all-zero (rank 0) here; aux must not stay NULL */
 }
 
@@ -309,35 +313,48 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
  * computing them here (instead of lazily per block, as the canonical
  * form allows) amortizes them across every block the table encodes or
  * decodes.  Returns the record count of the subtree (== the root
- * record's skip). */
+ * record's skip).
+ *
+ * The canonical rank-range form (per-rank flat depth + MSB-aligned
+ * codeword) is consumed only here, so it lives in build-local scratch
+ * rather than the table:
+ *
+ *   leaf test   (1 << flat_depth[rank_begin]) == range length
+ *   split       at tree level L the range's codewords read 0..0 1..1 at
+ *               bit L; a linear scan finds the boundary */
+typedef struct {
+    uint8_t  flat_depth[PIVCO_MAX_SYMBOLS]; /* leaf's flat depth at its first rank */
+    uint16_t codeword[PIVCO_MAX_SYMBOLS];   /* MSB-aligned, strictly increasing */
+} rank_canon_t;
 
 /* First rank of the right child: linear scan for the first codeword with
  * bit `level` set.  Runs once per node per table build — total work is
  * O(sum of leaf depths) <= 256 * PIVCO_MAX_CODE_LEN — so plain scalar. */
-static unsigned sched_split_rank(const pivco_huffman_table_t *table,
+static unsigned sched_split_rank(const rank_canon_t *rc,
                                  int level,
                                  unsigned rank_begin, unsigned rank_end)
 {
     const uint16_t mask = (uint16_t)(0x8000u >> level);
     unsigned r = rank_begin + 1;
-    while (r < rank_end && (table->rank_to_codeword[r] & mask) == 0)
+    while (r < rank_end && (rc->codeword[r] & mask) == 0)
         r++;
     PIVCO_CHECK(r < rank_end);
     return r;
 }
 
-static uint8_t build_walk_schedule(pivco_huffman_table_t *table,
+static uint8_t build_walk_schedule(pivco_huffman_decode_table_t *dt,
+                                   const rank_canon_t *rc,
                                    unsigned rank_begin, unsigned rank_end,
                                    int level)
 {
     unsigned range_len = rank_end - rank_begin;
     if (range_len == 1) return 0;               /* leaf — no record */
 
-    PIVCO_CHECK(table->sched_len < PIVCO_MAX_SYMBOLS - 1);
-    pivco_sched_rec_t *rec = &table->sched[table->sched_len++];
+    PIVCO_CHECK(dt->sched_len < PIVCO_MAX_SYMBOLS - 1);
+    pivco_sched_rec_t *rec = &dt->sched[dt->sched_len++];
     unsigned cnt = 1;
 
-    unsigned D = table->rank_to_flat_depth[rank_begin];
+    unsigned D = rc->flat_depth[rank_begin];
     if ((1u << D) == range_len) {               /* flat subtree (D >= 2) */
         rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (D << 2));
         rec->param = (uint8_t)rank_begin;
@@ -345,50 +362,53 @@ static uint8_t build_walk_schedule(pivco_huffman_table_t *table,
         rec->kd    = (uint8_t)PIVCO_SCHED_PAIR;
         rec->param = (uint8_t)rank_begin;       /* == thr */
     } else {
-        unsigned split = sched_split_rank(table, level, rank_begin, rank_end);
+        unsigned split = sched_split_rank(rc, level, rank_begin, rank_end);
         if (split == rank_begin + 1) {          /* lone left leaf */
             rec->kd    = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
             rec->param = (uint8_t)rank_begin;   /* == thr; sym = rank_to_sym[param] */
-            cnt += build_walk_schedule(table, split, rank_end, level + 1);
+            cnt += build_walk_schedule(dt, rc, split, rank_end, level + 1);
         } else {                                /* both children internal */
             rec->kd    = (uint8_t)PIVCO_SCHED_FULL;
             rec->param = (uint8_t)(split - 1);  /* thr */
-            cnt += build_walk_schedule(table, rank_begin, split, level + 1);
-            cnt += build_walk_schedule(table, split, rank_end, level + 1);
+            cnt += build_walk_schedule(dt, rc, rank_begin, split, level + 1);
+            cnt += build_walk_schedule(dt, rc, split, rank_end, level + 1);
         }
     }
     rec->skip = (uint8_t)cnt;
     return (uint8_t)cnt;
 }
 
-static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
-                              pivco_huffman_table_t *table)
+/* Core build: code lengths (n_used >= 2, all <= PIVCO_MAX_CODE_LEN) into a
+ * decode table, plus — when `full` is non-NULL — the full table's per-symbol
+ * codes, sym_to_rank, sym_count and min/max lengths.  The decode-only path
+ * (`full` == NULL) writes nothing but dt, and every dt byte it leaves
+ * untouched is beyond num_ranks / sched_len, so callers need no memset. */
+static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
+                      pivco_huffman_decode_table_t *dt,
+                      pivco_huffman_table_t *full)
 {
-    /* Copy lengths to table */
+    /* Histogram code lengths (local scratch; copied to the full table at
+       the end).  The len>0 guard isn't about correctness (bin 0 is unread
+       scratch) -- it keeps the unused symbols from all piling onto bin 0,
+       whose serial store-to-load-forward chain was 5x slower than the
+       (well-predicted) branch on sparse alphabets.  Oversized lengths are
+       rejected here (they reach this path from the wire). */
+    uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1] = {0};
     for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++) {
-        table->code_len[i] = lengths[i];
-    }
-
-    /* Histogram code lengths.  The len>0 guard isn't about correctness
-       (sym_count[0] is an unread scratch bin) -- it keeps the unused symbols
-       from all piling onto bin 0, whose serial store-to-load-forward chain
-       was 5x slower than the (well-predicted) branch on sparse alphabets.
-       min/max are derived from the bins below, not inline here. */
-    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++) {
-        if (lengths[i] > 0)
-            table->sym_count[lengths[i]]++;
+        if (lengths[i] > 0) {
+            if (lengths[i] > PIVCO_MAX_CODE_LEN) return PIVCO_ERR_CORRUPT;
+            sym_count[lengths[i]]++;
+        }
     }
 
     /* Derive min/max code length from the (<=11) length bins. */
     uint8_t max_len = 0, min_len = PIVCO_MAX_CODE_LEN + 1;
     for (int L = 1; L <= PIVCO_MAX_CODE_LEN; L++) {
-        if (table->sym_count[L]) {
+        if (sym_count[L]) {
             if (L < min_len) min_len = (uint8_t)L;
             max_len = (uint8_t)L;
         }
     }
-    table->max_len = max_len;
-    table->min_len = min_len;
 
     /* ---------- Flat-aware code assignment ----------
      *
@@ -427,6 +447,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
     } sf_t;
     sf_t  flat_items[PIVCO_MAX_SYMBOLS];
     int   per_len_start[PIVCO_MAX_CODE_LEN + 2];
+    rank_canon_t rc;    /* canonical rank-range form; feeds the schedule walk */
     {
         /* Counting sort by length: prefix-sum the per-length counts, then a
            single symbol-order pass places each symbol.  Equivalent to the
@@ -436,7 +457,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         for (int L = 1; L <= max_len; L++) {
             per_len_start[L] = acc;
             cursor[L] = acc;
-            acc += table->sym_count[L];
+            acc += sym_count[L];
         }
         per_len_start[max_len + 1] = acc;
         for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++) {
@@ -463,7 +484,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
     if (tree_mode == PIVCO_TREE_MODE_NAIVE) {
         /* Every symbol is its own D=0 chunk at depth L. */
         for (int L = 1; L <= max_len; L++) {
-            int c = table->sym_count[L];
+            int c = sym_count[L];
             int cur = per_len_start[L];
             for (int i = 0; i < c; i++) {
                 chunks[n_chunks].L       = (uint16_t)L;
@@ -479,7 +500,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
            for the odd-tail symbol.  Sequential reassign in the standard
            depth-sort step gives canonical Huffman codes. */
         for (int L = 1; L <= max_len; L++) {
-            int c = table->sym_count[L];
+            int c = sym_count[L];
             int cur = per_len_start[L];
             int n_pairs = c / 2;
             int n_singletons = c & 1;
@@ -511,14 +532,14 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         uint32_t code = 0;
         int last_L = 0;
         for (int L = 1; L <= max_len; L++) {
-            if (table->sym_count[L]) {
-                if (last_L) code = (code + (uint32_t)table->sym_count[last_L]) << (L - last_L);
+            if (sym_count[L]) {
+                if (last_L) code = (code + (uint32_t)sym_count[last_L]) << (L - last_L);
                 fc[L] = code;
                 last_L = L;
             }
         }
         for (int L = 1; L <= max_len; L++) {
-            int c = table->sym_count[L];
+            int c = sym_count[L];
             if (c == 0) continue;
             int cur = per_len_start[L];
             uint32_t C = fc[L];
@@ -545,7 +566,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
     } else {
         /* OPTIMIZED (default): original bit-decomposition of c_L. */
         for (int L = 1; L <= max_len; L++) {
-            int c = table->sym_count[L];
+            int c = sym_count[L];
             int cur = per_len_start[L];
             /* Iterate set bits high-to-low so larger chunks come first
                within the length (matters only for top-freq-first symbol
@@ -592,15 +613,17 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             for (int i = 0; i < n; i++) {
                 uint8_t sym = flat_items[chunks[ci].sym_idx + i].sym;
                 uint16_t c16 = (uint16_t)(((uint32_t)root << bit) | (uint32_t)i);
-                table->code[sym] = c16;
-                table->sym_to_rank[sym]         = (uint8_t)rank;
-                table->rank_to_sym[rank]        = sym;
-                table->rank_to_flat_depth[rank] = (uint8_t)(bit >= 2 ? bit : 0);
-                table->rank_to_codeword[rank]   = (uint16_t)(c16 << (16 - L));
+                if (full) {
+                    full->code[sym]        = c16;
+                    full->sym_to_rank[sym] = (uint8_t)rank;
+                }
+                dt->rank_to_sym[rank] = sym;
+                rc.flat_depth[rank]   = (uint8_t)(bit >= 2 ? bit : 0);
+                rc.codeword[rank]     = (uint16_t)(c16 << (16 - L));
                 rank++;
             }
         }
-        table->num_ranks = (uint16_t)rank;
+        dt->num_ranks = (uint16_t)rank;
     } else {
         /* Sort chunks by depth asc (stable; ties keep their natural order
            which is L asc by length, larger-bit-first within length). */
@@ -632,62 +655,77 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 for (int i = 0; i < n; i++) {
                     uint8_t sym = flat_items[chunks[ci].sym_idx + i].sym;
                     uint16_t c16 = (uint16_t)((code << bit) | (uint32_t)i);
-                    table->code[sym] = c16;
-                    table->sym_to_rank[sym]         = (uint8_t)rank;
-                    table->rank_to_sym[rank]        = sym;
-                    table->rank_to_flat_depth[rank] = (uint8_t)(bit >= 2 ? bit : 0);
-                    table->rank_to_codeword[rank]   = (uint16_t)(c16 << (16 - L));
+                    if (full) {
+                        full->code[sym]        = c16;
+                        full->sym_to_rank[sym] = (uint8_t)rank;
+                    }
+                    dt->rank_to_sym[rank] = sym;
+                    rc.flat_depth[rank]   = (uint8_t)(bit >= 2 ? bit : 0);
+                    rc.codeword[rank]     = (uint16_t)(c16 << (16 - L));
                     rank++;
                 }
                 code += 1;
                 prev_depth = d;
             }
-            table->num_ranks = (uint16_t)rank;
+            dt->num_ranks = (uint16_t)rank;
         }
 
     }
 
-    /* Populate sorted_symbols / first_sym_idx / first_code from the
-       new code assignment.  These fields are not used by runtime
-       decoders (only by the tree-walk pass below), but we keep them
-       in length-asc order for compatibility with anyone inspecting
-       the table. */
-    int sorted_idx = per_len_start[max_len + 1];
-    for (int i = 0; i < sorted_idx; i++)
-        table->sorted_symbols[i] = flat_items[i].sym;
-    for (int len = 1; len <= max_len; len++) {
-        table->first_sym_idx[len] = (uint16_t)per_len_start[len];
-        uint16_t min_code = 0xFFFF;
-        for (int i = per_len_start[len]; i < per_len_start[len + 1]; i++) {
-            uint16_t c = table->code[flat_items[i].sym];
-            if (c < min_code) min_code = c;
-        }
-        table->first_code[len] = (min_code == 0xFFFF) ? 0 : min_code;
-    }
-
-    /* The 2^MAX_CODE_LEN flat decode table (decode_sym/decode_len) is used
-     * ONLY by the traditional flat-table decoder (trad_huffman_decode*), never
-     * by the production tree-walk path.  It is built on demand via
-     * pivco_huffman_build_traditional_table() so the normal build -- and the
-     * decode-side rebuild from code lengths -- don't pay for the 2 KB fill. */
-
-
-    /* The explicit tree (tree[] / node_type[] / flat_*[] / split_rank[] /
-     * flat_base_rank[] / max_leaf_depth[]) is NOT built here: the codec
-     * walks the schedule below and never reads it.  Analysis tools that
-     * want it call pivco_huffman_build_explicit_tree() — its
-     * materialization (a spine walk per chunk plus classify,
-     * max_leaf_depth and in-order-rank passes over up-to-511-node
-     * arrays) was the bulk of small-input table-build time (issue #7). */
+    /* On-demand extras NOT built here: the 2^MAX_CODE_LEN flat decode
+     * tables (pivco_huffman_build_traditional_table) and the explicit
+     * tree (pivco_huffman_build_explicit_tree).  The codec streams the
+     * schedule below and reads neither. */
 
     /* Pre-order walk schedule: render the rank-range tree into the
      * program the codec streams (see build_walk_schedule above). */
-    table->sched_len = 0;
-    build_walk_schedule(table, 0, table->num_ranks, 0);
+    dt->sched_len = 0;
+    build_walk_schedule(dt, &rc, 0, dt->num_ranks, 0);
+
+    if (full) {
+        memcpy(full->sym_count, sym_count, sizeof(sym_count));
+        full->max_len = max_len;
+        full->min_len = min_len;
+    }
+    return PIVCO_OK;
+}
+
+/* Full build downstream of the code lengths: decode core (into
+ * table->dec) plus per-symbol codes, sym_to_rank and the encode aux
+ * tables.  Assumes `table`'s head is zeroed and num_symbols is set;
+ * caller handles n_used <= 1. */
+static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
+                              pivco_huffman_table_t *table)
+{
+    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++)
+        table->code_len[i] = lengths[i];
+
+    int rc = build_core(lengths, &table->dec, table);
+    if (rc != PIVCO_OK) return rc;
 
     fill_enc_init_aux(table);   /* x86 2tab/4tab gather tables (or NULL elsewhere) */
-
     return PIVCO_OK;
+}
+
+/* Public API: build ONLY the ~1 KB decode table from code lengths — the
+ * minimal decode-side setup.  No memset: every dt byte beyond num_ranks /
+ * sched_len is simply never read. */
+int pivco_huffman_build_decode_table(const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
+                                     pivco_huffman_decode_table_t *dt)
+{
+    if (!code_lens || !dt) return PIVCO_ERR_NULL;
+
+    int n_used = 0, last = 0;
+    for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++)
+        if (code_lens[s] > 0) { n_used++; last = s; }
+    if (n_used == 0) return PIVCO_ERR_EMPTY;
+
+    if (n_used == 1) {
+        if (code_lens[last] > PIVCO_MAX_CODE_LEN) return PIVCO_ERR_CORRUPT;
+        build_single_symbol_decode(last, dt);
+        return PIVCO_OK;
+    }
+    return build_core(code_lens, dt, NULL);
 }
 
 /* Public API: build a table from code lengths alone.  The tree is fully
@@ -726,8 +764,8 @@ void pivco_huffman_build_traditional_table(pivco_huffman_table_t *table)
 {
     if (!table) return;
     /* Defensive base fill covers any gap for incomplete codes (single sym);
-     * sorted_symbols[0] = shortest-code (most frequent) symbol. */
-    memset(table->decode_sym, table->sorted_symbols[0], sizeof(table->decode_sym));
+     * rank 0's symbol is always a valid table symbol. */
+    memset(table->decode_sym, table->dec.rank_to_sym[0], sizeof(table->decode_sym));
     memset(table->decode_len, 1, sizeof(table->decode_len));
     for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++) {
         int len = table->code_len[s];
@@ -764,7 +802,7 @@ static int16_t etree_leaf(etree_ctx_t *c, unsigned rank)
 {
     pivco_huffman_table_t *t = c->t;
     int16_t id = c->node_count++;
-    t->tree[id].symbol = (int16_t)t->rank_to_sym[rank];
+    t->tree[id].symbol = (int16_t)t->dec.rank_to_sym[rank];
     t->tree[id].left   = -1;
     t->tree[id].right  = -1;
     t->node_type[id] = (uint8_t)PIVCO_NODE_LEAF;
@@ -776,7 +814,7 @@ static int16_t etree_walk(etree_ctx_t *c, unsigned rank_begin, unsigned rank_end
     pivco_huffman_table_t *t = c->t;
     if (rank_end - rank_begin == 1) return etree_leaf(c, rank_begin);
 
-    const pivco_sched_rec_t *rec = &t->sched[c->cursor++];
+    const pivco_sched_rec_t *rec = &t->dec.sched[c->cursor++];
     const unsigned kind = rec->kd & 3u;
     int16_t id = c->node_count++;
     t->tree[id].symbol = -1;
@@ -789,7 +827,7 @@ static int16_t etree_walk(etree_ctx_t *c, unsigned rank_begin, unsigned rank_end
         t->flat_depth[id]     = (uint8_t)D;
         t->flat_offset[id]    = c->pool;
         t->flat_base_rank[id] = rec->param;
-        memcpy(&t->flat_code_to_sym[c->pool], &t->rank_to_sym[rec->param],
+        memcpy(&t->flat_code_to_sym[c->pool], &t->dec.rank_to_sym[rec->param],
                (size_t)1 << D);
         c->pool = (uint16_t)(c->pool + (1u << D));
         t->node_type[id] = (uint8_t)PIVCO_NODE_INTERNAL_FLAT;
@@ -830,7 +868,7 @@ static int16_t etree_walk(etree_ctx_t *c, unsigned rank_begin, unsigned rank_end
 
 void pivco_huffman_build_explicit_tree(pivco_huffman_table_t *table)
 {
-    if (!table || table->num_ranks < 2) return;
+    if (!table || table->dec.num_ranks < 2) return;
     /* Zero the per-node arrays: the flat test (flat_depth >= 2), the
      * flat-root split_rank convention (stays 0) and max_leaf_depth leaf
      * entries all rely on zeros, and the table may have been built
@@ -845,8 +883,8 @@ void pivco_huffman_build_explicit_tree(pivco_huffman_table_t *table)
     memset(table->max_leaf_depth, 0, sizeof(table->max_leaf_depth));
 
     etree_ctx_t c = { table, 0, 0, 0 };
-    table->tree_root = etree_walk(&c, 0, table->num_ranks);
+    table->tree_root = etree_walk(&c, 0, table->dec.num_ranks);
     table->tree_node_count = c.node_count;
     PIVCO_CHECK(table->tree_root == 0);
-    PIVCO_CHECK(c.cursor == table->sched_len);
+    PIVCO_CHECK(c.cursor == table->dec.sched_len);
 }

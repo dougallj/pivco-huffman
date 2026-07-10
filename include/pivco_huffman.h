@@ -138,6 +138,27 @@ typedef struct {
     uint8_t skip;   /* subtree record count incl. self (<= 255) */
 } pivco_sched_rec_t;
 
+/* ---------- Decode table ----------
+ *
+ * EVERYTHING the production decoder reads: the walk program plus the
+ * rank -> symbol permutation (~1 KB total).  Ranks are leaves in
+ * MSB-aligned-codeword order, so every subtree is a contiguous rank
+ * range; sched[] is that implicit tree rendered into pre-order records
+ * (issue #7).  Degenerate single-symbol tables get TWO ranks of the
+ * same symbol, so num_ranks == 2 there and the walk needs no special
+ * case (num_ranks == the used-symbol count otherwise).
+ *
+ * Build with pivco_huffman_build_decode_table() — no memset, no explicit
+ * tree, sized for the "rebuild per small input" decode path.  The full
+ * pivco_huffman_table_t embeds one as `dec`, so encode-side tables can
+ * also decode. */
+typedef struct {
+    uint16_t num_ranks;
+    uint16_t sched_len;
+    uint8_t  rank_to_sym[PIVCO_MAX_SYMBOLS];        /* rank -> symbol (in-order) */
+    pivco_sched_rec_t sched[PIVCO_MAX_SYMBOLS - 1]; /* pre-order walk program */
+} pivco_huffman_decode_table_t;
+
 /* ---------- Huffman table ---------- */
 
 /* Arch-specific precomputed gather tables for prim_enc_init.  Every pointer is
@@ -151,46 +172,19 @@ typedef struct {
 } pivco_huffman_enc_init_aux_t;
 
 typedef struct {
-    /* Per-symbol encode info */
-    uint16_t code[PIVCO_MAX_SYMBOLS];       /* canonical Huffman code */
-    uint8_t  code_len[PIVCO_MAX_SYMBOLS];   /* code length (0 = unused) */
+    /* Decode core — the codec's decode path reads ONLY this (encode also
+     * streams dec.sched).  See pivco_huffman_decode_table_t.  The
+     * canonical rank-range form (per-rank flat depths + MSB-aligned
+     * codewords) is a build-time intermediate, not stored: the schedule
+     * is its rendering, and pivco_huffman_build_explicit_tree can
+     * reconstruct the full tree from it. */
+    pivco_huffman_decode_table_t dec;
 
-    /* "partbyrank" encode: a subtree's leaves are a contiguous rank range, so
-     * per-node routing is `rank > split_rank` (8-bit, vs a 16-bit code bit-test)
-     * and a flat subtree's local code is `rank - flat_base_rank`.  Filled by
-     * pivco_huffman_build_table; byte-identical wire output. */
+    /* "partbyrank" encode: a subtree's leaves are a contiguous rank range,
+     * so per-node routing is `rank > thr` (8-bit, vs a 16-bit code
+     * bit-test) and a flat subtree's local code is `rank - rank_begin`.
+     * Filled by pivco_huffman_build_table; byte-identical wire output. */
     uint8_t  sym_to_rank[PIVCO_MAX_SYMBOLS];        /* in-order leaf rank per symbol */
-
-    /* Rank-range tree (issue #7, terrelln's implicit-tree construction).
-     * Ranks are leaves in MSB-aligned-codeword order, so every subtree is a
-     * contiguous rank range [rank_begin, rank_end) and the root is
-     * [0, num_ranks).  rank_to_sym carries all symbol content; the tree
-     * SHAPE exists in two renderings.  tree[]/node_type[]/flat_*[] below
-     * are kept for analysis tools and tests only.
-     *
-     * Execution form (what the codec streams, hot):
-     *   sched[]     pre-order walk program, one 3-byte record per visible
-     *               internal node — see pivco_sched_rec_t.  Built once per
-     *               table by the schedule walk in huffman_table.c.
-     *
-     * Canonical form (source of truth; build/verify time only):
-     *   leaf test   (1 << rank_to_flat_depth[rank_begin]) == rank_end - rank_begin
-     *               (flat depth 0 = single-symbol leaf, D >= 2 = flat subtree
-     *               whose 2^D symbols are rank_to_sym[rank_begin ..])
-     *   split       at tree level L the range's codewords read 0..0 1..1 at
-     *               bit L; a lazy linear scan of rank_to_codeword finds the
-     *               left/right boundary.  The schedule walk evaluates each
-     *               node's split exactly once, at build time.
-     *
-     * Degenerate single-symbol tables get TWO ranks of the same symbol
-     * (mirroring the fabricated root pair in tree[]), so num_ranks ==
-     * num_symbols except there, and the walk needs no special case. */
-    uint8_t  rank_to_sym[PIVCO_MAX_SYMBOLS];        /* rank -> symbol (in-order) */
-    pivco_sched_rec_t sched[PIVCO_MAX_SYMBOLS - 1]; /* pre-order walk program */
-    uint16_t sched_len;
-    uint16_t num_ranks;
-    uint8_t  rank_to_flat_depth[PIVCO_MAX_SYMBOLS]; /* leaf's flat depth at its first rank */
-    uint16_t rank_to_codeword[PIVCO_MAX_SYMBOLS];   /* MSB-aligned canonical-order codeword */
 #if defined(__x86_64__) || defined(__i386__)
     /* Backing storage for enc_init_aux — the x86 2tab merge hi table (sym_to_rank
      * << 8).  Other arches don't allocate it.  Filled by pivco_huffman_build_table. */
@@ -201,11 +195,10 @@ typedef struct {
      * table after pivco_huffman_build_table. */
     pivco_huffman_enc_init_aux_t enc_init_aux;
 
-    /* Canonical decode info (for traditional decoder) */
-    uint16_t first_code[PIVCO_MAX_CODE_LEN + 1];
-    uint16_t first_sym_idx[PIVCO_MAX_CODE_LEN + 1];
-    uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1];
-    uint8_t  sorted_symbols[PIVCO_MAX_SYMBOLS];
+    /* Per-symbol code info (wire header serialization, trad codecs, tools) */
+    uint16_t code[PIVCO_MAX_SYMBOLS];       /* canonical Huffman code */
+    uint8_t  code_len[PIVCO_MAX_SYMBOLS];   /* code length (0 = unused) */
+    uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1]; /* per-length histogram */
 
     uint8_t  max_len;
     uint8_t  min_len;
@@ -350,6 +343,15 @@ void pivco_huffman_fse_root_get(int idx, pivco_huffman_fse_root_event_t *out);
 int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
                               pivco_huffman_table_t *table);
 
+/* Build ONLY the ~1 KB decode table from code lengths — the minimal
+ * decode-side setup (no explicit tree, no encode/trad fields, no memset).
+ * Deterministic from the lengths, so it matches any encoder-side
+ * pivco_huffman_build_table over the same lengths.  Rejects lengths over
+ * PIVCO_MAX_CODE_LEN with PIVCO_ERR_CORRUPT (the lengths typically come
+ * off the wire). */
+int pivco_huffman_build_decode_table(const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
+                                     pivco_huffman_decode_table_t *dt);
+
 /* Build a Huffman table from already-known code lengths (the path used by
  * decoders that recovered code_lens from a wire format).  The tree is fully
  * determined by the lengths -- within-tier order is symbol-value ascending --
@@ -400,6 +402,14 @@ int pivco_huffman_decode(const uint8_t *in, size_t in_len,
                          const pivco_huffman_table_t *table,
                          uint8_t *symbols, size_t *consumed);
 
+/* Decode against a bare decode table (see pivco_huffman_build_decode_table)
+ * — the minimal-setup path.  pivco_huffman_decode(table, ...) is exactly
+ * this over &table->dec.  The per-backend *_dt entries below are the real
+ * implementations; the table-taking forms are thin shims. */
+int pivco_huffman_decode_dt(const uint8_t *in, size_t in_len,
+                            const pivco_huffman_decode_table_t *dt,
+                            uint8_t *symbols, size_t *consumed);
+
 int pivco_huffman_encode_scalar(const uint8_t *symbols, size_t n,
                                 const pivco_huffman_table_t *table,
                                 uint8_t *out, size_t *out_len);
@@ -407,6 +417,9 @@ int pivco_huffman_encode_scalar(const uint8_t *symbols, size_t n,
 int pivco_huffman_decode_scalar(const uint8_t *in, size_t in_len,
                                 const pivco_huffman_table_t *table,
                                 uint8_t *symbols, size_t *consumed);
+int pivco_huffman_decode_scalar_dt(const uint8_t *in, size_t in_len,
+                                   const pivco_huffman_decode_table_t *dt,
+                                   uint8_t *symbols, size_t *consumed);
 
 #ifdef PIVCO_HAS_NEON
 int pivco_huffman_encode_neon(const uint8_t *symbols, size_t n,
@@ -417,6 +430,9 @@ int pivco_huffman_encode_neon(const uint8_t *symbols, size_t n,
 int pivco_huffman_decode_bu_neon(const uint8_t *in, size_t in_len,
                                   const pivco_huffman_table_t *table,
                                   uint8_t *symbols, size_t *consumed);
+int pivco_huffman_decode_bu_neon_dt(const uint8_t *in, size_t in_len,
+                                    const pivco_huffman_decode_table_t *dt,
+                                    uint8_t *symbols, size_t *consumed);
 #endif
 
 #ifdef PIVCO_HAS_SSE4
@@ -428,6 +444,9 @@ int pivco_huffman_encode_x86(const uint8_t *symbols, size_t n,
 int pivco_huffman_decode_bu_x86(const uint8_t *in, size_t in_len,
                                  const pivco_huffman_table_t *table,
                                  uint8_t *symbols, size_t *consumed);
+int pivco_huffman_decode_bu_x86_dt(const uint8_t *in, size_t in_len,
+                                   const pivco_huffman_decode_table_t *dt,
+                                   uint8_t *symbols, size_t *consumed);
 #endif
 
 /* Prior experimental NEON variants (neon2, neon2b, neon_fused_1leaf)
@@ -459,6 +478,9 @@ int pivco_huffman_encode_avx512(const uint8_t *symbols, size_t n,
 int pivco_huffman_decode_bu_avx512(const uint8_t *in, size_t in_len,
                                     const pivco_huffman_table_t *table,
                                     uint8_t *symbols, size_t *consumed);
+int pivco_huffman_decode_bu_avx512_dt(const uint8_t *in, size_t in_len,
+                                      const pivco_huffman_decode_table_t *dt,
+                                      uint8_t *symbols, size_t *consumed);
 #endif
 
 /* Top-down (TD) decode entry points have been retired (2026-05-14).
