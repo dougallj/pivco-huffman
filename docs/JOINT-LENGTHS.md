@@ -444,3 +444,36 @@ DECODES both get faster (+2..+7 % / +17..+19 %) at +0.1 pp ratio —
 and at 4-8 K it still nets a ratio improvement.  Auto DP crosses to
 encode-positive at 128 K while carrying ~2x the decode win.  Absolute
 dec-e2e with auto/exact: 11.0-11.3 GB/s at 64-128 K windows.
+
+## What the price buys: the lambda sweep
+
+Exact-DP sweep over all 2011 G=16K lits windows (results/
+m1-20260711-lambda-sweep-g16.txt).  The RAW frontier is convex and
+never saturates: passes remaining (bits premium) go 0.81 (+0.00%) at
+lam=0.005, 0.59 (+0.4%) at 0.1, 0.51 (+0.75%) at 1/7, 0.40 (+1.7%)
+at 0.3, and 0.09 (+8.9%) at 1.0 — the last being "the tree is nearly
+one flat", i.e. converging on fixed 8-bit coding.  You can always buy
+more decode speed; the exchange rate just worsens.
+
+DEPLOYED (post-guard) is what matters, and there the optimum is set
+by the guard, not the frontier: under bits <= 1.015 the best price is
+lam = 0.10-0.14 (passes 0.607 -> 0.595; adoption peaks 92%) and
+larger lambda gets vetoed into uselessness (adoption 15% at lam=1).
+Loosening the cap to 1.03 moves the optimum only to lam ~ 0.2
+(passes 0.572) with lam = 1/7 nearly matching it (0.578).  Happy
+coincidence: the slot DP's exactness ceiling lam <= 1/7 covers the
+deployed-optimal region under any sane guard — the mass-DP fallback
+is effectively dead code for production prices.  lam = 0.1 (current)
+is within ~2% of deployed-optimal; 1/7 is the better default if the
+guard stays at 1.015.
+
+Smoothness: per window the solution path is a STAIRCASE — at each
+sweep step 35-50% of windows swap trees, so a typical window has
+several breakpoints across the range, and (per the trajectory study)
+a swap can jump to a distant corner of state space.  The aggregate
+curve is smooth only because 2011 windows break in different places.
+J*(lambda) itself is concave piecewise-linear per window (lower
+envelope of one line per candidate tree).  Caveat at large lambda:
+the model runs kappa = 0, and deep-flat regimes are exactly where
+per-D kernel differences bite, so the far end of the frontier is the
+least trustworthy part of it.

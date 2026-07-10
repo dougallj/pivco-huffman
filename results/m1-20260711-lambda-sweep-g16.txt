@@ -1,0 +1,36 @@
+# Lambda sweep on lits windows (G=16K, M1 Max, exact DP; mass DP for lam > 1/7)
+# bits/b, pass/b = deployed post-guard averages; * = raw DP pre-guard
+
+windows: 2011 (G=16K) bitscap=1.015
+ lambda   solver |    bits/b    pass/b  adopt% |   bits/b*   pass/b* |  changed
+  0.005    slots |    1.0000     0.834     44% |    1.0000     0.810 |       0
+  0.010    slots |    1.0001     0.799     54% |    1.0001     0.777 |     730
+  0.020    slots |    1.0003     0.756     67% |    1.0003     0.738 |     878
+  0.035    slots |    1.0008     0.713     77% |    1.0008     0.700 |     896
+  0.050    slots |    1.0014     0.678     82% |    1.0014     0.668 |     741
+  0.075    slots |    1.0024     0.640     89% |    1.0024     0.631 |     930
+  0.100    slots |    1.0036     0.607     92% |    1.0039     0.592 |     817
+  0.142    slots |    1.0045     0.595     89% |    1.0075     0.509 |    1014
+  0.200     mass |    1.0051     0.598     84% |    1.0105     0.459 |     768
+  0.300     mass |    1.0047     0.653     68% |    1.0171     0.403 |    1039
+  0.500     mass |    1.0014     0.808     29% |    1.0412     0.265 |    1109
+  1.000     mass |    1.0002     0.856     15% |    1.0894     0.094 |     811
+(bits/b, pass/b = deployed post-guard; * = raw DP pre-guard;
+ changed = windows whose solution differs from previous lambda)
+
+windows: 2011 (G=16K) bitscap=1.030
+ lambda   solver |    bits/b    pass/b  adopt% |   bits/b*   pass/b* |  changed
+  0.005    slots |    1.0000     0.834     44% |    1.0000     0.810 |       0
+  0.010    slots |    1.0001     0.799     54% |    1.0001     0.777 |     730
+  0.020    slots |    1.0003     0.756     67% |    1.0003     0.738 |     878
+  0.035    slots |    1.0008     0.713     77% |    1.0008     0.700 |     896
+  0.050    slots |    1.0014     0.678     82% |    1.0014     0.668 |     741
+  0.075    slots |    1.0024     0.639     89% |    1.0024     0.631 |     930
+  0.100    slots |    1.0039     0.597     93% |    1.0039     0.592 |     817
+  0.142    slots |    1.0050     0.578     91% |    1.0075     0.509 |    1014
+  0.200     mass |    1.0059     0.572     88% |    1.0105     0.459 |     768
+  0.300     mass |    1.0077     0.581     82% |    1.0171     0.403 |    1039
+  0.500     mass |    1.0061     0.703     52% |    1.0412     0.265 |    1109
+  1.000     mass |    1.0015     0.825     20% |    1.0894     0.094 |     811
+(bits/b, pass/b = deployed post-guard; * = raw DP pre-guard;
+ changed = windows whose solution differs from previous lambda)
