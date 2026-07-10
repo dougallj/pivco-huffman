@@ -84,6 +84,8 @@ int main(int argc, char **argv)
             tdbu_only = 1;
         } else if (strcmp(argv[i], "--no-fse") == 0) {
             pivco_huffman_set_fse_enabled(0);
+        } else if (strncmp(argv[i], "--joint=", 8) == 0) {
+            pivco_huffman_set_joint_lambda(atof(argv[i] + 8));
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [repeats] [--all] [--tdbu] [--no-fse]\n"
                    "  repeats   passes over 4M symbols per timed run (default %d)\n"
@@ -95,7 +97,9 @@ int main(int argc, char **argv)
                    "            keeps the full 5-run methodology.  Use for prof-on/off\n"
                    "            A/B without paying for trad / huf0 timing.\n"
                    "  --no-fse  disable the encoder's FSE dispatch at runtime\n"
-                   "            (still v0.2+ wire format; marker stays 0).\n",
+                   "            (still v0.2+ wire format; marker stays 0).\n"
+                   "  --joint=L joint length/flat optimization, lambda=L bits per\n"
+                   "            merge pass (0 = off; docs/JOINT-LENGTHS.md).\n",
                    argv[0], DEFAULT_REPEATS);
             return 0;
         } else {

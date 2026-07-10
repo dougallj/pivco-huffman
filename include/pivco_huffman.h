@@ -277,6 +277,21 @@ typedef struct {
 int  pivco_huffman_fse_root_count(void);
 void pivco_huffman_fse_root_get(int idx, pivco_huffman_fse_root_event_t *out);
 
+/* ---------- Joint length/flat-shape optimization (experimental) ----------
+ *
+ * When lambda > 0, pivco_huffman_build_table deliberately distorts the
+ * code-length histogram away from the Huffman optimum, trading
+ * compressed bits for a flatter decode tree: lambda is the price, in
+ * bits per symbol-occurrence, of one merge pass (the objective is
+ * sum n_s * (len_s + lambda * (len_s - flat_depth_s)); see
+ * docs/JOINT-LENGTHS.md for the model and the exact DP).  0 (default)
+ * = off.  Encoder-side only: the wire still carries plain lengths and
+ * ANY decoder reads the output.  Set before build_table. */
+void   pivco_huffman_set_joint_lambda(double lam);
+double pivco_huffman_get_joint_lambda(void);
+int    pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                                    uint8_t lengths[PIVCO_MAX_SYMBOLS]);
+
 /* ---------- Table construction ---------- */
 
 int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
