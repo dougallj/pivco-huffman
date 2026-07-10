@@ -409,3 +409,38 @@ files late in a hot batch throttle-drift by up to ~2x (dickens
 standalone: 6.2-6.4 GB/s; in-batch: 2.3-4.3 GB/s), so cross-file
 comparisons within one batch are indicative only — the M1 solve-time
 A/Bs and same-binary deltas are the load-bearing measurements.
+
+## On fast tables: the ladder goes positive (branch joint-flat-lengths-plus-fast-tables)
+
+Rebased onto rank-range-codec (minimal ~1.5 KB codec table, <1 us
+decode-table build, two-queue length derivation).  Two consequences:
+
+1. The decoder-side table build stopped masking kernel gains: at
+   G = 4 K the auto-DP dec-e2e delta grew from +40 % to +67 %.
+2. The builds hand their already-sorted leaf array to the joint pass
+   (pivco_joint_optimize_lengths_leaves), killing its scan + qsort:
+   the nudge rung's build increment fell to ~+1.8 us/window.
+
+M4 ladder (PH, geomean of 12 lits files, deltas vs off, all four
+configs measured back-to-back per file):
+
+| G     | rung  | enc-e2e   | dec-e2e   | ratio     |
+|-------|-------|-----------|-----------|-----------|
+| 4 K   | nudge | -8.6 %    | +39.9 %   | -0.26 pp  |
+|       | auto  | -42.5 %   | +67.0 %   | -0.27 pp  |
+|       | exact | -79.6 %   | +67.6 %   | -0.41 pp  |
+| 16 K  | nudge | -2.0 %    | +24.2 %   | +0.09 pp  |
+|       | auto  | -24.7 %   | +44.2 %   | +0.21 pp  |
+|       | exact | -70.4 %   | +45.8 %   | +0.11 pp  |
+| 32 K  | nudge | +1.8 %    | +17.0 %   | +0.09 pp  |
+| 64 K  | nudge | +7.4 %    | +17.8 %   | +0.10 pp  |
+|       | auto  | -2.1 %    | +41.6 %   | +0.20 pp  |
+| 128 K | nudge | +7.1 %    | +19.4 %   | +0.10 pp  |
+|       | auto  | +3.8 %    | +37.7 %   | +0.18 pp  |
+|       | exact | -28.8 %   | +39.4 %   | +0.10 pp  |
+
+The nudge rung is free-and-always-helps from ~32 K up: ENCODES AND
+DECODES both get faster (+2..+7 % / +17..+19 %) at +0.1 pp ratio —
+and at 4-8 K it still nets a ratio improvement.  Auto DP crosses to
+encode-positive at 128 K while carrying ~2x the decode win.  Absolute
+dec-e2e with auto/exact: 11.0-11.3 GB/s at 64-128 K windows.

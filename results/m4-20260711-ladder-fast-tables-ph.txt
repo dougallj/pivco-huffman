@@ -1,0 +1,340 @@
+# Solve ladder on fast tables (rank-range-codec base): PH, M4 mini, reps=5
+# configs per file back-to-back: off / nudge(gran=-1) / auto DP(gran=0) / exact(gran=1), lambda=0.1
+# enc-e2e = histogram + build_codec_table (+joint) + encode_ct; dec-e2e = build_decode_table + decode_dt
+# branch joint-flat-lengths-plus-fast-tables, 2026-07-11
+
+LADDER G=4K reps=5 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits    off   0.6924       139      1158       451      1405      20.3         -
+dickens.lits  nudge   0.6896       219      1765       892      2549      14.1   101/174
+dickens.lits   auto   0.6880       124      3247      1482      4938      30.1   172/174
+dickens.lits  exact   0.6878       130      3704      1867      5644      29.2   172/174
+mozilla.lits    off   0.9653       340      2088      1808      4533       9.8         -
+mozilla.lits  nudge   0.9611       419      3218      3089      7476       8.5 2493/2764
+mozilla.lits   auto   0.9623       284      3300      3137      8202      13.1 2241/2764
+mozilla.lits  exact   0.9600        61      3553      3535      9316      66.0 2734/2764
+mr.lits         off   0.8207       499      2749      2073      4847       6.2         -
+mr.lits       nudge   0.8180       421      4029      2833      7647       8.3   303/385
+mr.lits        auto   0.8204       273      2989      2051      6202      13.0    42/385
+mr.lits       exact   0.8161        59      3998      3065      7956      68.6   348/385
+nci.lits        off   0.5604       956      5500      3128      6423       3.0         -
+nci.lits      nudge   0.5600       723      6142      2882      7791       4.2    37/206
+nci.lits       auto   0.5588       454      7012      3658     10261       7.9   185/206
+nci.lits      exact   0.5588       474      7381      3674     10518       7.5   185/206
+ooffice.lits    off   0.9451       373      2068      1521      4533       8.3         -
+ooffice.lits  nudge   0.9417       328      2926      2368      6075      10.7   368/428
+ooffice.lits   auto   0.9400       246      3880      2971      8749      15.2   406/428
+ooffice.lits  exact   0.9399        58      3352      2804      8215      69.4   424/428
+osdb.lits       off   0.9293       415      2612      1587      5107       7.3         -
+osdb.lits     nudge   0.9276       364      3530      2133      7221       9.3   352/503
+osdb.lits      auto   0.9306       263      4854      2987      9397      14.2   500/503
+osdb.lits     exact   0.9255        58      4625      3288      8833      68.7   503/503
+reymont.lits    off   0.7354       848      5041      2826      7174       3.3         -
+reymont.lits  nudge   0.7326       684      6545      3694      9817       4.8     52/92
+reymont.lits   auto   0.7312       388      7174      4389     10082       9.5     65/92
+reymont.lits  exact   0.7311       196      7315      4099     10082      19.7     71/92
+samba.lits      off   0.9142       743      3143      2163      5993       3.6         -
+samba.lits    nudge   0.9113       705      7389      4665     12139       4.9   488/581
+samba.lits     auto   0.9111       387      8683      5371     15861       9.8   535/581
+samba.lits    exact   0.9109        90      8348      5252     15550      44.5   536/581
+sao.lits        off   0.9935       823      3111      2380      5706       3.3         -
+sao.lits      nudge   0.9926       669      4088      2820      7672       4.7   898/958
+sao.lits       auto   0.9964       361      4380      3154      8033      10.0   948/958
+sao.lits      exact   0.9914        61      3866      2893      7612      65.4   906/958
+webster.lits    off   0.7049       641      3103      1771      5021       4.1         -
+webster.lits  nudge   0.7010       543      3961      2290      6127       5.7   479/707
+webster.lits   auto   0.6985       400      5648      2708      9359       8.7   703/707
+webster.lits  exact   0.6991       216      5446      2778      8607      17.5   703/707
+x-ray.lits      off   0.8833       567      2413      1947      4680       5.1         -
+x-ray.lits    nudge   0.8806       460      2859      2488      5393       7.3  820/1184
+x-ray.lits     auto   0.8787       306      3605      3124      7471      12.1 1149/1184
+x-ray.lits    exact   0.8788        60      3285      2842      6706      67.2 1137/1184
+xml.lits        off   0.7181       790      4867      2983      7398       3.7         -
+xml.lits      nudge   0.7156       656      6165      3557      8042       5.0     23/46
+xml.lits       auto   0.7147       358      7114      3853     10276      10.2     38/46
+xml.lits      exact   0.7145       253      6850      4301     10880      14.9     38/46
+== geomean over 12 files (G=4K)
+   off: enc-e2e    533 ( +0.0%)  dec-e2e   2901 ( +0.0%)  enc-k   1877  dec-k   4909  ratio +0.000pp
+ nudge: enc-e2e    487 ( -8.6%)  dec-e2e   4059 (+39.9%)  enc-k   2635  dec-k   6922  ratio -0.258pp
+  auto: enc-e2e    306 (-42.5%)  dec-e2e   4845 (+67.0%)  enc-k   3087  dec-k   8729  ratio -0.266pp
+ exact: enc-e2e    108 (-79.6%)  dec-e2e   4861 (+67.6%)  enc-k   3262  dec-k   8876  ratio -0.406pp
+
+LADDER G=8K reps=5 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits    off   0.6711       384      2654      1324      3323      15.1         -
+dickens.lits  nudge   0.6705       384      3592      1805      4530      16.7     46/87
+dickens.lits   auto   0.6704       336      5116      2704      6709      21.3     87/87
+dickens.lits  exact   0.6703       249      5116      2694      6773      29.8     87/87
+mozilla.lits    off   0.9519       592      3648      2506      6247      10.6         -
+mozilla.lits  nudge   0.9514       754      5601      4202      9834       8.9 1245/1382
+mozilla.lits   auto   0.9528       525      5685      4344     10309      13.7 1111/1382
+mozilla.lits  exact   0.9511       118      6202      4792     11388      67.6 1365/1382
+mr.lits         off   0.8040       860      5646      3029      7916       6.8         -
+mr.lits       nudge   0.8042       745      6790      3919      9212       8.9   150/193
+mr.lits        auto   0.8043       508      5944      3221      7996      13.5    21/193
+mr.lits       exact   0.8031       113      7096      4135      8800      70.4   176/193
+nci.lits        off   0.5395      1190      7938      3969      8674       4.8         -
+nci.lits      nudge   0.5395      1032      8091      4315      9562       6.0     8/103
+nci.lits       auto   0.5398       689     10138      4754     12749      10.1    94/103
+nci.lits      exact   0.5398       715     10017      4836     12749       9.7    94/103
+ooffice.lits    off   0.9283       728      4268      2521      5972       8.0         -
+ooffice.lits  nudge   0.9290       652      6034      3431      8577      10.1   192/214
+ooffice.lits   auto   0.9290       492      7414      4206      9667      14.7   205/214
+ooffice.lits  exact   0.9281       115      6782      4013      9998      69.0   211/214
+osdb.lits       off   0.9077       853      5132      2712      7272       6.6         -
+osdb.lits     nudge   0.9081       768      6770      3512      9441       8.3   220/252
+osdb.lits      auto   0.9138       548      7825      4513     10554      13.1   252/252
+osdb.lits     exact   0.9091       118      7825      4067     10290      67.4   252/252
+reymont.lits    off   0.7140      1130      7772      4099      9565       5.2         -
+reymont.lits  nudge   0.7133       982      9099      4974     11658       6.6     22/46
+reymont.lits   auto   0.7123       754      9817      5181     13323       9.2     27/46
+reymont.lits  exact   0.7123       336     10362      5329     13817      22.6     33/46
+samba.lits      off   0.8984      1129      5846      3409      7826       4.8         -
+samba.lits    nudge   0.8978      1098     11837      6180     16638       6.1   248/291
+samba.lits     auto   0.8984       676     13145      6936     20510      10.9   277/291
+samba.lits    exact   0.8981       168     13832      6957     19993      47.4   277/291
+sao.lits        off   0.9775      1242      5283      3382      7672       4.2         -
+sao.lits      nudge   0.9785      1055      6059      3810      8578       5.6   402/479
+sao.lits       auto   0.9818       632      6448      4058      8889      10.9   427/479
+sao.lits      exact   0.9773       122      5931      3825      9074      65.1   375/479
+webster.lits    off   0.6828       971      5477      2695      6869       5.4         -
+webster.lits  nudge   0.6816       828      7212      3073      9037       7.2   239/354
+webster.lits   auto   0.6806       662      8817      3851     11385      10.2   354/354
+webster.lits  exact   0.6809       378      8710      3866     11296      19.5   354/354
+x-ray.lits      off   0.8625       836      4283      3053      6313       7.1         -
+x-ray.lits    nudge   0.8624       712      5009      3303      7505       9.0   309/592
+x-ray.lits     auto   0.8632       515      6289      3945      9046      13.8   583/592
+x-ray.lits    exact   0.8625       116      6091      3773      8612      68.4   584/592
+xml.lits        off   0.6996       994      7114      3935      9248       6.0         -
+xml.lits      nudge   0.6991       864      8042      4301     10276       7.4      8/23
+xml.lits       auto   0.6991       597      9248      4511     10880      11.7     18/23
+xml.lits      exact   0.6989       415      8407      4624     11560      17.7     18/23
+== geomean over 12 files (G=8K)
+   off: enc-e2e    869 ( +0.0%)  dec-e2e   5188 ( +0.0%)  enc-k   2940  dec-k   7017  ratio +0.000pp
+ nudge: enc-e2e    796 ( -8.4%)  dec-e2e   6725 (+29.6%)  enc-k   3757  dec-k   9202  ratio -0.015pp
+  auto: enc-e2e    566 (-34.8%)  dec-e2e   7699 (+48.4%)  enc-k   4244  dec-k  10576  ratio +0.069pp
+ exact: enc-e2e    200 (-77.0%)  dec-e2e   7728 (+48.9%)  enc-k   4303  dec-k  10797  ratio -0.048pp
+
+LADDER G=16K reps=5 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits    off   0.6609       460      2624      1170      2879      21.3         -
+dickens.lits  nudge   0.6610       486      3592      1529      3386      22.7     18/44
+dickens.lits   auto   0.6616       417      5556      2332      6465      31.8     44/44
+dickens.lits  exact   0.6618       340      5556      2714      6524      41.6     44/44
+mozilla.lits    off   0.9471       793      5720      2833      6889      14.9         -
+mozilla.lits  nudge   0.9488      1263      8823      5284     11791       9.9   607/691
+mozilla.lits   auto   0.9502       915      8962      5204     12563      14.8   530/691
+mozilla.lits  exact   0.9487       230      9792      5671     13787      68.3   663/691
+mr.lits         off   0.7986      1128      7001      3919      8608      10.3         -
+mr.lits       nudge   0.7997      1035      8037      4688      9724      12.2     67/97
+mr.lits        auto   0.7990       780      7537      4113      8469      16.9      5/97
+mr.lits       exact   0.7991       214      8561      4847     10034      72.7     80/97
+nci.lits        off   0.5292      1386      9246      4892     10138       8.4         -
+nci.lits      nudge   0.5292      1319      9246      5008     10388       9.0      1/52
+nci.lits       auto   0.5303       943     11371      5292     13794      14.1     49/52
+nci.lits      exact   0.5303      1010     12195      5325     14261      13.0     49/52
+ooffice.lits    off   0.9215      1199      6249      3271      7777       8.6         -
+ooffice.lits  nudge   0.9244      1109      7446      4166      9113      10.8    88/107
+ooffice.lits   auto   0.9251       885      8927      4999     10801      15.2   103/107
+ooffice.lits  exact   0.9242       225      8662      4833     10541      69.4   107/107
+osdb.lits       off   0.8969      1452      7247      3630      8435       6.7         -
+osdb.lits     nudge   0.8990      1325      8684      4398     10342       8.6   114/126
+osdb.lits      auto   0.9056       991     10138      5197     11896      13.3   126/126
+osdb.lits     exact   0.9006       231      9942      5119     11627      67.5   126/126
+reymont.lits    off   0.7064      1397      8676      4606     10659       8.1         -
+reymont.lits  nudge   0.7064      1342     11304      5829     12435       9.3     11/23
+reymont.lits   auto   0.7058      1081     12435      6017     13323      12.3     17/23
+reymont.lits  exact   0.7058       552     11304      6217     14348      26.8     17/23
+samba.lits      off   0.8925      1507      8148      4406      9479       7.1         -
+samba.lits    nudge   0.8932      1470     15968      7343     19826       8.9   120/146
+samba.lits     auto   0.8938      1053     18734      8038     24277      13.5   136/146
+samba.lits    exact   0.8934       312     18162      7931     23792      50.2   136/146
+sao.lits        off   0.9729      1637      7154      4197      8485       6.1         -
+sao.lits      nudge   0.9745      1433      7732      4365      8971       7.7   183/240
+sao.lits       auto   0.9764       989      7809      4590      9356      13.0   174/240
+sao.lits      exact   0.9731       229      7763      4341      8950      67.7   130/240
+webster.lits    off   0.6718      1281      7212      3443      8334       8.0         -
+webster.lits  nudge   0.6719      1183      8456      3882      9608       9.6   103/177
+webster.lits   auto   0.6718      1002     10711      4672     12254      12.8   177/177
+webster.lits  exact   0.6719       632     10554      4812     12573      22.5   177/177
+x-ray.lits      off   0.8524      1024      6508      3876      7708      11.8         -
+x-ray.lits    nudge   0.8528       925      6819      3952      8067      13.6    66/296
+x-ray.lits     auto   0.8554       745      8302      4553      9678      18.4   294/296
+x-ray.lits    exact   0.8544       215      8121      4400      9451      72.5   287/296
+xml.lits        off   0.6973      1312      8042      4404      9735       8.3         -
+xml.lits      nudge   0.6974      1209      9248      4204     10880       9.1      4/12
+xml.lits       auto   0.6982       944     10880      5605     13211      13.6     10/12
+xml.lits      exact   0.6978       574     11560      5605     13211      24.1     10/12
+== geomean over 12 files (G=16K)
+   off: enc-e2e   1159 ( +0.0%)  dec-e2e   6714 ( +0.0%)  enc-k   3532  dec-k   7920  ratio +0.000pp
+ nudge: enc-e2e   1136 ( -2.0%)  dec-e2e   8340 (+24.2%)  enc-k   4317  dec-k   9717  ratio +0.091pp
+  auto: enc-e2e    873 (-24.7%)  dec-e2e   9683 (+44.2%)  enc-k   4878  dec-k  11574  ratio +0.213pp
+ exact: enc-e2e    343 (-70.4%)  dec-e2e   9787 (+45.8%)  enc-k   5009  dec-k  11837  ratio +0.113pp
+
+LADDER G=32K reps=5 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits    off   0.6581       532      2891      1224      3039      34.4         -
+dickens.lits  nudge   0.6583       532      3743      1782      3973      42.6      7/22
+dickens.lits   auto   0.6585       577      6078      2789      6585      44.4     22/22
+dickens.lits  exact   0.6587       474      5976      2746      6524      56.4     22/22
+mozilla.lits    off   0.9482      1009      7261      3049      8000      21.7         -
+mozilla.lits  nudge   0.9500      1630     10491      5226     12004      13.8   251/346
+mozilla.lits   auto   0.9519      1331     11185      5434     12790      18.6   219/346
+mozilla.lits  exact   0.9500       418     11953      5755     13605      72.6   280/346
+mr.lits         off   0.7993      1248      8248      4070      9106      17.9         -
+mr.lits       nudge   0.7998      1195      8800      4661      9490      20.0     17/49
+mr.lits        auto   0.7993      1009      8379      4340      9053      24.4      1/49
+mr.lits       exact   0.8001       367      8655      4832      9605      81.0     36/49
+nci.lits        off   0.5260      1538      9146      4754     10138      14.2         -
+nci.lits      nudge   0.5261      1436      9562      4979     10388      16.0      1/26
+nci.lits       auto   0.5267      1175     13147      5131     12945      21.2     26/26
+nci.lits      exact   0.5267      1218     13356      5259     14261      20.4     26/26
+ooffice.lits    off   0.9219      1477      7142      3492      7674      12.7         -
+ooffice.lits  nudge   0.9248      1473      8293      4310      9307      14.5     44/54
+ooffice.lits   auto   0.9256      1272      9721      4957     10477      18.9     50/54
+ooffice.lits  exact   0.9250       404      9998      5101     10868      73.9     52/54
+osdb.lits       off   0.8933      1628      7796      3669      8469      11.2         -
+osdb.lits     nudge   0.8964      1646     10239      4563     11125      12.7     63/63
+osdb.lits      auto   0.9024      1360     11065      5210     11965      17.7     63/63
+osdb.lits     exact   0.8977       414     10775      5107     11497      72.5     63/63
+reymont.lits    off   0.7030      1665     10659      5181     10972      12.7         -
+reymont.lits  nudge   0.7027      1651     12034      5568     12034      13.2      2/12
+reymont.lits   auto   0.7026      1347     12864      5829     13323      17.7      5/12
+reymont.lits  exact   0.7027       774     13323      5921     14348      34.9      6/12
+samba.lits      off   0.8936      1681      9593      4575     10124      12.3         -
+samba.lits    nudge   0.8943      1751     15756      6702     17240      13.8     52/73
+samba.lits     auto   0.8947      1426     19663      7931     23099      18.7     60/73
+samba.lits    exact   0.8945       526     20162      7904     22877      57.8     60/73
+sao.lits        off   0.9747      1834      7904      4202      8394      10.0         -
+sao.lits      nudge   0.9763      1714      8430      4375      8971      11.6    80/120
+sao.lits       auto   0.9763      1344      8150      4370      8809      16.8    49/120
+sao.lits      exact   0.9747       415      8430      4266      9159      71.1    49/120
+webster.lits    off   0.6687      1474      8033      3455      8684      12.6         -
+webster.lits  nudge   0.6688      1405      9239      3805     10255      14.6     57/89
+webster.lits   auto   0.6685      1315     11804      4868     12050      18.0     89/89
+webster.lits  exact   0.6686       949     11430      4860     12000      27.5     89/89
+x-ray.lits      off   0.8491      1113      7517      4017      7897      21.3         -
+x-ray.lits    nudge   0.8494      1058      7588      4054      8418      22.9    21/148
+x-ray.lits     auto   0.8522       930      9080      4531      9716      28.0   145/148
+x-ray.lits    exact   0.8511       365      8929      4424      9470      82.3   139/148
+xml.lits        off   0.7058      1468      9735      4624     10276      14.3         -
+xml.lits      nudge   0.7057      1423      8808      4743      9735      15.2       1/6
+xml.lits       auto   0.7074      1163     10880      5605     11560      21.0       4/6
+xml.lits      exact   0.7074       837     11560      5605     12331      31.3       5/6
+== geomean over 12 files (G=32K)
+   off: enc-e2e   1330 ( +0.0%)  dec-e2e   7676 ( +0.0%)  enc-k   3667  dec-k   8225  ratio +0.000pp
+ nudge: enc-e2e   1354 ( +1.8%)  dec-e2e   8985 (+17.0%)  enc-k   4387  dec-k   9775  ratio +0.090pp
+  auto: enc-e2e   1158 (-13.0%)  dec-e2e  10566 (+37.6%)  enc-k   4952  dec-k  11344  ratio +0.201pp
+ exact: enc-e2e    547 (-58.8%)  dec-e2e  10748 (+40.0%)  enc-k   5013  dec-k  11673  ratio +0.129pp
+
+LADDER G=64K reps=5 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits    off   0.6572       444      2856      1109      2891      87.2         -
+dickens.lits  nudge   0.6575       590      3161      1370      3247      62.5      2/11
+dickens.lits   auto   0.6573       551      5470      2403      5689      90.5     11/11
+dickens.lits  exact   0.6576       558      6238      2756      6524      92.5     11/11
+mozilla.lits    off   0.9504      1017      7801      2986      7592      42.4         -
+mozilla.lits  nudge   0.9521      1759     11297      5255     11706      24.8   120/173
+mozilla.lits   auto   0.9549      1676     12549      5674     13011      27.5   121/173
+mozilla.lits  exact   0.9518       705     12878      5820     13720      81.5   139/173
+mr.lits         off   0.8010      1327      8335      4212      8800      32.5         -
+mr.lits       nudge   0.8012      1303      8950      4488      9266      34.3      7/25
+mr.lits        auto   0.8010      1152      8608      4292      8900      40.0      1/25
+mr.lits       exact   0.8013       577      9159      4674      9159      95.7     18/25
+nci.lits        off   0.5248      1615      9784      4921     10017      26.9         -
+nci.lits      nudge   0.5254      1579     10261      5008     10518      28.1      2/13
+nci.lits       auto   0.5250      1366     13794      5292     14261      35.2     13/13
+nci.lits      exact   0.5250      1379     13794      5325     14507      34.8     13/13
+ooffice.lits    off   0.9249      1602      7477      3492      7477      21.9         -
+ooffice.lits  nudge   0.9283      1687      8793      4310      9113      23.4     23/27
+ooffice.lits   auto   0.9285      1591     10353      5086     10604      28.0     27/27
+ooffice.lits  exact   0.9282       670     10541      5086     10734      84.0     27/27
+osdb.lits       off   0.8914      1779      8167      3797      8647      19.2         -
+osdb.lits     nudge   0.8947      1834     11006      4543     11370      20.9     32/32
+osdb.lits      auto   0.9008      1657     11497      5373     11896      26.8     32/32
+osdb.lits     exact   0.8962       685     11370      5346     12035      81.8     32/32
+reymont.lits    off   0.7041      1802     10362      5181     11658      22.5         -
+reymont.lits  nudge   0.7041      1711     10362      5254     11658      24.5       0/6
+reymont.lits   auto   0.7046      1548     13817      6116     14922      30.0       3/6
+reymont.lits  exact   0.7047      1028     12864      6217     14922      50.5       3/6
+samba.lits      off   0.8976      1789      9671      4532      9913      21.8         -
+samba.lits    nudge   0.8980      1998     18162      7232     19187      23.3     31/37
+samba.lits     auto   0.8984      1737     21243      7801     23099      28.8     32/37
+samba.lits    exact   0.8982       808     20688      7700     22877      71.2     32/37
+sao.lits        off   0.9782      1943      8236      4162      8341      17.9         -
+sao.lits      nudge   0.9802      1912      8950      4475      9401      19.6     45/60
+sao.lits       auto   0.9788      1638      8412      4317      8522      24.7      7/60
+sao.lits      exact   0.9782       692      8394      4261      8654      79.1     12/60
+webster.lits    off   0.6671      1607      8382      3619      8055      22.2         -
+webster.lits  nudge   0.6673      1568     10007      3940     10328      24.7     28/45
+webster.lits   auto   0.6670      1575     12254      4927     12796      27.8     45/45
+webster.lits  exact   0.6671      1231     12254      5091     12684      39.6     45/45
+x-ray.lits      off   0.8477      1177      7975      4283      8190      40.4         -
+x-ray.lits    nudge   0.8477      1136      7820      4137      8331      41.8      3/74
+x-ray.lits     auto   0.8509      1067      9253      4527      9658      46.9     73/74
+x-ray.lits    exact   0.8498       555      9029      4372      9271     103.1     67/74
+xml.lits        off   0.7148      1581      8407      4404      8808      25.0         -
+xml.lits      nudge   0.7148      1581      8808      4624     10276      25.7       1/3
+xml.lits       auto   0.7163      1412     12331      5780     13211      33.0       3/3
+xml.lits      exact   0.7158      1069     13211      5780     14228      47.0       3/3
+== geomean over 12 files (G=64K)
+   off: enc-e2e   1389 ( +0.0%)  dec-e2e   7810 ( +0.0%)  enc-k   3675  dec-k   8013  ratio +0.000pp
+ nudge: enc-e2e   1492 ( +7.4%)  dec-e2e   9202 (+17.8%)  enc-k   4306  dec-k   9723  ratio +0.101pp
+  auto: enc-e2e   1360 ( -2.1%)  dec-e2e  11060 (+41.6%)  enc-k   4966  dec-k  11558  ratio +0.203pp
+ exact: enc-e2e    791 (-43.0%)  dec-e2e  11218 (+43.6%)  enc-k   5065  dec-k  11841  ratio +0.122pp
+
+LADDER G=128K reps=5 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits    off   0.6579       591      3052      1220      3079     103.5         -
+dickens.lits  nudge   0.6573       627      3723      1730      3783     120.7       1/6
+dickens.lits   auto   0.6570       747      6465      2789      6524     116.2       6/6
+dickens.lits  exact   0.6574       719      6407      2756      6465     121.8       6/6
+mozilla.lits    off   0.9520      1119      8311      2964      7587      72.4         -
+mozilla.lits  nudge   0.9529      1944     11991      5332     12277      42.5     67/87
+mozilla.lits   auto   0.9566      1934     13011      5874     13056      45.1     65/87
+mozilla.lits  exact   0.9530      1064     13101      5766     13255      99.7     72/87
+mr.lits         off   0.8009      1352      8469      4246      8608      61.1         -
+mr.lits       nudge   0.8021      1365      9159      4620      9321      62.5      5/13
+mr.lits        auto   0.8009      1249      8752      4400      8850      69.5      1/13
+mr.lits       exact   0.8014       790      9321      4759      9490     127.9      8/13
+nci.lits        off   0.5242      1656      9562      4836     10017      47.7         -
+nci.lits      nudge   0.5250      1640      9672      4950     10518      49.0       1/7
+nci.lits       auto   0.5243      1479     14024      5259     14024      58.4       7/7
+nci.lits      exact   0.5243      1555     14261      5394     14261      55.0       7/7
+ooffice.lits    off   0.9276      1687      7882      3431      7674      37.6         -
+ooffice.lits  nudge   0.9305      1798      8793      4176      8882      39.6     12/14
+ooffice.lits   auto   0.9311      1798     10735      5086     10735      44.9     14/14
+ooffice.lits  exact   0.9308       988     10669      5131     10801     102.1     14/14
+osdb.lits       off   0.8902      1866      8647      3847      8684      35.5         -
+osdb.lits     nudge   0.8940      1956     11246      4635     11308      38.0     16/16
+osdb.lits      auto   0.9001      1874     11760      5402     11896      44.8     16/16
+osdb.lits     exact   0.8952      1025     11693      5158     11562     100.6     16/16
+reymont.lits    off   0.7217      1847      9817      4845     10972      41.7         -
+reymont.lits  nudge   0.7224      1838     10972      5329     12034      44.3       1/3
+reymont.lits   auto   0.7229      1658     11305      5652     12435      53.0       1/3
+reymont.lits  exact   0.7226      1207     11305      5652     12864      81.0       2/3
+samba.lits      off   0.9044      1850      9294      4398      9257      39.2         -
+samba.lits    nudge   0.9041      2111     17494      6936     17623      41.3     15/19
+samba.lits     auto   0.9047      1957     19501      7505     20335      47.3     17/19
+samba.lits    exact   0.9044      1132     19826      7298     19993      93.5     17/19
+sao.lits        off   0.9818      2012      8305      4197      8412      33.8         -
+sao.lits      nudge   0.9842      2063      9378      4667      9561      35.3     28/30
+sao.lits       auto   0.9818      1812      8504      4148      8323      40.6      0/30
+sao.lits      exact   0.9818      1026      8578      4193      8790      96.2      0/30
+webster.lits    off   0.6664      1697      8431      3684      8310      40.0         -
+webster.lits  nudge   0.6668      1675      9672      3924      9836      43.0     13/23
+webster.lits   auto   0.6663      1745     12519      4952     12740      46.7     23/23
+webster.lits  exact   0.6663      1517     12684      4943     12796      57.4     23/23
+x-ray.lits      off   0.8473      1194      8316      4352      8345      79.6         -
+x-ray.lits    nudge   0.8474      1176      8162      4223      8536      80.4      2/37
+x-ray.lits     auto   0.8504      1141      9378      4536      9658      85.9     35/37
+x-ray.lits    exact   0.8492       767      9200      4392      9253     141.0     34/37
+xml.lits        off   0.7284      1729     10276      5138     11560      35.5         -
+xml.lits      nudge   0.7284      1681     11560      4867     12331      36.0       1/2
+xml.lits       auto   0.7283      1666     12331      6165     12331      40.5       2/2
+xml.lits      exact   0.7283      1217     13211      5440     14228      59.0       2/2
+== geomean over 12 files (G=128K)
+   off: enc-e2e   1482 ( +0.0%)  dec-e2e   8071 ( +0.0%)  enc-k   3728  dec-k   8196  ratio +0.000pp
+ nudge: enc-e2e   1587 ( +7.1%)  dec-e2e   9638 (+19.4%)  enc-k   4428  dec-k   9966  ratio +0.103pp
+  auto: enc-e2e   1538 ( +3.8%)  dec-e2e  11110 (+37.7%)  enc-k   5016  dec-k  11295  ratio +0.181pp
+ exact: enc-e2e   1054 (-28.8%)  dec-e2e  11254 (+39.4%)  enc-k   4958  dec-k  11529  ratio +0.100pp
