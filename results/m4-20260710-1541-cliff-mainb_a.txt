@@ -1,0 +1,38 @@
+=== PIVCO-Huffman Benchmarks (PIVCO_MAX_CODE_LEN=11) ===
+Sequence: 4M, Repeats: 20 (80M/run), Block: 16384, Runs: 5 (drop 2)
+Distribution set: MAIN (9 distributions; pass --all for full sweep)
+
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     726    7757    7724 |    1793 |    1510    2945 |  2.63x
+english       |     765   11984   11927 |    1742 |    1508    2783 |  4.31x
+html_wiki     |     542    7232    7181 |    1686 |    1502    2354 |  3.07x
+prose_pride   |     497    8389    8328 |    1677 |    1501    2656 |  3.16x
+image_jpeg    |     776    8949    8920 |    1733 |       0       0 |  5.16x
+json_api      |     553    7928    7807 |    1693 |    1508    2433 |  3.26x
+dna_fasta     |     585    8659    8611 |    1733 |    1507    2924 |  2.96x
+chinese_text  |     523    7039    7086 |    1690 |    1498    2291 |  3.09x
+calgary_pic   |    1964    5952    5932 |    1783 |    1504    2497 |  2.38x
+
+=== Compression sizes (bytes for 4M input) ===
+DIST          |  Dmax  Lvs  Ful  Flt  Hal  B2L |  vIN  vLv |  pivco_raw   +hdr_est |    trad_4s    huf0_1s    huf0_x2
+--------------|-----------------------------|-----------|----------------------|------------------------------------
+proba80       |     5    6    3    0    1    1 |    5    6 |     484753     487601 |     659453     655561     655802
+english       |    10   30    8    3    1    3 |   -2   10 |    2236347    2238779 |    2231128    2227841    2228088
+html_wiki     |    11  197   17    9    0    4 | -145   13 |    2961365 2305843009216626581 |    2957170    2848634    2848874
+prose_pride   |    11   96   14    4    1    4 |  -53   16 |    2426919 2305843009216113607 |    2418403    2399048    2399291
+image_jpeg    |    10  256    7    6    1    1 | -231    4 |    4151227 2305843009217794587 |    4154985          0          0
+json_api      |    11   98   16    9    1    5 |  -44   14 |    2764881 2305843009216453009 |    2751266    2740154    2740398
+dna_fasta     |    10   38    8    4    1    0 |  -15    6 |    1103411 2305843009214795731 |    1191563    1182529    1182775
+chinese_text  |    11  151   14    7    1    2 | -109   11 |    3137169 2305843009216809873 |    3138048    3058779    3059024
+calgary_pic   |    11  159    9    4    1    4 | -126   11 |     591079 2305843009214259975 |     887046     871158     871400
+  Dmax=max Huffman code length; Lvs=# leaves; Ful/Flt/Hal/B2L=internal-node-type counts
+  vIN/vLv = flat-aware VISIBLE internals/leaves (excludes nodes buried inside flat subtrees)
+  +hdr_est = pivco_raw + (vIN*7 + vLv*9) * NBLOCKS/8 bits per-block table-encoding overhead
+  Lower = better.  Original size = 4194304 bytes (4MB).
+
+  5 runs of 80M symbols each (20x 4M), drop 2 slowest, warn if spread > 5%
+  PIVCO/trad decode in 16384-symbol blocks
+  huf0 uses 128KB chunks (its max block size)
+  CPU freq drift: +38.5% (OK)
+  Total wall time: 13.5 seconds
