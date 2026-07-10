@@ -62,10 +62,16 @@ build-time/decode, r2 = wire cross-check/table-lifetime/interleaved decode).
   codegen); ARM immune (31 GPRs — pressure never bites); dispatch/
   alignment/cursor fixes useless (pressure is the SUM of live values).
   Residual -1.3% uninlined = true walk-logic overhead (checks etc).
-  Recovery direction if desired: shrink live state across the merge
-  calls — e.g. outline each switch case into a noinline helper taking
-  only the state that kind needs (the experiment shows calls here cost
-  far less than spills), or pack walk state into one context struct.
+  PARTIAL RECOVERY SHIPPED (..._c8i_byvalue.txt): record indices by
+  VALUE — the pre-order layout makes children implicit (left = idx+1,
+  right = idx + rec->right, the record's third byte repurposed from
+  subtree-skip to right-child offset, free at build time).  Kills the
+  cursor's live-across-calls pointer, its memory round-trips, AND the
+  K==0 skip logic (empty children are simply not visited).
+  c8i gcc-13: -2.2% vs main (from -3.0%) — halfway to the uninlined
+  floor.  ARM unchanged.  Further recovery if ever needed: outline
+  each switch case into a noinline helper carrying only its kind's
+  state (uninline experiment shows calls cost ~nothing here).
   Verdict: accepted meanwhile — the table-lifetime regime (the actual
   target) nets 1.45-1.63x on these same hosts INCLUDING this effect;
   the ~2-3% only bites unbounded-lifetime single-table x86 streams.

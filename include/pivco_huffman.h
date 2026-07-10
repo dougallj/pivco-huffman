@@ -110,11 +110,15 @@ typedef enum {
  * The execution form of the implicit rank-range tree (issue #7): one
  * record per VISIBLE internal node of the codec walk, in pre-order.
  * Leaves emit no record (parents consume their symbols via cst merges),
- * and nodes buried inside flat subtrees don't exist.  The wire supplies
- * all child sizes (K_right), so the walk needs no random access — a
- * single cursor streams the program.  A child subtree that receives 0
- * elements touches neither the wire nor its records; the caller jumps
- * the cursor by that child's `skip`.
+ * and nodes buried inside flat subtrees don't exist.  Child links are
+ * implicit in the pre-order layout: a node's LEFT child (when it has a
+ * record) is the next record, and its RIGHT child sits at the
+ * precomputed `right` offset — so the walk passes record indices BY
+ * VALUE, exactly like the retired tree walk passed node ids.  (An
+ * earlier form streamed a by-reference cursor instead; the extra
+ * live-across-calls state measurably fed x86 register pressure — see
+ * results/sweep_2026-07-10_aws_SUMMARY.md.)  A child subtree that
+ * receives 0 elements is simply not visited.
  *
  *   kd     kind in the low 2 bits; for FLAT, the subtree depth D in the
  *          high bits (kd >> 2).
@@ -123,7 +127,10 @@ typedef enum {
  *          for FLAT (symbols are rank_to_sym[param..]), the leaf
  *          symbol(s) rank_to_sym[param] (+ [param+1] for PAIR), and
  *          numerically == thr for PAIR / LEAF_LEFT.
- *   skip   record count of this node's subtree including itself.
+ *   right  offset from this record to the right child's record:
+ *          1 + the left subtree's record count for FULL, 1 for
+ *          LEAF_LEFT (the lone left leaf has no record), 0 (unused)
+ *          for FLAT / PAIR.
  */
 typedef enum {
     PIVCO_SCHED_FULL      = 0,  /* both children internal — K_right header */
@@ -135,7 +142,7 @@ typedef enum {
 typedef struct {
     uint8_t kd;     /* kind | (flat D << 2) */
     uint8_t param;  /* rank_begin or thr — see kind */
-    uint8_t skip;   /* subtree record count incl. self (<= 255) */
+    uint8_t right;  /* offset to the right child's record — see above */
 } pivco_sched_rec_t;
 
 /* ---------- Decode table ----------

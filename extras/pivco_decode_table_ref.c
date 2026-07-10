@@ -200,7 +200,7 @@ static uint8_t ref_sched_gen(ref_gen_t *g, int depth)
         rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
                               : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
         rec->param = (uint8_t)rank0;
-        rec->skip  = 1;
+        rec->right = 0;                     /* no child records */
         return 1;
     }
 
@@ -219,8 +219,10 @@ static uint8_t ref_sched_gen(ref_gen_t *g, int depth)
     else if (right_lone)          { g->err = 1; return 0; }
     else                          rec->kd = (uint8_t)PIVCO_SCHED_FULL;
     rec->param = (uint8_t)thr;
-    rec->skip  = (uint8_t)(1 + nl + nr);
-    return rec->skip;
+    /* right child record = 1 + left subtree's record count (1 for
+     * LEAF_LEFT: nl == 0); unused for PAIR */
+    rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR) ? 0 : (uint8_t)(1 + nl);
+    return (uint8_t)(1 + nl + nr);
 }
 
 static int ref_run_sched(pivco_huffman_decode_table_t *dt,
@@ -282,7 +284,7 @@ static int ref_run_sched(pivco_huffman_decode_table_t *dt,
                 rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
                                       : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
                 rec->param = (uint8_t)rank0;
-                rec->skip  = 1;
+                rec->right = 0;             /* no child records */
             }
         }
 
@@ -311,7 +313,9 @@ static int ref_run_sched(pivco_huffman_decode_table_t *dt,
             else if (right_lone)          return -1;
             else                          rec->kd = (uint8_t)PIVCO_SCHED_FULL;
             rec->param = (uint8_t)(f->mid_rank - 1);
-            rec->skip  = (uint8_t)(dt->sched_len - f->my);
+            rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR)
+                             ? 0
+                             : (uint8_t)(f->mid_sched - f->my);
             sp--;
         }
     }
@@ -342,7 +346,7 @@ int pivco_huffman_build_decode_table_ref(
         dt->num_ranks = 2;
         dt->sched[0].kd    = (uint8_t)PIVCO_SCHED_PAIR;
         dt->sched[0].param = 0;
-        dt->sched[0].skip  = 1;
+        dt->sched[0].right = 0;
         dt->sched_len = 1;
         return PIVCO_OK;
     }

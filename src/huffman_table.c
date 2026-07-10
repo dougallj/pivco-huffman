@@ -386,7 +386,7 @@ static void build_single_symbol_decode(int sym,
     dt->num_ranks = 2;
     dt->sched[0].kd    = (uint8_t)PIVCO_SCHED_PAIR;
     dt->sched[0].param = 0;
-    dt->sched[0].skip  = 1;
+    dt->sched[0].right = 0;    /* PAIR: no child records */
     dt->sched_len = 1;
 }
 
@@ -538,7 +538,7 @@ static int build_schedule(pivco_huffman_decode_table_t *dt,
                 rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
                                       : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
                 rec->param = (uint8_t)rank0;    /* == thr for PAIR */
-                rec->skip  = 1;
+                rec->right = 0;                 /* no child records */
             }
         }
 
@@ -571,7 +571,12 @@ static int build_schedule(pivco_huffman_decode_table_t *dt,
             else if (right_lone)          return -1;
             else                          rec->kd = (uint8_t)PIVCO_SCHED_FULL;
             rec->param = (uint8_t)(f->mid_rank - 1);
-            rec->skip  = (uint8_t)(dt->sched_len - f->my);
+            /* right child's record starts where the left subtree's
+             * records ended (1 for LEAF_LEFT: bare left leaf, no record;
+             * 0 for the PAIR case: no child records at all). */
+            rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR)
+                             ? 0
+                             : (uint8_t)(f->mid_sched - f->my);
             sp--;
         }
     }
