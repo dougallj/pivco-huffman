@@ -209,18 +209,22 @@ extern uint64_t g_pivco_fse_bytes_out[PIVCO_FSE_STATS_SLOTS];
 
 #if defined(PIVCO_BACKEND_SCALAR)
 #  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_scalar
+#  define CODEC_ENCODE_CT_ENTRY pivco_huffman_encode_scalar_ct
 #  define CODEC_DECODE_ENTRY    pivco_huffman_decode_scalar
 #  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_scalar_dt
 #elif defined(PIVCO_BACKEND_NEON)
 #  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_neon
+#  define CODEC_ENCODE_CT_ENTRY pivco_huffman_encode_neon_ct
 #  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_neon
 #  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_neon_dt
 #elif defined(PIVCO_BACKEND_X86)
 #  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_x86
+#  define CODEC_ENCODE_CT_ENTRY pivco_huffman_encode_x86_ct
 #  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_x86
 #  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_x86_dt
 #elif defined(PIVCO_BACKEND_AVX512)
 #  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_avx512
+#  define CODEC_ENCODE_CT_ENTRY pivco_huffman_encode_avx512_ct
 #  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_avx512
 #  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_avx512_dt
 #else
@@ -340,8 +344,10 @@ static inline void codec_maybe_fse_attempt(uint8_t *marker_slot,
 }
 
 /* Callers guarantee n > 0 and do not visit empty (n == 0) child
- * subtrees; record indices ride by value. */
-static void codec_encode_node(const pivco_huffman_table_t *table,
+ * subtrees; record indices ride by value.  Takes the bare decode table —
+ * the walk reads only sched[], so the full-table and codec-table encode
+ * entries share it. */
+static void codec_encode_node(const pivco_huffman_decode_table_t *dt,
                                int idx,
                                uint8_t *ranks, int n,
                                int depth,
@@ -350,7 +356,7 @@ static void codec_encode_node(const pivco_huffman_table_t *table,
 {
     PROF_COUNT_ONLY(PROF_ENC_NODE_VISIT, n);
 
-    const pivco_sched_rec_t *rec = &table->dec.sched[idx];
+    const pivco_sched_rec_t *rec = &dt->sched[idx];
     const unsigned kind = rec->kd & 3u;
 
     /* Flat-subtree fast path: pack n*D bits, no marker, no K_right. */
@@ -413,18 +419,21 @@ static void codec_encode_node(const pivco_huffman_table_t *table,
      * left child is a leaf (no record, nothing on the wire); an empty
      * child is simply not visited. */
     if (kind == PIVCO_SCHED_FULL && n_left > 0)
-        codec_encode_node(table, idx + 1, ranks, n_left, depth + 1,
+        codec_encode_node(dt, idx + 1, ranks, n_left, depth + 1,
                            out_ptr, tmp + n_right);
     if (kind != PIVCO_SCHED_PAIR && n_right > 0)
-        codec_encode_node(table, idx + rec->right, tmp, n_right, depth + 1,
+        codec_encode_node(dt, idx + rec->right, tmp, n_right, depth + 1,
                            out_ptr, tmp + n_right);
 }
 
-int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
-                       const pivco_huffman_table_t *table,
-                       uint8_t *out, size_t *out_len)
+/* Shared encode body; the two public entries below differ only in where
+ * the three table pieces live. */
+static int codec_encode_core(const uint8_t *symbols, size_t n,
+                             const pivco_huffman_decode_table_t *dt,
+                             const uint8_t *sym_to_rank,
+                             const pivco_huffman_enc_init_aux_t *aux,
+                             uint8_t *out, size_t *out_len)
 {
-    if (!symbols || !table || !out || !out_len) return PIVCO_ERR_NULL;
     if (n == 0 || n > PIVCO_WIRE_MAX_N) return PIVCO_ERR_OVERFLOW;
     prim_codec_init();
 
@@ -449,13 +458,31 @@ int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
     /* ranks[i] = in-order rank of symbols[i] (gather table->sym_to_rank). */
     PROF_COUNT_ONLY(PROF_ENC_ENTRY, N);
     PROF_TIC();
-    prim_enc_init(ranks, N, symbols, table->sym_to_rank, &table->enc_init_aux);
+    prim_enc_init(ranks, N, symbols, sym_to_rank, aux);
     PROF_TOC(PROF_ENC_INIT, N);
 
-    codec_encode_node(table, 0, ranks, N, 0, &ptr, tmp);
+    codec_encode_node(dt, 0, ranks, N, 0, &ptr, tmp);
 
     *out_len = (size_t)(ptr - out);
     return PIVCO_OK;
+}
+
+int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
+                       const pivco_huffman_table_t *table,
+                       uint8_t *out, size_t *out_len)
+{
+    if (!symbols || !table || !out || !out_len) return PIVCO_ERR_NULL;
+    return codec_encode_core(symbols, n, &table->dec, table->sym_to_rank,
+                             &table->enc_init_aux, out, out_len);
+}
+
+int CODEC_ENCODE_CT_ENTRY(const uint8_t *symbols, size_t n,
+                          const pivco_huffman_codec_table_t *ct,
+                          uint8_t *out, size_t *out_len)
+{
+    if (!symbols || !ct || !out || !out_len) return PIVCO_ERR_NULL;
+    return codec_encode_core(symbols, n, &ct->dec, ct->sym_to_rank,
+                             &ct->enc_init_aux, out, out_len);
 }
 
 /* ---------- Bottom-up decode tree walk ---------- *

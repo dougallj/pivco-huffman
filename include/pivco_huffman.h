@@ -178,6 +178,32 @@ typedef struct {
     const uint16_t *s2r_hi;      /* sym_to_rank[s] << 8 (u16) — x86 2tab merge */
 } pivco_huffman_enc_init_aux_t;
 
+/* ---------- Codec table (modern encoder + decoder, minimal) ----------
+ *
+ * EVERYTHING the production codec reads on BOTH sides: the decode core
+ * (walk program + rank -> symbol), plus the encoder's symbol -> rank
+ * gather (with its x86 aux) and the code lengths for wire-header
+ * serialization.  ~1.5 KB (~2 KB on x86) vs the 13 KB full table —
+ * sized, like the decode table, for rebuild-per-window adaptive use.
+ * sym_to_rank is the inverse of dec.rank_to_sym (0 for symbols not in
+ * the table); code_len of the degenerate single-symbol table is 1
+ * whatever length the input claimed, matching the full build.
+ *
+ * Build with pivco_huffman_build_codec_table() (from frequencies — the
+ * encoder side owns counts) or .._from_code_lens() (predefined /
+ * static lengths).  Encode via pivco_huffman_encode_ct(); decode via
+ * pivco_huffman_decode_dt(&ct->dec).  enc_init_aux is self-referential:
+ * rebuild, don't bitwise-copy. */
+typedef struct {
+    pivco_huffman_decode_table_t dec;
+    uint8_t code_len[PIVCO_MAX_SYMBOLS];
+    uint8_t sym_to_rank[PIVCO_MAX_SYMBOLS];
+#if defined(__x86_64__) || defined(__i386__)
+    uint16_t enc_init_hi[PIVCO_MAX_SYMBOLS];   /* backing for enc_init_aux.s2r_hi */
+#endif
+    pivco_huffman_enc_init_aux_t enc_init_aux;
+} pivco_huffman_codec_table_t;
+
 typedef struct {
     /* Decode core — the codec's decode path reads ONLY this (encode also
      * streams dec.sched).  See pivco_huffman_decode_table_t.  The
@@ -361,6 +387,21 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
 int pivco_huffman_build_decode_table(const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
                                      pivco_huffman_decode_table_t *dt);
 
+/* Build the minimal codec table (see pivco_huffman_codec_table_t) from
+ * frequencies: derive code lengths (two-queue + limiting), then the decode
+ * core plus the encoder's sym_to_rank (one inversion of rank_to_sym) and
+ * aux.  This is the encoder-side twin of build_decode_table; the header
+ * lengths to transmit are left in ct->code_len. */
+int pivco_huffman_build_codec_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                                    pivco_huffman_codec_table_t *ct);
+
+/* Same, from predefined code lengths (static tables, table reuse).  Costs
+ * build_decode_table plus the sym_to_rank inversion.  Rejects invalid /
+ * non-Kraft-complete lengths exactly like build_decode_table. */
+int pivco_huffman_build_codec_table_from_code_lens(
+    const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
+    pivco_huffman_codec_table_t *ct);
+
 /* Build a Huffman table from already-known code lengths (the path used by
  * decoders that recovered code_lens from a wire format).  The tree is fully
  * determined by the lengths -- within-tier order is symbol-value ascending --
@@ -419,9 +460,20 @@ int pivco_huffman_decode_dt(const uint8_t *in, size_t in_len,
                             const pivco_huffman_decode_table_t *dt,
                             uint8_t *symbols, size_t *consumed);
 
+/* Encode against the minimal codec table — same walk, same wire bytes as
+ * pivco_huffman_encode over a full table built from the same lengths.
+ * The per-backend *_ct entries below are the real implementations; both
+ * table-taking forms are thin shims over a shared core. */
+int pivco_huffman_encode_ct(const uint8_t *symbols, size_t n,
+                            const pivco_huffman_codec_table_t *ct,
+                            uint8_t *out, size_t *out_len);
+
 int pivco_huffman_encode_scalar(const uint8_t *symbols, size_t n,
                                 const pivco_huffman_table_t *table,
                                 uint8_t *out, size_t *out_len);
+int pivco_huffman_encode_scalar_ct(const uint8_t *symbols, size_t n,
+                                   const pivco_huffman_codec_table_t *ct,
+                                   uint8_t *out, size_t *out_len);
 
 int pivco_huffman_decode_scalar(const uint8_t *in, size_t in_len,
                                 const pivco_huffman_table_t *table,
@@ -433,6 +485,9 @@ int pivco_huffman_decode_scalar_dt(const uint8_t *in, size_t in_len,
 #ifdef PIVCO_HAS_NEON
 int pivco_huffman_encode_neon(const uint8_t *symbols, size_t n,
                               const pivco_huffman_table_t *table,
+                              uint8_t *out, size_t *out_len);
+int pivco_huffman_encode_neon_ct(const uint8_t *symbols, size_t n,
+                              const pivco_huffman_codec_table_t *ct,
                               uint8_t *out, size_t *out_len);
 
 /* Bottom-up merge decode (NEON). */
@@ -447,6 +502,9 @@ int pivco_huffman_decode_bu_neon_dt(const uint8_t *in, size_t in_len,
 #ifdef PIVCO_HAS_SSE4
 int pivco_huffman_encode_x86(const uint8_t *symbols, size_t n,
                               const pivco_huffman_table_t *table,
+                              uint8_t *out, size_t *out_len);
+int pivco_huffman_encode_x86_ct(const uint8_t *symbols, size_t n,
+                              const pivco_huffman_codec_table_t *ct,
                               uint8_t *out, size_t *out_len);
 
 /* Bottom-up merge decode (x86 SSE4.1 / AVX-512 VBMI2). */
@@ -481,6 +539,9 @@ int pivco_huffman_decode_sve(const uint8_t *in, size_t in_len,
 #ifdef PIVCO_HAS_AVX512
 int pivco_huffman_encode_avx512(const uint8_t *symbols, size_t n,
                                  const pivco_huffman_table_t *table,
+                                 uint8_t *out, size_t *out_len);
+int pivco_huffman_encode_avx512_ct(const uint8_t *symbols, size_t n,
+                                 const pivco_huffman_codec_table_t *ct,
                                  uint8_t *out, size_t *out_len);
 
 /* Bottom-up merge decode (AVX-512 VBMI2). */

@@ -38,44 +38,131 @@
  * (leaves sorted by (freq,sym); internals in creation order). */
 typedef struct { uint64_t freq; uint16_t sym; } leaf_t;
 
-/* Stable LSD radix sort of leaf[0..n) by frequency ascending, over only the
- * bytes the max frequency needs (typically 2-3 for per-window counts).  Beats
- * qsort here: no indirect compare per element, and stability over the
- * symbol-ordered seed keeps the (freq,sym) tie discipline the heap relied on. */
-static void sort_leaves_by_freq(leaf_t *leaf, int n)
+/* Stable sort of leaf[0..n) by frequency ascending.  Stability over the
+ * symbol-ordered seed keeps the (freq,sym) tie discipline the heap relied on.
+ *
+ * Small alphabets take an insertion sort: a radix pass costs 256 bins of
+ * zero + prefix regardless of n, which dwarfs n^2/4 compares up to a few
+ * dozen leaves.
+ *
+ * Larger ones take an LSD radix over only the bytes that VARY across the
+ * frequencies (`vary` = OR ^ AND of all freqs, a free by-product of the
+ * caller's scan): a constant byte is an identity (stable) pass, so it is
+ * skipped outright.  Near-uniform frequency sets — whose same-value runs
+ * serialize hardest on a bin's store-to-load forwarding — are exactly the
+ * sets with few varying bytes.  The remaining planes' histograms are all
+ * gathered in ONE pass over the leaves (u16 bins suffice for n <= 256), so
+ * same-byte runs split across the planes' independent forwarding chains
+ * instead of hammering one bin per pass. */
+#define PIVCO_LEAF_SORT_INSERTION_MAX 24
+
+static void sort_leaves_by_freq(leaf_t *leaf, int n, uint64_t vary)
 {
-    uint64_t mx = 0;
-    for (int i = 0; i < n; i++) if (leaf[i].freq > mx) mx = leaf[i].freq;
-    int nbytes = 0;
-    while (mx) { nbytes++; mx >>= 8; }   /* freq>0 for every leaf => nbytes>=1 */
+    if (n <= PIVCO_LEAF_SORT_INSERTION_MAX) {
+        for (int i = 1; i < n; i++) {
+            leaf_t cur = leaf[i];
+            int j = i - 1;
+            while (j >= 0 && leaf[j].freq > cur.freq) { leaf[j + 1] = leaf[j]; j--; }
+            leaf[j + 1] = cur;
+        }
+        return;
+    }
+
+    uint8_t pass_shift[8];
+    int npass = 0;
+    for (int b = 0; b < 8; b++)
+        if ((vary >> (8 * b)) & 0xFF)
+            pass_shift[npass++] = (uint8_t)(8 * b);
+    if (npass == 0) return;              /* all frequencies equal */
+
+    uint16_t cnt[8][256];
+    memset(cnt, 0, (size_t)npass * sizeof(cnt[0]));
+    /* Constant plane count so the inner loop unrolls (2-3 planes is the
+     * per-window norm: counts <= 100K with a zero high-vary byte or two). */
+#define PIVCO_HIST_PLANES(NP)                                   \
+        for (int i = 0; i < n; i++) {                           \
+            uint64_t f = leaf[i].freq;                          \
+            for (int p = 0; p < (NP); p++)                      \
+                cnt[p][(f >> pass_shift[p]) & 0xFF]++;          \
+        }
+    switch (npass) {
+    case 1:  PIVCO_HIST_PLANES(1); break;
+    case 2:  PIVCO_HIST_PLANES(2); break;
+    case 3:  PIVCO_HIST_PLANES(3); break;
+    default: PIVCO_HIST_PLANES(npass); break;
+    }
+#undef PIVCO_HIST_PLANES
 
     leaf_t tmp[PIVCO_MAX_SYMBOLS];
     leaf_t *src = leaf, *dst = tmp;
-    for (int b = 0; b < nbytes; b++) {
-        int shift = b * 8;
-        int cnt[256] = {0};
-        for (int i = 0; i < n; i++) cnt[(src[i].freq >> shift) & 0xFF]++;
-        int sum = 0;
-        for (int c = 0; c < 256; c++) { int t = cnt[c]; cnt[c] = sum; sum += t; }
-        for (int i = 0; i < n; i++) { int k = (src[i].freq >> shift) & 0xFF; dst[cnt[k]++] = src[i]; }
+    for (int p = 0; p < npass; p++) {
+        int shift = pass_shift[p];
+        uint16_t *c = cnt[p];
+        unsigned sum = 0, maxc = 0;
+        for (int k = 0; k < 256; k++) {
+            unsigned t = c[k]; c[k] = (uint16_t)sum; sum += t;
+            if (t > maxc) maxc = t;
+        }
+        if (maxc >= (unsigned)n / 2) {
+            /* Dominant-bin pass (e.g. the top freq byte, where every count
+             * below 64K lands in bin 0): the plain scatter's c[k]++ becomes
+             * a serial store-to-load-forward chain on that bin.  Cache the
+             * ACTIVE bin's cursor in a register across the run; a dominant
+             * bin >= n/2 bounds the same-bin transition rate at >= ~50%, so
+             * the k!=prev branch predicts well too. */
+            unsigned prev_k = (src[0].freq >> shift) & 0xFF;
+            unsigned cur = c[prev_k];
+            for (int i = 0; i < n; i++) {
+                unsigned k = (src[i].freq >> shift) & 0xFF;
+                if (k != prev_k) {
+                    c[prev_k] = (uint16_t)cur;
+                    cur = c[k];
+                    prev_k = k;
+                }
+                dst[cur++] = src[i];
+            }
+            c[prev_k] = (uint16_t)cur;
+        } else {
+            for (int i = 0; i < n; i++) { unsigned k = (src[i].freq >> shift) & 0xFF; dst[c[k]++] = src[i]; }
+        }
         leaf_t *t = src; src = dst; dst = t;
     }
     if (src != leaf) memcpy(leaf, src, (size_t)n * sizeof(leaf_t));
 }
 
-/* Derives code lengths for n_used (>=2) symbols into lengths[] (indexed by
- * symbol; untouched entries stay 0).  No length limiting -- the caller applies
- * limit_code_lengths afterwards, same as the heap path did. */
-static void build_lengths_twoqueue(const uint64_t freq[PIVCO_MAX_SYMBOLS],
-                                   int n_used, const int used[PIVCO_MAX_SYMBOLS],
-                                   uint8_t lengths[PIVCO_MAX_SYMBOLS])
+/* Scan the nonzero frequencies into leaf[] in symbol order (the sort's
+ * stable seed) and report which freq bytes vary (OR ^ AND — see
+ * sort_leaves_by_freq).  Returns the leaf count. */
+static int scan_nonzero_freqs(const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                              leaf_t leaf[PIVCO_MAX_SYMBOLS],
+                              uint64_t *vary)
 {
-    leaf_t leaf[PIVCO_MAX_SYMBOLS];
-    for (int i = 0; i < n_used; i++) {
-        leaf[i].freq = freq[used[i]];
-        leaf[i].sym  = (uint16_t)used[i];
+    int n_used = 0;
+    uint64_t orv = 0, andv = ~(uint64_t)0;
+    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++) {
+        uint64_t f = freq[i];
+        if (f > 0) {
+            leaf[n_used].freq = f;
+            leaf[n_used].sym  = (uint16_t)i;
+            n_used++;
+            orv |= f;
+            andv &= f;
+        }
     }
-    sort_leaves_by_freq(leaf, n_used);
+    *vary = orv ^ andv;
+    return n_used;
+}
+
+/* Derives code lengths for the n_used (>=2) leaves into lengths[] (indexed
+ * by symbol; untouched entries stay 0).  leaf[] arrives in symbol order and
+ * is sorted here; `vary` is the OR ^ AND of all frequencies (see
+ * sort_leaves_by_freq).  Returns the max derived length -- the caller runs
+ * limit_code_lengths only when it exceeds PIVCO_MAX_CODE_LEN. */
+static int build_lengths_twoqueue(leaf_t leaf[PIVCO_MAX_SYMBOLS],
+                                  int n_used, uint64_t vary,
+                                  uint8_t lengths[PIVCO_MAX_SYMBOLS])
+{
+    sort_leaves_by_freq(leaf, n_used, vary);
 
     /* nodes 0..n_used-1 = leaves (sorted order); n_used.. = internals.
      * The internal queue is the contiguous index range [ih, it). */
@@ -102,8 +189,16 @@ static void build_lengths_twoqueue(const uint64_t freq[PIVCO_MAX_SYMBOLS],
     depth[root] = 0;
     for (int i = root - 1; i >= 0; i--) /* parent index always > child index */
         depth[i] = (uint8_t)(depth[parent[i]] + 1);
-    for (int i = 0; i < N; i++)
-        lengths[leaf[i].sym] = depth[i] > 0 ? depth[i] : 1;
+    /* Leaf depths are non-increasing along the freq-sorted leaves (sibling
+     * property), so the max is leaf 0's -- but track it explicitly; the
+     * branch updates once and then predicts perfectly. */
+    int max_len = 1;
+    for (int i = 0; i < N; i++) {
+        uint8_t d = depth[i] > 0 ? depth[i] : 1;
+        lengths[leaf[i].sym] = d;
+        if (d > max_len) max_len = d;
+    }
+    return max_len;
 }
 
 /* ---------- Code length limiting (DEFLATE-style, RFC 1951) ---------- */
@@ -420,31 +515,30 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
      * + explicit tree) is left undefined -- see the table struct doc. */
     memset(table, 0, offsetof(pivco_huffman_table_t, decode_sym));
 
-    /* Count symbols with nonzero frequency */
-    int n_used = 0;
-    int used[PIVCO_MAX_SYMBOLS];
-    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++) {
-        if (freq[i] > 0) {
-            used[n_used++] = i;
-        }
-    }
+    /* Scan the nonzero frequencies straight into the leaf array (symbol
+     * order = the sort's stable seed). */
+    leaf_t leaf[PIVCO_MAX_SYMBOLS];
+    uint64_t vary;
+    int n_used = scan_nonzero_freqs(freq, leaf, &vary);
 
     if (n_used == 0) return PIVCO_ERR_EMPTY;
 
     table->num_symbols = (uint16_t)n_used;
 
     if (n_used == 1) {
-        build_single_symbol_table(used[0], table);
+        build_single_symbol_table(leaf[0].sym, table);
         return PIVCO_OK;
     }
 
     /* Derive code lengths from frequencies (two-queue, no heap) */
     uint8_t lengths[PIVCO_MAX_SYMBOLS];
     memset(lengths, 0, sizeof(lengths));
-    build_lengths_twoqueue(freq, n_used, used, lengths);
+    int max_len = build_lengths_twoqueue(leaf, n_used, vary, lengths);
 
-    /* Limit code lengths to PIVCO_MAX_CODE_LEN */
-    limit_code_lengths(lengths, PIVCO_MAX_SYMBOLS, PIVCO_MAX_CODE_LEN);
+    /* Limit code lengths to PIVCO_MAX_CODE_LEN (rarely needed: per-window
+     * counts must be quite skewed to push a depth past 11) */
+    if (max_len > PIVCO_MAX_CODE_LEN)
+        limit_code_lengths(lengths, PIVCO_MAX_SYMBOLS, PIVCO_MAX_CODE_LEN);
 
     return build_table_finish(lengths, table);
 }
@@ -901,8 +995,7 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                               pivco_huffman_table_t *table)
 {
-    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++)
-        table->code_len[i] = lengths[i];
+    memcpy(table->code_len, lengths, PIVCO_MAX_SYMBOLS);
 
     int rc = build_core(lengths, &table->dec, table);
     if (rc != PIVCO_OK) return rc;
@@ -919,6 +1012,75 @@ int pivco_huffman_build_decode_table(const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
 {
     if (!code_lens || !dt) return PIVCO_ERR_NULL;
     return build_core(code_lens, dt, NULL);
+}
+
+/* Encode-side fields of the minimal codec table, from its finished decode
+ * core: sym_to_rank is one inversion of rank_to_sym (descending, so the
+ * degenerate single-symbol table's duplicate pair resolves to rank 0,
+ * matching the full build's zero seed), zeroed first so off-table symbols
+ * map to rank 0 like the full table's memset head.  Plus the x86 gather
+ * aux (NULL elsewhere) — same convention as fill_enc_init_aux. */
+static void ct_fill_encode_side(pivco_huffman_codec_table_t *ct)
+{
+    memset(ct->sym_to_rank, 0, sizeof(ct->sym_to_rank));
+    for (int r = ct->dec.num_ranks - 1; r >= 0; r--)
+        ct->sym_to_rank[ct->dec.rank_to_sym[r]] = (uint8_t)r;
+#if defined(__x86_64__) || defined(__i386__)
+    for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++)
+        ct->enc_init_hi[s] = (uint16_t)((unsigned)ct->sym_to_rank[s] << 8);
+    ct->enc_init_aux.s2r_hi = ct->enc_init_hi;
+#else
+    ct->enc_init_aux.s2r_hi = NULL;
+#endif
+}
+
+int pivco_huffman_build_codec_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                                    pivco_huffman_codec_table_t *ct)
+{
+    if (!freq || !ct) return PIVCO_ERR_NULL;
+
+    leaf_t leaf[PIVCO_MAX_SYMBOLS];
+    uint64_t vary;
+    int n_used = scan_nonzero_freqs(freq, leaf, &vary);
+    if (n_used == 0) return PIVCO_ERR_EMPTY;
+
+    /* Lengths derive straight into ct->code_len — they double as the
+     * header lengths the caller serializes. */
+    memset(ct->code_len, 0, sizeof(ct->code_len));
+    if (n_used == 1) {
+        ct->code_len[leaf[0].sym] = 1;   /* degenerate convention */
+        build_single_symbol_decode(leaf[0].sym, &ct->dec);
+        ct_fill_encode_side(ct);
+        return PIVCO_OK;
+    }
+    int max_len = build_lengths_twoqueue(leaf, n_used, vary, ct->code_len);
+    if (max_len > PIVCO_MAX_CODE_LEN)
+        limit_code_lengths(ct->code_len, PIVCO_MAX_SYMBOLS, PIVCO_MAX_CODE_LEN);
+
+    int rc = build_core(ct->code_len, &ct->dec, NULL);
+    if (rc != PIVCO_OK) return rc;   /* unreachable: lengths are Kraft-exact */
+    ct_fill_encode_side(ct);
+    return PIVCO_OK;
+}
+
+int pivco_huffman_build_codec_table_from_code_lens(
+    const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
+    pivco_huffman_codec_table_t *ct)
+{
+    if (!code_lens || !ct) return PIVCO_ERR_NULL;
+    int rc = build_core(code_lens, &ct->dec, NULL);
+    if (rc != PIVCO_OK) return rc;
+    memcpy(ct->code_len, code_lens, PIVCO_MAX_SYMBOLS);
+    /* Degenerate single-symbol table: the lone symbol codes as one bit
+     * whatever length the input claimed (full-build convention; the
+     * fabricated rank pair identifies the case). */
+    if (ct->dec.num_ranks == 2 &&
+        ct->dec.rank_to_sym[0] == ct->dec.rank_to_sym[1]) {
+        memset(ct->code_len, 0, sizeof(ct->code_len));
+        ct->code_len[ct->dec.rank_to_sym[0]] = 1;
+    }
+    ct_fill_encode_side(ct);
+    return PIVCO_OK;
 }
 
 /* Public API: build a table from code lengths alone.  The tree is fully

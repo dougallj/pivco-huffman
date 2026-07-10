@@ -147,6 +147,26 @@ int pivco_huffman_encode(const uint8_t *symbols, size_t n,
     }
 }
 
+int pivco_huffman_encode_ct(const uint8_t *symbols, size_t n,
+                            const pivco_huffman_codec_table_t *ct,
+                            uint8_t *out, size_t *out_len)
+{
+    /* Mirrors pivco_huffman_decode_dt's backend order; each *_ct entry
+     * comes from codec.c compiled with the matching PIVCO_BACKEND_*. */
+    switch (resolve_impl()) {
+    case PIVCO_IMPL_NEON:
+#ifdef PIVCO_HAS_AVX512
+        return pivco_huffman_encode_avx512_ct(symbols, n, ct, out, out_len);
+#elif defined(PIVCO_HAS_SSE4)
+        return pivco_huffman_encode_x86_ct(symbols, n, ct, out, out_len);
+#elif defined(PIVCO_HAS_NEON)
+        return pivco_huffman_encode_neon_ct(symbols, n, ct, out, out_len);
+#endif
+    default:
+        return pivco_huffman_encode_scalar_ct(symbols, n, ct, out, out_len);
+    }
+}
+
 int pivco_huffman_decode(const uint8_t *in, size_t in_len,
                          const pivco_huffman_table_t *table,
                          uint8_t *symbols, size_t *consumed)
