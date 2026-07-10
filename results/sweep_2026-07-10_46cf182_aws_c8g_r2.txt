@@ -1,0 +1,139 @@
+host: aarch64 cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+new:  === ALL PASSED (0 failures) ===
+main: === ALL PASSED (0 failures) ===
+=== wire cross-check ===
+total 2900
+drwxrwxr-x 2 ubuntu ubuntu    4096 Jul 10 09:40 .
+drwxr-x--- 7 ubuntu ubuntu    4096 Jul 10 09:42 ..
+-rw-r--r-- 1 ubuntu ubuntu  711142 Jul 10 08:59 dickens.lits
+-rw-r--r-- 1 ubuntu ubuntu 2058039 Jul 10 08:59 osdb.lits
+-rw-r--r-- 1 ubuntu ubuntu  184960 Jul 10 08:59 xml.lits
+dickens wire IDENTICAL
+dickens cross-decode OK
+osdb wire IDENTICAL
+osdb cross-decode OK
+xml wire IDENTICAL
+xml cross-decode OK
+=== table lifetime ===
+== btl old dickens ==
+file                  G   tables   ns/table     dec MB/s     d+b MB/s    build %
+dickens.lits         5K      139       1480         2148         1325      38.3%
+dickens.lits        10K       70       1289         2948         2145      27.2%
+dickens.lits        20K       35       1244         3035         2560      15.7%
+dickens.lits        50K       14       1244         3304         3057       7.5%
+dickens.lits       100K        7       1251         3438         3298       4.1%
+== btl new dickens ==
+file                  G   tables   ns/table     dec MB/s     d+b MB/s    build %
+dickens.lits         5K      139        607         2283         1796      21.3%
+dickens.lits        10K       70        403         3014         2692      10.7%
+dickens.lits        20K       35        370         3076         2913       5.3%
+dickens.lits        50K       14        365         3340         3262       2.3%
+dickens.lits       100K        7        373         3458         3414       1.3%
+== btl old osdb ==
+file                  G   tables   ns/table     dec MB/s     d+b MB/s    build %
+osdb.lits            5K      402       1943         2129         1178      44.7%
+osdb.lits           10K      201       1835         2731         1834      32.9%
+osdb.lits           20K      101       1808         2702         2180      19.3%
+osdb.lits           50K       41       1792         3033         2737       9.8%
+osdb.lits          100K       21       1727         3150         2984       5.3%
+== btl new osdb ==
+file                  G   tables   ns/table     dec MB/s     d+b MB/s    build %
+osdb.lits            5K      402       1137         2146         1454      32.3%
+osdb.lits           10K      201        932         2771         2213      20.1%
+osdb.lits           20K      101        678         2674         2455       8.2%
+osdb.lits           50K       41        524         2986         2895       3.0%
+osdb.lits          100K       21        506         3162         3111       1.6%
+== btl old xml ==
+file                  G   tables   ns/table     dec MB/s     d+b MB/s    build %
+xml.lits             5K       37       1249         2623         1584      39.6%
+xml.lits            10K       19       1225         3585         2470      31.1%
+xml.lits            20K       10       1235         3572         2884      19.3%
+xml.lits            50K        4       1288         3179         2921       8.1%
+xml.lits           100K        2       1241         2730         2633       3.5%
+== btl new xml ==
+file                  G   tables   ns/table     dec MB/s     d+b MB/s    build %
+xml.lits             5K       37        364         2825         2343      17.1%
+xml.lits            10K       19        357         3644         3215      11.8%
+xml.lits            20K       10        357         3635         3397       6.6%
+xml.lits            50K        4        384         3115         3036       2.5%
+xml.lits           100K        2        378         2758         2727       1.1%
+=== decode bench interleaved ===
+== dec main r1 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     393    3883    3877 |    1040 |     942    1695 |  2.29x
+english       |     113    4670    4672 |    1014 |     935    1651 |  2.83x
+html_wiki     |     130    2963    2969 |     983 |     931    1398 |  2.12x
+prose_pride   |      85    3320    3328 |     983 |     929    1570 |  2.12x
+image_jpeg    |     138    3453    3462 |    1015 |       0       0 |  3.41x
+json_api      |     154    3072    3071 |     983 |     933    1442 |  2.13x
+dna_fasta     |     141    4269    4271 |    1008 |     940    1692 |  2.52x
+chinese_text  |      99    3085    3093 |     983 |     931    1390 |  2.22x
+calgary_pic   |     404    3397    3403 |     983 |     929    1524 |  2.23x
+
+== dec new r1 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     415    3894    3905 |    1036 |     942    1695 |  2.30x
+english       |     112    4700    4708 |    1010 |     935    1651 |  2.85x
+html_wiki     |     125    2979    2985 |     988 |     931    1399 |  2.13x
+prose_pride   |      85    3366    3360 |     988 |     931    1572 |  2.14x
+image_jpeg    |     137    3468    3475 |    1009 |       0       0 |  3.44x
+json_api      |     146    3051    3071 |     988 |     932    1430 |  2.15x
+dna_fasta     |     142    4270    4262 |    1014 |     939    1692 |  2.52x
+chinese_text  |      98    3074    3082 |     988 |     931    1391 |  2.22x
+calgary_pic   |     416    3406    3411 |     988 |     928    1522 |  2.24x
+
+== dec new r2 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     416    3898    3895 |    1033 |     942    1695 |  2.30x
+english       |     112    4707    4709 |    1010 |     935    1651 |  2.85x
+html_wiki     |     125    2964    2976 |     988 |     931    1397 |  2.13x
+prose_pride   |      85    3340    3356 |     988 |     930    1570 |  2.14x
+image_jpeg    |     137    3473    3475 |    1015 |       0       0 |  3.42x
+json_api      |     146    3072    3093 |     992 |     933    1438 |  2.15x
+dna_fasta     |     142    4217    4223 |    1010 |     939    1690 |  2.50x
+chinese_text  |      98    3091    3096 |     988 |     931    1390 |  2.23x
+calgary_pic   |     417    3402    3407 |     988 |     928    1523 |  2.24x
+
+== dec main r2 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     390    3881    3893 |    1037 |     942    1695 |  2.30x
+english       |     113    4669    4684 |    1008 |     935    1651 |  2.84x
+html_wiki     |     130    2977    2981 |     983 |     930    1394 |  2.14x
+prose_pride   |      85    3318    3321 |     983 |     929    1570 |  2.12x
+image_jpeg    |     138    3458    3466 |    1008 |       0       0 |  3.44x
+json_api      |     154    3077    3093 |     987 |     933    1439 |  2.15x
+dna_fasta     |     141    4207    4236 |    1014 |     940    1692 |  2.50x
+chinese_text  |      99    3089    3091 |     983 |     931    1388 |  2.23x
+calgary_pic   |     405    3402    3403 |     984 |     929    1524 |  2.23x
+
+== dec main r3 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     392    3854    3858 |    1037 |     942    1692 |  2.28x
+english       |     113    4671    4677 |    1014 |     935    1650 |  2.83x
+html_wiki     |     129    2972    2979 |     988 |     931    1396 |  2.13x
+prose_pride   |      86    3314    3333 |     987 |     929    1569 |  2.12x
+image_jpeg    |     138    3457    3446 |    1008 |       0       0 |  3.43x
+json_api      |     154    3079    3092 |     983 |     933    1432 |  2.16x
+dna_fasta     |     141    4259    4257 |    1008 |     940    1692 |  2.52x
+chinese_text  |      99    3082    3084 |     983 |     931    1390 |  2.22x
+calgary_pic   |     405    3383    3389 |     983 |     928    1522 |  2.23x
+
+== dec new r3 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     416    3889    3895 |    1044 |     942    1694 |  2.30x
+english       |     112    4697    4699 |    1010 |     935    1651 |  2.85x
+html_wiki     |     125    2978    2986 |     988 |     932    1396 |  2.14x
+prose_pride   |      85    3351    3353 |     988 |     930    1570 |  2.14x
+image_jpeg    |     137    3466    3474 |    1010 |       0       0 |  3.44x
+json_api      |     146    3074    3077 |     988 |     933    1437 |  2.14x
+dna_fasta     |     142    4251    4240 |    1010 |     940    1691 |  2.51x
+chinese_text  |      98    3099    3098 |     992 |     931    1389 |  2.23x
+calgary_pic   |     417    3406    3408 |     989 |     928    1524 |  2.24x
+
+=== SWEEP2 DONE ===

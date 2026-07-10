@@ -1,0 +1,87 @@
+host: x86_64 2c cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+=== tests ===
+new:  === ALL PASSED (0 failures) ===
+main: === ALL PASSED (0 failures) ===
+=== fuzz ===
+fuzz: 100000 iters, 24776 decoded, 75224 rejected, guards intact
+=== wire cross-check ===
+wire DIFFER
+cross-decode FAIL
+=== build-time harness ===
+== bt main r1 ==
+dist         freq ns/build  lens ns/build    dt ns/build
+skew6                  893            476              -
+text90                2288           1019              -
+zipf256               4481           1606              -
+uniform256            4502           1412              -
+== bt new r1 ==
+dist         freq ns/build  lens ns/build    dt ns/build
+skew6                  685            185            154
+text90                1734            379            303
+zipf256               3502            536            371
+uniform256            3657            396            256
+== bt port r1 ==
+dist         freq ns/build  lens ns/build    dt ns/build
+skew6                  752            255            224
+text90                1868            507            430
+zipf256               3750            795            633
+uniform256            4067            797            648
+== bt main r2 ==
+dist         freq ns/build  lens ns/build    dt ns/build
+skew6                  890            457              -
+text90                2270           1015              -
+zipf256               4485           1596              -
+uniform256            4509           1412              -
+== bt new r2 ==
+dist         freq ns/build  lens ns/build    dt ns/build
+skew6                  684            181            150
+text90                1730            379            302
+zipf256               3501            533            371
+uniform256            3660            393            255
+== bt port r2 ==
+dist         freq ns/build  lens ns/build    dt ns/build
+skew6                  745            256            225
+text90                1868            506            436
+zipf256               3764            808            633
+uniform256            4062            799            649
+=== table lifetime ===
+== btl old dickens ==
+== btl new dickens ==
+/home/ubuntu/lits/dickens.lits: No such file or directory
+== btl old osdb ==
+/home/ubuntu/lits/dickens.lits: No such file or directory
+== btl new osdb ==
+/home/ubuntu/lits/osdb.lits: No such file or directory
+== btl old xml ==
+/home/ubuntu/lits/osdb.lits: No such file or directory
+/home/ubuntu/lits/xml.lits: No such file or directory
+== btl new xml ==
+=== decode bench ===
+== dec main ==
+/home/ubuntu/lits/xml.lits: No such file or directory
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     328    4945    4948 |     869 |    1125    1869 |  2.65x
+english       |      92   10672   10728 |     855 |    1118    1805 |  5.94x
+html_wiki     |     107    5895    5905 |     840 |    1112    1501 |  3.93x
+prose_pride   |      71    7991    8028 |     843 |    1114    1691 |  4.75x
+image_jpeg    |     114    9584    9694 |     848 |       0       0 | 11.43x
+json_api      |     124    7578    7620 |     841 |    1115    1558 |  4.89x
+dna_fasta     |     116    6812    6816 |     856 |    1122    1863 |  3.66x
+chinese_text  |      83    6398    6393 |     837 |    1111    1501 |  4.26x
+calgary_pic   |     378    4473    4481 |     845 |    1108    1623 |  2.76x
+
+== dec new ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     338    4859    4858 |     873 |    1125    1868 |  2.60x
+english       |      90   10235   10290 |     858 |    1120    1812 |  5.68x
+html_wiki     |     104    5755    5815 |     843 |    1113    1504 |  3.87x
+prose_pride   |      69    7463    7520 |     845 |    1114    1697 |  4.43x
+image_jpeg    |     111    9177    9343 |     847 |       0       0 | 11.03x
+json_api      |     121    7143    7193 |     843 |    1117    1561 |  4.61x
+dna_fasta     |     112    6825    6819 |     860 |    1122    1865 |  3.66x
+chinese_text  |      80    6136    6138 |     843 |    1112    1506 |  4.08x
+calgary_pic   |     363    4368    4376 |     846 |    1107    1628 |  2.69x
+
+=== SWEEP DONE ===
