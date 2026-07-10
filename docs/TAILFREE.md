@@ -52,18 +52,22 @@ Supporting pieces:
   DST_PAD.  The whole suite also passes under macOS GuardMalloc
   (page-end allocations, catches any out-of-allocation read/write).
 
-## Results (M1 Max, machine under light load, bench 20 --all, best of 2 A/B pairs)
+## Results (bench 20 --all, best of 2 interleaved A/B pairs per host)
 
-Decode `pivco_bu`: **geomean +5%**, no credible regression.
+Decode `pivco_bu`:
 
-* merge-heavy dists: +8–13 % (source_c +11.5 %, html_wiki +12.2 %,
+* **M1 Max** (machine under light load): **geomean +5.0 %**.
+  Merge-heavy dists +8–13 % (source_c +11.5 %, html_wiki +12.2 %,
   chinese_text +11.8 %, json_api/log_apache/prose_pride ~+10 %,
-  proba50 +12.7 %, calgary_pic +8 %)
-* flat-dominated dists: +0–4 % (already ~50 GB/s; ±2 % run noise)
+  proba50 +12.7 %, calgary_pic +8 %); flat-dominated +0–4 %.
+* **M4 mini** (idle): **geomean +2.9 %**, max +8 % (flat_M5, proba50),
+  merge-heavy dists +4–7 %.  Nominal negatives (proba80 −1.0 %,
+  csv_numeric −2.3 %) sit inside that host's 5 % A/A run spread.
+  See results/20260710-1142-5827214-tailfree-m4.md.
 * code size: `codec_decode_subtree` 6916 → 4552 B (−34 %), NEON codec
   TU text 15.9 → 12.9 KB (−19 %, encode untouched)
 
-M4 / Graviton unverified so far.
+Graviton unverified so far.
 
 ## Options to make this shippable
 
