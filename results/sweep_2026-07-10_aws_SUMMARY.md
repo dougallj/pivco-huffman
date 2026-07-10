@@ -40,9 +40,19 @@ build-time/decode, r2 = wire cross-check/table-lifetime/interleaved decode).
   -5%ish on wide ones (json_api, prose_pride) — consistent with per-node
   walk overhead being RELATIVELY costlier on x86, where AVX-512 merges
   are much faster per symbol than NEON's (ARM hosts are neutral).
-  Verdict: accepted for now — the table-lifetime regime (the actual
+  Recovery attempts, both TESTED AND REJECTED on c8i/gcc-13
+  (3 interleaved rounds each):
+    - -falign-loops=32 (hot merge loops byte-identical but landing at
+      mod64=48 in the new layout): -2.6% vs -3.0% baseline — no effect.
+    - switch-on-kind dispatch (restores the old single-indirect-jump
+      jump table; codegen verified): -3.2% vs -3.0% — no effect.
+      (Kept in-tree anyway as the better idiom, perf-neutral.)
+    - cursor-by-value/return (earlier triage): no effect.
+  Remaining candidates: something per-symbol that static diffing hasn't
+  caught, or distributed frontend/BTB pressure not attributable to one
+  site.  The definitive next tool is a PMU profile (perf stat/record,
+  branch-misses + topdown, main vs tip on json_api) — needs a .metal
+  instance (~US$5/hr, small instances hide the PMU per ~/AWS.md).
+  Verdict: accepted meanwhile — the table-lifetime regime (the actual
   target) nets 1.45-1.63x on these same hosts INCLUDING this effect;
-  the ~2-3% only bites unbounded-lifetime single-table streams.
-  Recovery ideas if it matters later: fuse the per-record kr/marker/
-  bitmap bounds checks into one span check, flatten dispatch on x86,
-  inline leaf-adjacent child handling into the parent node.
+  the ~2-3% only bites unbounded-lifetime single-table x86 streams.

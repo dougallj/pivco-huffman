@@ -497,12 +497,35 @@ int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
  * is on.  The root call passes 0 -- the caller's output buffer has no
  * over-read slack. */
 
+/* Read a non-leaf node's K_right header + bitmap (shared by the
+ * LEAF_LEFT and FULL switch cases below; kept out-of-case so the
+ * compiler can still merge it, without costing the jump table). */
+static inline const uint8_t *decode_node_prologue(int *K_right, int K,
+                                                  const uint8_t **in_ptr,
+                                                  const uint8_t *in_end,
+                                                  uint8_t *bm_scratch)
+{
+    int kr = wire_read_kr_checked(in_ptr, in_end);
+    if (kr < 0 || kr > K) return NULL;
+    *K_right = kr;
+    return wire_read_bitmap_checked(in_ptr, in_end, K, bm_scratch);
+}
+
 /* Returns 0, or -1 when the (untrusted) stream is truncated or carries
  * an impossible K_right / bad FSE record.  All stream reads are checked
  * against in_end BEFORE dereferencing; K_right is clamped to [0, K] so
  * child sizes, scratch carves and merge extents stay within the bounds
  * the entry sized for N.  (A bitmap whose popcount disagrees with
- * K_right yields garbage output but touches only in-bounds memory.) */
+ * K_right yields garbage output but touches only in-bounds memory.)
+ *
+ * Dispatch is a SWITCH on the record's 2-bit kind, mirroring the old
+ * explicit-tree walk's single indirect jump on the precomputed
+ * node_type[] (the compiler emits the same jump-table shape; verified
+ * on x86).  NB: measured NEUTRAL vs the earlier if-chain on c8i/gcc-13
+ * — dispatch shape is NOT the source of the ~3% x86 decode delta vs
+ * the pre-schedule codec (nor is loop alignment; both tested and
+ * rejected — see results/sweep_2026-07-10_aws_SUMMARY.md).  Kept as
+ * the better idiom for a precomputed kind. */
 static int codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
                                    unsigned *cursor, int K,
                                    uint8_t *out_buf,
@@ -511,9 +534,10 @@ static int codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
                                    uint8_t *scratch_top, int tail_ok)
 {
     const pivco_sched_rec_t *rec = &dt->sched[(*cursor)++];
-    const unsigned kind = rec->kd & 3u;
 
-    if (kind == PIVCO_SCHED_FLAT) {
+    switch ((pivco_sched_kind_t)(rec->kd & 3u)) {
+
+    case PIVCO_SCHED_FLAT: {
         /* Flat subtree: the 2^D code_to_sym entries are the subtree's own
          * slice of rank_to_sym (ranks are in code order). */
         int D = rec->kd >> 2;
@@ -525,7 +549,7 @@ static int codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
         return 0;
     }
 
-    if (kind == PIVCO_SCHED_PAIR) {
+    case PIVCO_SCHED_PAIR: {
         /* Both children leaves; no K_right header. */
         uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
         const uint8_t *bm = wire_read_bitmap_checked(in_ptr, in_end, K,
@@ -538,16 +562,13 @@ static int codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
         return 0;
     }
 
-    /* At least one non-leaf child: K_right header, then bitmap. */
-    int K_right = wire_read_kr_checked(in_ptr, in_end);
-    if (K_right < 0 || K_right > K) return -1;
-    uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
-    const uint8_t *bm = wire_read_bitmap_checked(in_ptr, in_end, K,
-                                                 bm_scratch);
-    if (!bm) return -1;
-
-    if (kind == PIVCO_SCHED_LEAF_LEFT) {
+    case PIVCO_SCHED_LEAF_LEFT: {
         /* Left child is a lone leaf (a lone leaf child is always left). */
+        int K_right;
+        uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
+        const uint8_t *bm = decode_node_prologue(&K_right, K,
+                                                 in_ptr, in_end, bm_scratch);
+        if (!bm) return -1;
         uint8_t *right_buf = tail_ok
             ? place_tail(out_buf, K - K_right, K_right, &scratch_top)
             : scratch_carve(&scratch_top, K_right);
@@ -565,8 +586,18 @@ static int codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
         return 0;
     }
 
-    /* Both children internal.  Recurse into both with disjoint
+    case PIVCO_SCHED_FULL:
+    default:
+        break;      /* falls through to the FULL body below */
+    }
+
+    /* FULL: both children internal.  Recurse into both with disjoint
      * scratch slices, then merge. */
+    int K_right;
+    uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
+    const uint8_t *bm = decode_node_prologue(&K_right, K,
+                                             in_ptr, in_end, bm_scratch);
+    if (!bm) return -1;
     int K_left = K - K_right;
     uint8_t *left_buf, *right_buf;
     if (tail_ok && K_left >= K_right) {

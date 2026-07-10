@@ -1,0 +1,96 @@
+Reading package lists...
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+--- configure main
+-- Generating done (0.0s)
+-- Build files have been written to: /home/ubuntu/main/build
+--- build main
+[100%] Linking C executable pivco_huffman_tests
+[100%] Built target pivco_huffman_tests
+-rwxrwxr-x 1 ubuntu ubuntu 285832 Jul 10 11:40 build/pivco_huffman_bench
+--- configure tip
+-- Generating done (0.0s)
+-- Build files have been written to: /home/ubuntu/tip/build
+--- build tip
+[100%] Linking C executable pivco_huffman_tests
+[100%] Built target pivco_huffman_tests
+-rwxrwxr-x 1 ubuntu ubuntu 286088 Jul 10 11:40 build/pivco_huffman_bench
+tip tests: === ALL PASSED (0 failures) ===
+== dec main r1 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     328    4887    4883 |     869 |    1124    1869 |  2.62x
+english       |      93   10719   10804 |     855 |    1118    1807 |  5.98x
+html_wiki     |     107    5898    5905 |     838 |    1111    1502 |  3.93x
+prose_pride   |      71    8224    8222 |     841 |    1113    1690 |  4.87x
+image_jpeg    |     114    9514    9489 |     836 |       0       0 | 11.38x
+json_api      |     124    7542    7636 |     839 |    1116    1560 |  4.90x
+dna_fasta     |     117    6755    6756 |     855 |    1122    1843 |  3.67x
+chinese_text  |      83    6363    6395 |     836 |    1111    1500 |  4.26x
+calgary_pic   |     378    4374    4387 |     845 |    1107    1624 |  2.70x
+
+== dec tip r1 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     269    4727    4733 |     873 |    1126    1870 |  2.53x
+english       |      94   10555   10610 |     857 |    1118    1812 |  5.86x
+html_wiki     |     109    5695    5734 |     839 |    1110    1502 |  3.82x
+prose_pride   |      71    7745    7767 |     845 |    1112    1695 |  4.58x
+image_jpeg    |     115    9054    9184 |     849 |       0       0 | 10.81x
+json_api      |     129    7129    7137 |     842 |    1115    1559 |  4.58x
+dna_fasta     |     115    6772    6781 |     859 |    1119    1864 |  3.64x
+chinese_text  |      83    6192    6206 |     840 |    1110    1501 |  4.14x
+calgary_pic   |     374    4207    4215 |     845 |    1107    1626 |  2.59x
+
+== dec tip r2 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     270    4738    4733 |     869 |    1124    1870 |  2.53x
+english       |      94   10573   10588 |     857 |    1119    1810 |  5.85x
+html_wiki     |     109    5715    5736 |     843 |    1111    1502 |  3.82x
+prose_pride   |      71    7721    7777 |     844 |    1113    1696 |  4.59x
+image_jpeg    |     115    9071    9336 |     851 |       0       0 | 10.97x
+json_api      |     129    7146    7163 |     844 |    1116    1562 |  4.59x
+dna_fasta     |     115    6770    6778 |     859 |    1122    1865 |  3.63x
+chinese_text  |      84    6158    6205 |     837 |    1111    1502 |  4.13x
+calgary_pic   |     375    4200    4219 |     849 |    1107    1626 |  2.59x
+
+== dec main r2 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     328    4896    4889 |     868 |    1125    1868 |  2.62x
+english       |      93   10717   10781 |     856 |    1119    1803 |  5.98x
+html_wiki     |     107    5865    5905 |     838 |    1112    1498 |  3.94x
+prose_pride   |      71    8222    8231 |     841 |    1113    1688 |  4.88x
+image_jpeg    |     114    9455    9489 |     841 |       0       0 | 11.29x
+json_api      |     124    7427    7662 |     837 |    1115    1555 |  4.93x
+dna_fasta     |     117    6729    6740 |     853 |    1122    1864 |  3.62x
+chinese_text  |      83    6358    6370 |     837 |    1110    1498 |  4.25x
+calgary_pic   |     378    4363    4397 |     844 |    1107    1623 |  2.71x
+
+== dec main r3 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     328    4722    4733 |     869 |    1126    1868 |  2.53x
+english       |      93   10504   10627 |     855 |    1119    1805 |  5.89x
+html_wiki     |     107    5863    5907 |     835 |    1111    1500 |  3.94x
+prose_pride   |      71    8226    8251 |     840 |    1112    1690 |  4.88x
+image_jpeg    |     114    9299    9512 |     840 |       0       0 | 11.32x
+json_api      |     124    7431    7636 |     836 |    1115    1558 |  4.90x
+dna_fasta     |     117    6753    6747 |     853 |    1122    1862 |  3.63x
+chinese_text  |      83    6385    6420 |     839 |    1110    1500 |  4.28x
+calgary_pic   |     378    4386    4400 |     845 |    1108    1623 |  2.71x
+
+== dec tip r3 ==
+DECODE M/s    | pivco_s pivco_n pivco_bu | trad_4s | huf0_x1 huf0_x2 |   ratio
+--------------|-------------------------|---------|------------------|--------
+proba80       |     270    4720    4731 |     870 |    1125    1870 |  2.53x
+english       |      95   10559   10631 |     857 |    1119    1810 |  5.87x
+html_wiki     |     109    5679    5718 |     842 |    1111    1502 |  3.81x
+prose_pride   |      71    7682    7773 |     844 |    1112    1696 |  4.58x
+image_jpeg    |     116    9138    9261 |     849 |       0       0 | 10.91x
+json_api      |     129    7152    7172 |     844 |    1115    1560 |  4.60x
+dna_fasta     |     115    6777    6784 |     859 |    1120    1865 |  3.64x
+chinese_text  |      84    6185    6191 |     842 |    1110    1502 |  4.12x
+calgary_pic   |     375    4206    4211 |     848 |    1106    1626 |  2.59x
+
+=== ALIGN2 DONE ===
