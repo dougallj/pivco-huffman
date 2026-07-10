@@ -64,10 +64,15 @@ Decode `pivco_bu`:
   merge-heavy dists +4–7 %.  Nominal negatives (proba80 −1.0 %,
   csv_numeric −2.3 %) sit inside that host's 5 % A/A run spread.
   See results/20260710-1142-5827214-tailfree-m4.md.
+* **Graviton 4** (c8g.large spot, gcc 13.3, pinned, ~0.5 % A/A noise):
+  **geomean +1.8 %**, two_sym_eq +9.4 %, merge-heavy +2–5 %.  Two real
+  regressions on this host/compiler: sparse_16 −5.5 % (D=4 flat root;
+  the executed kernel is IDENTICAL to main for 32-aligned n, so this
+  is gcc-13 code-layout fallout, not the scheme — M4 shows +0.4 %) and
+  flat_M7 −1.3 % (one-load d7 kernel slightly worse on Neoverse V2).
+  See results/20260710-1211-5827214-tailfree-c8g.md.
 * code size: `codec_decode_subtree` 6916 → 4552 B (−34 %), NEON codec
   TU text 15.9 → 12.9 KB (−19 %, encode untouched)
-
-Graviton unverified so far.
 
 ## Options to make this shippable
 
