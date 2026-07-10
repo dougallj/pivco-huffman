@@ -241,7 +241,32 @@ The joint DP's incremental cost over the plain Huffman build is now
 encode / ratio are unchanged from the table above — the DP returns
 identical optima, only faster.
 
-## Route 3 (heuristic) evaluation: deferred
+## End-to-end sweep, 4-128 K windows (M4, PHA, geomean of 12 files)
+
+enc-e2e = histogram + table build (incl. joint DP) + encode kernels;
+dec-e2e = per-window build_table_from_code_lens + decode kernels (the
+decoder's true all-in speed at this cadence; the 128-byte header
+unpack is noise).  Baseline (lam = 0) and joint (lam = 0.1) measured
+back-to-back per file, so deltas are thermal-fair.  MB/s:
+
+| G     | enc-e2e 0 -> J     | dec-e2e 0 -> J      | ratio avg |
+|-------|--------------------|---------------------|-----------|
+| 4 K   | 446 -> 95 (-79 %)  | 2058 -> 2867 (+39 %)| -0.42 pp  |
+| 8 K   | 735 -> 171 (-77 %) | 3524 -> 4737 (+34 %)| -0.07 pp  |
+| 16 K  | 1053 -> 302 (-71 %)| 5248 -> 6724 (+28 %)| +0.08 pp  |
+| 32 K  | 1226 -> 483 (-61 %)| 6402 -> 8086 (+26 %)| +0.08 pp  |
+| 64 K  | 1279 -> 718 (-44 %)| 6765 -> 8885 (+31 %)| +0.13 pp  |
+| 128 K | 1356 -> 956 (-30 %)| 6917 -> 8820 (+28 %)| +0.09 pp  |
+
+Notable: at G <= 8 K the joint result also COMPRESSES better on
+average (the lam = 0 baseline is the production limit_code_lengths
+heuristic, and flats drop node records), and kernel decode gains grow
+to +70 % at 4 K.  Decoder-side table build is not free even for the
+baseline: dec-k vs dec-e2e differ by ~25-60 % at small G — which the
+old per-file table regime never exposed.  The encode-side e2e cost is
+the joint DP (95 MB/s at 4 K, 956 at 128 K); with the original mass
+DP this column read ~1-10 MB/s, i.e. the sweep only became meaningful
+after the fast DP.
 
 What any heuristic could still buy is bounded by the all-in ENCODE
 throughput (G / (encode + table build) per window; decode and ratio
