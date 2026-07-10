@@ -51,6 +51,22 @@ double pivco_huffman_get_joint_lambda(void)
     return g_joint_lambda;
 }
 
+/* Solve granularity: 1 = exact DP (default), 2/4/8 = group the
+ * freq-sorted symbols by g (4^log2(g) fewer DP states, ~0.13 %/0.25 %
+ * mean J loss at 2/4 on lits data), 0 = auto (pick by sigma so the
+ * solve stays ~<= 10 us: exact to sigma 64, g=2 to 128, g=4 above). */
+static int g_joint_gran = 1;
+
+void pivco_huffman_set_joint_granularity(int g)
+{
+    g_joint_gran = (g == 0 || g == 1 || g == 2 || g == 4 || g == 8) ? g : 1;
+}
+
+int pivco_huffman_get_joint_granularity(void)
+{
+    return g_joint_gran;
+}
+
 typedef struct {
     double   cost;      /* per-occurrence: L + lambda * (L - b) */
     uint8_t  L, b;
@@ -148,7 +164,14 @@ static inline int jl_row_jcap(int t, int h, int sigma)
     return (kcap - p) >> 1;
 }
 
+/* lmax/bcap parameterize the level range and flat-depth cap so the
+ * same solver runs the exact problem (11, 8) and the 4-grouped coarse
+ * problem (9, 6): a group of 4 sorted symbols at real level L is a
+ * depth-2 flat, so the coarse problem is this problem at L' = L - 2,
+ * b' = b - 2 with an identical cost form (the +2 bits per symbol is a
+ * constant offset). */
 static double jl_solve_slots(const double *P, int sigma, double lam,
+                             int lmax, int bcap,
                              uint16_t out_BL[JL_LMAX + 1])
 {
     const int W = (((sigma >> 1) + 2) + 3) & ~3;   /* compact row width */
@@ -160,7 +183,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
     if (!cost || !arch) { free(cost); free(arch); return -1.0; }
 
     for (int p = 0; p < 2; p++)
-        for (int b = 1; b <= 8; b++) {
+        for (int b = 1; b <= bcap; b++) {
             const int cnk = 1 << b;
             for (int j = 0; j < W; j++) {
                 const int k = 2 * j + p;
@@ -172,8 +195,8 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
     for (int k = 1; k <= sigma; k++) dP0[k] = (float)(P[k] - P[k - 1]);
 
     int tlo[JL_LMAX + 1], thi[JL_LMAX + 1];
-    for (int L = 1; L <= JL_LMAX; L++) {
-        const int h = JL_LMAX - L;
+    for (int L = 1; L <= lmax; L++) {
+        const int h = lmax - L;
         thi[L] = (1 << L) > sigma ? sigma : (1 << L);
         tlo[L] = (sigma + (1 << h) - 1) >> h;
         if (tlo[L] < 1) tlo[L] = 1;
@@ -186,9 +209,9 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
         for (int j = 0; j < W; j++) cost[(size_t)t * W + j] = INFINITY;
     cost[2 * W + 0] = 0.0f;      /* level-1 entry: k = 0, s = 2, t = 2 */
 
-    for (int L = 1; L <= JL_LMAX; L++) {
-        const int h = JL_LMAX - L;
-        const int bmax = L < 8 ? L : 8;
+    for (int L = 1; L <= lmax; L++) {
+        const int h = lmax - L;
+        const int bmax = L < bcap ? L : bcap;
         uint16_t *archL = arch + (size_t)(L - 1) * plane;
         for (int t = tlo[L]; t <= thi[L]; t++) {
             const int p = t & 1;
@@ -239,7 +262,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
                 }
             }
         }
-        if (L == JL_LMAX) break;
+        if (L == lmax) break;
         /* Doubling s' = 2s with the b = 0 take folded in.  Dest cell
          * (t', k) has the unique source (t = (t'+k)/2, k): even-lattice
          * there if k == t (mod 2), else the odd-s product of a lone
@@ -302,7 +325,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
          * s means the folded b0 was taken there — recover its bits
          * from the even-lattice predecessor and set bit 0. */
         int k = sigma, s = 0;
-        for (int L = JL_LMAX; L >= 1; L--) {
+        for (int L = lmax; L >= 1; L--) {
             const int t = k + s;
             const int p = t & 1;
             const uint16_t *arow = arch + (size_t)(L - 1) * plane
@@ -439,36 +462,76 @@ int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
 
     /* Solve: slot-ledger DP (exact and fast) whenever the level-order
      * == cost-order condition lam <= 1/7 holds — always true for the
-     * production lambda range; exact mass DP otherwise. */
+     * production lambda range; exact mass DP otherwise.
+     *
+     * Granularity g > 1 groups the freq-sorted symbols by g and solves
+     * the identical problem g levels shallower (a group of g = 2^G
+     * symbols at real level L is a depth-G flat), 4^G fewer states.
+     * On lits-style data the near-optimal solutions are dense: g = 2
+     * loses ~0.13 % of J on average, g = 4 ~0.25 % (measured), and the
+     * adoption guard below still rejects any bad case per window.
+     * sigma is ghost-padded to a multiple of g with zero-frequency
+     * unused byte values — real leaves the encoder never emits; there
+     * are always enough since sigma % g != 0 implies sigma < 256. */
+    int gran = g_joint_gran;
+    if (gran == 0)   /* auto: keep the solve ~<= 10 us at every sigma */
+        gran = sigma <= 64 ? 1 : sigma <= 128 ? 2 : 4;
+    if (gran > 1 && (sigma < 8 * gran || lam > (1.0 / 7.0) + 1e-9))
+        gran = 1;
+    const int glog = gran == 8 ? 3 : gran == 4 ? 2 : gran == 2 ? 1 : 0;
+    int sigma_pad = sigma;
+    if (glog) {
+        const int pad = (gran - (sigma % gran)) % gran;
+        int added = 0;
+        for (int s = 0; s < PIVCO_MAX_SYMBOLS && added < pad; s++)
+            if (!freq[s]) {
+                sf[sigma_pad].freq = 0; sf[sigma_pad].sym = (uint8_t)s;
+                P[sigma_pad + 1] = P[sigma];
+                sigma_pad++; added++;
+            }
+        if (added < pad) return -1;          /* unreachable: pad <= 256-sigma */
+    }
+
     uint16_t BL[JL_LMAX + 1] = {0};
-    if (lam <= (1.0 / 7.0) + 1e-9) {
-        if (jl_solve_slots(P, sigma, lam, BL) < 0) return -1;
+    if (glog) {
+        double Pg[PIVCO_MAX_SYMBOLS / 2 + 2];
+        const int sp = sigma_pad / gran;
+        for (int i = 0; i <= sp; i++) Pg[i] = P[i * gran];
+        uint16_t BLc[JL_LMAX + 1] = {0};
+        if (jl_solve_slots(Pg, sp, lam, JL_LMAX - glog, 8 - glog, BLc) < 0)
+            return -1;
+        for (int L = 1; L <= JL_LMAX - glog; L++)
+            BL[L + glog] = (uint16_t)(BLc[L] << glog);
+    } else if (lam <= (1.0 / 7.0) + 1e-9) {
+        if (jl_solve_slots(P, sigma, lam, JL_LMAX, 8, BL) < 0) return -1;
     } else {
         if (jl_solve_mass(P, sigma, lam, BL) < 0) return -1;
     }
 
-    /* Model the DP result and apply the adoption guard. */
+    /* Model the DP result and apply the adoption guard.  Ghost chunks
+     * carry zero weight, so the model scores real symbols exactly. */
     double dp_bits = 0, dp_passes = 0;
     {
         int cur = 0;
         for (int L = 1; L <= JL_LMAX; L++)
-            for (int b = 8; b >= 0; b--)
+            for (int b = 10; b >= 0; b--)
                 if (BL[L] & (1 << b)) {
                     double w = P[cur + (1 << b)] - P[cur];
                     dp_bits   += w * L;
                     dp_passes += w * (L - b);
                     cur += 1 << b;
                 }
-        if (cur != sigma) return -1;
+        if (cur != sigma_pad) return -1;
     }
     if (!(dp_passes <= 0.90 * prod_passes && dp_bits <= 1.015 * prod_bits))
         return -1;
 
-    /* Deal freq-sorted symbols to chunks in cost order (L asc, b desc). */
+    /* Deal freq-sorted symbols to chunks in cost order (L asc, b desc).
+     * Ghosts (sorted last) land in the final, deepest chunk. */
     {
         int cur = 0;
         for (int L = 1; L <= JL_LMAX; L++)
-            for (int b = 8; b >= 0; b--)
+            for (int b = 10; b >= 0; b--)
                 if (BL[L] & (1 << b))
                     for (int j = 0; j < (1 << b); j++)
                         lengths[sf[cur++].sym] = (uint8_t)L;
