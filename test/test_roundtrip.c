@@ -404,29 +404,17 @@ static int test_joint_lengths(void)
                 FAIL("neon roundtrip dist=%d li=%zu", d, li);
             }
 #endif
-            /* Two observed non-bugs worth encoding as comments, not
+            /* Observed non-bugs, recorded as comments rather than
              * asserts: (a) total wire bytes may SHRINK under
              * distortion (flatter trees emit fewer per-node records);
-             * (b) code bits at small lambda may beat the production
-             * baseline, because limit_code_lengths is a heuristic
-             * reshaper, not package-merge — the DP is an exact
-             * length-limiter.  What IS guaranteed: within the DP
-             * family, code bits are non-decreasing in lambda
-             * (Lagrangian monotonicity). */
-            /* Weight by the FREQ TABLE (the DP objective), not the
-             * sampled block — sampling noise otherwise breaks the
-             * comparison at nearby lambdas. */
-            size_t code_bits = 0;
-            for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++)
-                code_bits += (size_t)freq[i] * table.code_len[i];
-            if (li == 1) base_len = code_bits;      /* smallest lambda */
-            else if (li > 1 && code_bits < base_len) {
-                pivco_huffman_set_joint_lambda(0.0);
-                FAIL("code bits decreased with lambda?! dist=%d li=%zu",
-                     d, li);
-            } else if (li > 1) {
-                base_len = code_bits;
-            }
+             * (b) code bits may beat the production baseline
+             * (limit_code_lengths is a heuristic reshaper, the DP an
+             * exact length-limiter); (c) with the adoption guard, some
+             * lambdas keep production lengths and others adopt DP
+             * lengths, so no cross-lambda monotonicity holds.  The
+             * roundtrip through decode-side table rebuild above is the
+             * real invariant. */
+            (void)base_len;
         }
     }
     pivco_huffman_set_joint_lambda(0.0);

@@ -138,20 +138,68 @@ int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
         }
     }
 
+    /* Adoption guard: model both the incoming (production) lengths and
+     * the DP result as (bits, merge passes) under the freq table, and
+     * adopt the DP lengths only when they buy a real modeled decode
+     * win (passes -10% or better) at bounded bit cost (<= +1.5%).
+     * This keeps the production shape wherever the DP's J-optimum is
+     * "better ratio, slower decode" (deep-tree dists where the exact
+     * limiter finds big bit savings) or a wash (already-flat dists),
+     * eliminating the regressions those trades caused in the raw
+     * sweep. */
+    double prod_bits = 0, prod_passes = 0;
+    {
+        int    cls_n[JL_LMAX + 1] = {0};
+        double cls_w[JL_LMAX + 1] = {0};
+        for (int i = 0; i < sigma; i++) {
+            int L = lengths[sf[i].sym];
+            if (L < 1 || L > JL_LMAX) { L = JL_LMAX; }
+            cls_n[L]++; cls_w[L] += (double)sf[i].freq;
+        }
+        for (int L = 1; L <= JL_LMAX; L++) {
+            if (!cls_n[L]) continue;
+            prod_bits += cls_w[L] * L;
+            /* exchangeable-model passes: mean flat depth of the class */
+            double dbar = 0;
+            for (int b = 0; b <= JL_LMAX; b++)
+                if (cls_n[L] & (1 << b)) dbar += (double)b * (1 << b);
+            dbar /= (double)cls_n[L];
+            prod_passes += cls_w[L] * ((double)L - dbar);
+        }
+    }
+
     int rc = -1;
     if (dp[JL_IX(sigma, JL_MASS)] < INFINITY) {
-        /* Deal freq-sorted symbols to chosen chunks in cost order. */
         const uint64_t m0 = msk0[JL_IX(sigma, JL_MASS)];
         const uint64_t m1 = msk1[JL_IX(sigma, JL_MASS)];
-        int cur = 0;
-        for (int it = 0; it < n_items; it++) {
-            const int on = it < 64 ? (int)((m0 >> it) & 1)
-                                   : (int)((m1 >> (it - 64)) & 1);
-            if (!on) continue;
-            for (int j = 0; j < items[it].size; j++)
-                lengths[sf[cur++].sym] = items[it].L;
+        /* Model the DP result the same way (weights dealt in cost
+         * order, per-chunk exact). */
+        double dp_bits = 0, dp_passes = 0;
+        {
+            int cur = 0;
+            for (int it = 0; it < n_items; it++) {
+                const int on = it < 64 ? (int)((m0 >> it) & 1)
+                                       : (int)((m1 >> (it - 64)) & 1);
+                if (!on) continue;
+                double w = P[cur + items[it].size] - P[cur];
+                dp_bits   += w * items[it].L;
+                dp_passes += w * (items[it].L - items[it].b);
+                cur += items[it].size;
+            }
         }
-        rc = (cur == sigma) ? 0 : -1;
+        if (dp_passes <= 0.90 * prod_passes
+            && dp_bits <= 1.015 * prod_bits) {
+            /* Deal freq-sorted symbols to chosen chunks in cost order. */
+            int cur = 0;
+            for (int it = 0; it < n_items; it++) {
+                const int on = it < 64 ? (int)((m0 >> it) & 1)
+                                       : (int)((m1 >> (it - 64)) & 1);
+                if (!on) continue;
+                for (int j = 0; j < items[it].size; j++)
+                    lengths[sf[cur++].sym] = items[it].L;
+            }
+            rc = (cur == sigma) ? 0 : -1;
+        }
     }
     free(dp); free(msk0); free(msk1);
     return rc;
