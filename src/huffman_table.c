@@ -305,77 +305,107 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
 
 /* ---------- Pre-order walk schedule (issue #7 execution form) ----------
  *
- * Renders the implicit rank-range tree into sched[]: one 3-byte record
- * per visible internal node in pre-order, which is all the codec walk
- * reads at runtime (see pivco_sched_rec_t in pivco_huffman.h).  Built by
- * one recursion over the rank ranges, evaluating each node's split
- * exactly once — the splits are a pure function of the table, so
- * computing them here (instead of lazily per block, as the canonical
- * form allows) amortizes them across every block the table encodes or
- * decodes.  Returns the record count of the subtree (== the root
- * record's skip).
+ * Renders the tree into sched[]: one 3-byte record per visible internal
+ * node in pre-order, which is all the codec walk reads at runtime (see
+ * pivco_sched_rec_t in pivco_huffman.h).
  *
- * The canonical rank-range form (per-rank flat depth + MSB-aligned
- * codeword) is consumed only here, so it lives in build-local scratch
- * rather than the table:
+ * The tree is generated DIRECTLY from the chunk list: chunks in rank
+ * order are the left-to-right leaves of the chunk-level tree, and a
+ * left-to-right leaf-depth sequence uniquely determines a binary tree.
+ * The classic greedy reconstruction recovers it with no codewords at
+ * all — at a node at depth d, if the next unconsumed chunk sits at
+ * depth d it IS this node (a chunk-leaf: FLAT for width >= 4, PAIR for
+ * width 2, a bare leaf for width 1); otherwise the node is internal and
+ * both children recurse at d+1.  (An earlier version assigned every
+ * rank its MSB-aligned codeword and re-derived the splits by scanning
+ * for bit boundaries — a round-trip through the codes that this
+ * generation makes unnecessary.)
  *
- *   leaf test   (1 << flat_depth[rank_begin]) == range length
- *   split       at tree level L the range's codewords read 0..0 1..1 at
- *               bit L; a linear scan finds the boundary */
+ * Alongside the records, each consumed chunk memcpy's its symbols into
+ * rank_to_sym (chunk-consumption order IS rank order), and the running
+ * rank cursor yields each internal node's thr (max rank of the left
+ * subtree) for free.
+ *
+ * Kraft validation falls out naturally: lengths that over- or
+ * under-subscribe the code space leave chunks unconsumed or exhaust
+ * them mid-tree, reported as PIVCO_ERR_CORRUPT by the caller (the
+ * lengths typically come off the wire). */
+
 typedef struct {
-    uint8_t  flat_depth[PIVCO_MAX_SYMBOLS]; /* leaf's flat depth at its first rank */
-    uint16_t codeword[PIVCO_MAX_SYMBOLS];   /* MSB-aligned, strictly increasing */
-} rank_canon_t;
+    uint16_t L;
+    uint16_t bit;       /* 0..PIVCO_MAX_CODE_LEN */
+    uint16_t depth;     /* tree-depth of chunk root */
+    uint16_t n_syms;    /* 1 << bit */
+    uint16_t root_code; /* canonical code of the chunk root (CANONICAL_FLAT) */
+    int      sym_idx;   /* index into the length-sorted symbol array */
+} chunk_t;
 
-/* First rank of the right child: linear scan for the first codeword with
- * bit `level` set.  Runs once per node per table build — total work is
- * O(sum of leaf depths) <= 256 * PIVCO_MAX_CODE_LEN — so plain scalar. */
-static unsigned sched_split_rank(const rank_canon_t *rc,
-                                 int level,
-                                 unsigned rank_begin, unsigned rank_end)
+typedef struct {
+    pivco_huffman_decode_table_t *dt;
+    const chunk_t *chunks;
+    const uint8_t *items;   /* symbols counting-sorted by length */
+    int      n_chunks;
+    int      ci;            /* next unconsumed chunk */
+    unsigned rank;          /* leaf-rank cursor */
+    int      err;           /* invalid (non-Kraft-complete) lengths */
+} sched_gen_t;
+
+/* Returns the record count of the subtree rooted at `depth`. */
+static uint8_t sched_gen(sched_gen_t *g, int depth)
 {
-    const uint16_t mask = (uint16_t)(0x8000u >> level);
-    unsigned r = rank_begin + 1;
-    while (r < rank_end && (rc->codeword[r] & mask) == 0)
-        r++;
-    PIVCO_CHECK(r < rank_end);
-    return r;
-}
-
-static uint8_t build_walk_schedule(pivco_huffman_decode_table_t *dt,
-                                   const rank_canon_t *rc,
-                                   unsigned rank_begin, unsigned rank_end,
-                                   int level)
-{
-    unsigned range_len = rank_end - rank_begin;
-    if (range_len == 1) return 0;               /* leaf — no record */
-
-    PIVCO_CHECK(dt->sched_len < PIVCO_MAX_SYMBOLS - 1);
-    pivco_sched_rec_t *rec = &dt->sched[dt->sched_len++];
-    unsigned cnt = 1;
-
-    unsigned D = rc->flat_depth[rank_begin];
-    if ((1u << D) == range_len) {               /* flat subtree (D >= 2) */
-        rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (D << 2));
-        rec->param = (uint8_t)rank_begin;
-    } else if (range_len == 2) {                /* both children leaves */
-        rec->kd    = (uint8_t)PIVCO_SCHED_PAIR;
-        rec->param = (uint8_t)rank_begin;       /* == thr */
-    } else {
-        unsigned split = sched_split_rank(rc, level, rank_begin, rank_end);
-        if (split == rank_begin + 1) {          /* lone left leaf */
-            rec->kd    = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
-            rec->param = (uint8_t)rank_begin;   /* == thr; sym = rank_to_sym[param] */
-            cnt += build_walk_schedule(dt, rc, split, rank_end, level + 1);
-        } else {                                /* both children internal */
-            rec->kd    = (uint8_t)PIVCO_SCHED_FULL;
-            rec->param = (uint8_t)(split - 1);  /* thr */
-            cnt += build_walk_schedule(dt, rc, rank_begin, split, level + 1);
-            cnt += build_walk_schedule(dt, rc, split, rank_end, level + 1);
-        }
+    if (g->err) return 0;
+    if (g->ci >= g->n_chunks || depth > PIVCO_MAX_CODE_LEN) {
+        g->err = 1;             /* under-subscribed lengths */
+        return 0;
     }
-    rec->skip = (uint8_t)cnt;
-    return (uint8_t)cnt;
+
+    const chunk_t *c = &g->chunks[g->ci];
+    if ((int)c->depth == depth) {
+        /* This node is the chunk itself. */
+        g->ci++;
+        unsigned b = c->bit;
+        unsigned rank0 = g->rank;
+        memcpy(&g->dt->rank_to_sym[rank0], &g->items[c->sym_idx],
+               (size_t)1 << b);
+        g->rank += 1u << b;
+        if (b == 0) return 0;                   /* bare leaf — no record */
+        pivco_sched_rec_t *rec = &g->dt->sched[g->dt->sched_len++];
+        rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
+                              : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
+        rec->param = (uint8_t)rank0;            /* == thr for PAIR */
+        rec->skip  = 1;
+        return 1;
+    }
+
+    /* Internal node: left then right at depth + 1. */
+    PIVCO_CHECK(g->dt->sched_len < PIVCO_MAX_SYMBOLS - 1);
+    uint16_t my = g->dt->sched_len++;
+    unsigned rank0 = g->rank;
+
+    uint8_t nl = sched_gen(g, depth + 1);
+    unsigned thr = g->rank - 1;                 /* max rank of left subtree */
+    int left_lone = (nl == 0 && g->rank == rank0 + 1);
+    uint8_t nr = sched_gen(g, depth + 1);
+    if (g->err) return 0;
+    int right_lone = (nr == 0 && g->rank == thr + 2);
+
+    pivco_sched_rec_t *rec = &g->dt->sched[my];
+    if (left_lone && right_lone) {
+        /* Two sibling bare-leaf chunks (NAIVE mode; OPTIMIZED emits at
+         * most one singleton per length, so its pairs are b==1 chunks).
+         * Same PAIR record either way; param == thr == rank_begin. */
+        rec->kd = (uint8_t)PIVCO_SCHED_PAIR;
+    } else if (left_lone) {
+        rec->kd = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
+    } else {
+        /* A lone leaf child next to an internal sibling is always LEFT
+         * (chunk depths never decrease left-to-right under a node). */
+        PIVCO_CHECK(!right_lone);
+        rec->kd = (uint8_t)PIVCO_SCHED_FULL;
+    }
+    rec->param = (uint8_t)thr;
+    rec->skip  = (uint8_t)(1 + nl + nr);
+    return rec->skip;
 }
 
 /* Core build: code lengths (n_used >= 2, all <= PIVCO_MAX_CODE_LEN) into a
@@ -442,12 +472,8 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
      * a bad FSE commit policy (the gate ignores FSE decode cost).  Plain
      * symbol-value order is deterministic from the code lengths alone, so
      * encoder and decoder agree with no rank info transmitted. */
-    typedef struct {
-        uint8_t  sym;
-    } sf_t;
-    sf_t  flat_items[PIVCO_MAX_SYMBOLS];
-    int   per_len_start[PIVCO_MAX_CODE_LEN + 2];
-    rank_canon_t rc;    /* canonical rank-range form; feeds the schedule walk */
+    uint8_t items[PIVCO_MAX_SYMBOLS];   /* symbols, counting-sorted by length */
+    int per_len_start[PIVCO_MAX_CODE_LEN + 2];
     {
         /* Counting sort by length: prefix-sum the per-length counts, then a
            single symbol-order pass places each symbol.  Equivalent to the
@@ -462,21 +488,13 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         per_len_start[max_len + 1] = acc;
         for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++) {
             uint8_t L = lengths[s];
-            if (L) flat_items[cursor[L]++].sym = (uint8_t)s;
+            if (L) items[cursor[L]++] = (uint8_t)s;
         }
     }
 
     /* Decompose each c_L into chunks.  Strategy depends on tree mode --
        see pivco_huffman_set_tree_mode().  Default OPTIMIZED matches the
        original production behavior (decompose c_L by its set bits). */
-    typedef struct {
-        uint16_t L;
-        uint16_t bit;       /* 0..PIVCO_MAX_CODE_LEN */
-        uint16_t depth;     /* tree-depth of chunk root */
-        uint16_t n_syms;    /* 1 << bit */
-        uint16_t root_code; /* canonical code of the chunk root (depth bits) */
-        int      sym_idx;   /* index into flat_items */
-    } chunk_t;
     chunk_t chunks[PIVCO_MAX_SYMBOLS];   /* upper bound: one chunk per symbol */
     int n_chunks = 0;
     pivco_tree_mode_t tree_mode = pivco_huffman_get_tree_mode();
@@ -591,39 +609,34 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
     }
 
 
-    /* The code-assignment loops below also fill the rank-range arrays
-       (rank_to_sym / rank_to_flat_depth / rank_to_codeword) that the
-       production codec walks: once chunks are in code-assignment order,
-       their MSB-aligned codewords are strictly increasing, so chunk
-       iteration order IS rank order -- the in-order leaf order of the
-       (implicit) tree. */
+    /* Chunk order below == rank order (the tree's left-to-right leaf
+       order): CANONICAL_FLAT chunks are generated in canonical code
+       order; every other mode depth-sorts, and canonical assignment
+       over sorted depths fills the tree leftmost-first.  sched_gen
+       consumes the chunks in exactly this order.
 
-    /* For CANONICAL_FLAT, chunks already carry canonical root_codes; assign
-       symbol codes directly from them and skip the depth-sort + sequential
-       reassign step (sequential reassign would clobber the canonical
-       prefixes when chunks span multiple depths).  All other modes use
-       the standard pipeline. */
+       Per-symbol CODES are needed only by the full table (wire header
+       serialization, trad codecs, tools) — the decode-only path skips
+       the assignment loops entirely. */
     if (tree_mode == PIVCO_TREE_MODE_CANONICAL_FLAT) {
-        unsigned rank = 0;
-        for (int ci = 0; ci < n_chunks; ci++) {
-            int bit = chunks[ci].bit;
-            int n   = chunks[ci].n_syms;
-            int L   = chunks[ci].L;
-            uint16_t root = chunks[ci].root_code;
-            for (int i = 0; i < n; i++) {
-                uint8_t sym = flat_items[chunks[ci].sym_idx + i].sym;
-                uint16_t c16 = (uint16_t)(((uint32_t)root << bit) | (uint32_t)i);
-                if (full) {
-                    full->code[sym]        = c16;
+        /* Chunks already carry canonical root_codes; assign symbol codes
+           directly from them (sequential reassign would clobber the
+           canonical prefixes when chunks span multiple depths). */
+        if (full) {
+            unsigned rank = 0;
+            for (int ci = 0; ci < n_chunks; ci++) {
+                int bit = chunks[ci].bit;
+                int n   = chunks[ci].n_syms;
+                uint16_t root = chunks[ci].root_code;
+                for (int i = 0; i < n; i++) {
+                    uint8_t sym = items[chunks[ci].sym_idx + i];
+                    full->code[sym] =
+                        (uint16_t)(((uint32_t)root << bit) | (uint32_t)i);
                     full->sym_to_rank[sym] = (uint8_t)rank;
+                    rank++;
                 }
-                dt->rank_to_sym[rank] = sym;
-                rc.flat_depth[rank]   = (uint8_t)(bit >= 2 ? bit : 0);
-                rc.codeword[rank]     = (uint16_t)(c16 << (16 - L));
-                rank++;
             }
         }
-        dt->num_ranks = (uint16_t)rank;
     } else {
         /* Sort chunks by depth asc (stable; ties keep their natural order
            which is L asc by length, larger-bit-first within length). */
@@ -637,39 +650,28 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             chunks[j + 1] = cur;
         }
 
-
         /* Canonical-assign codes to chunks (chunk-level Kraft sum = 1).
            Each chunk gets a code prefix of length `chunk.depth`.  Within
            the chunk, symbol i takes suffix i for i in [0, 2^bit). */
-        {
+        if (full) {
             uint32_t code = 0;
             int prev_depth = 0;
             unsigned rank = 0;
             for (int ci = 0; ci < n_chunks; ci++) {
                 int d = chunks[ci].depth;
                 if (d > prev_depth) code <<= (d - prev_depth);
-                chunks[ci].root_code = (uint16_t)code;
                 int bit = chunks[ci].bit;
                 int n   = chunks[ci].n_syms;
-                int L   = chunks[ci].L;
                 for (int i = 0; i < n; i++) {
-                    uint8_t sym = flat_items[chunks[ci].sym_idx + i].sym;
-                    uint16_t c16 = (uint16_t)((code << bit) | (uint32_t)i);
-                    if (full) {
-                        full->code[sym]        = c16;
-                        full->sym_to_rank[sym] = (uint8_t)rank;
-                    }
-                    dt->rank_to_sym[rank] = sym;
-                    rc.flat_depth[rank]   = (uint8_t)(bit >= 2 ? bit : 0);
-                    rc.codeword[rank]     = (uint16_t)(c16 << (16 - L));
+                    uint8_t sym = items[chunks[ci].sym_idx + i];
+                    full->code[sym] = (uint16_t)((code << bit) | (uint32_t)i);
+                    full->sym_to_rank[sym] = (uint8_t)rank;
                     rank++;
                 }
                 code += 1;
                 prev_depth = d;
             }
-            dt->num_ranks = (uint16_t)rank;
         }
-
     }
 
     /* On-demand extras NOT built here: the 2^MAX_CODE_LEN flat decode
@@ -677,10 +679,13 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
      * tree (pivco_huffman_build_explicit_tree).  The codec streams the
      * schedule below and reads neither. */
 
-    /* Pre-order walk schedule: render the rank-range tree into the
-     * program the codec streams (see build_walk_schedule above). */
+    /* Schedule + rank_to_sym, straight from the chunk list (sched_gen
+     * above).  Also validates Kraft-completeness of the lengths. */
     dt->sched_len = 0;
-    build_walk_schedule(dt, &rc, 0, dt->num_ranks, 0);
+    sched_gen_t g = { dt, chunks, items, n_chunks, 0, 0, 0 };
+    sched_gen(&g, 0);
+    if (g.err || g.ci != n_chunks) return PIVCO_ERR_CORRUPT;
+    dt->num_ranks = (uint16_t)g.rank;
 
     if (full) {
         memcpy(full->sym_count, sym_count, sizeof(sym_count));
