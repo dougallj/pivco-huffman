@@ -54,12 +54,14 @@ double pivco_huffman_get_joint_lambda(void)
 /* Solve granularity: 1 = exact DP (default), 2/4/8 = group the
  * freq-sorted symbols by g (4^log2(g) fewer DP states, ~0.13 %/0.25 %
  * mean J loss at 2/4 on lits data), 0 = auto (pick by sigma so the
- * solve stays ~<= 10 us: exact to sigma 64, g=2 to 128, g=4 above). */
+ * solve stays ~<= 10 us: exact to sigma 64, g=2 to 128, g=4 above),
+ * -1 = greedy boundary nudger (no DP at all, ~0.2 us). */
 static int g_joint_gran = 1;
 
 void pivco_huffman_set_joint_granularity(int g)
 {
-    g_joint_gran = (g == 0 || g == 1 || g == 2 || g == 4 || g == 8) ? g : 1;
+    g_joint_gran = (g == -1 || g == 0 || g == 1 || g == 2 || g == 4
+                    || g == 8) ? g : 1;
 }
 
 int pivco_huffman_get_joint_granularity(void)
@@ -421,6 +423,137 @@ static double jl_solve_mass(const double *P, int sigma, double lam,
     return J;
 }
 
+/* ---------- Greedy boundary nudger (granularity -1): no DP ----------
+ *
+ * The transformation study (docs/JOINT-LENGTHS.md) showed the DP acts
+ * as a boundary nudger that rounds class counts to few powers of two
+ * on a nearly degenerate objective.  This does that directly: one
+ * shallow-to-deep walk with the slot ledger, at each level choosing
+ * among a handful of low-popcount roundings of the baseline class
+ * count inside the feasibility window, scored by the exact chunk cost
+ * of this level plus a one-level proxy for everything remaining.
+ * ~0.2 us; the caller's adoption guard rejects any bad pick, so this
+ * is never worse than baseline by construction.
+ *
+ * Feasibility window at level L (h = LMAX - L, s open slots, rest
+ * symbols unplaced): capacity below needs rest - c <= (s - c)*2^h,
+ * i.e. c <= (s*2^h - rest)/(2^h - 1) — an UPPER bound (leaves taken
+ * now eat slots the remainder needs); completeness (every open slot
+ * must eventually host >= 1 leaf) needs rest - c >= 2*(s - c), i.e.
+ * c >= 2s - rest.  Given the invariants s <= rest <= s*2^h the window
+ * is provably nonempty at every level ((s - rest)*(2^h - 2) <= 0),
+ * and any in-window choice preserves them, so the walk cannot die.
+ * At h = 0 it collapses to c = rest = s.
+ */
+/* Clamp c into the level's feasibility window; -1 if empty (cannot
+ * happen while the invariants s <= rest <= s*2^h hold). */
+static inline int jl_nudge_clamp(int c, int s, int rest, int h)
+{
+    int hi = s < rest ? s : rest;
+    int lo = 0;
+    if (h == 0)
+        return rest <= hi ? rest : -1;
+    const long cap = (((long)s << h) - rest) / ((1l << h) - 1);
+    if (cap < hi) hi = (int)cap;
+    const long l2 = 2l * s - rest;
+    if (l2 > 0) lo = (int)l2;
+    if (lo > hi) return -1;
+    return c < lo ? lo : c > hi ? hi : c;
+}
+
+/* Exact chunk cost of placing count c at level L on prefix [k, k+c). */
+static inline double jl_nudge_chunkcost(const double *P, int k, int c,
+                                        int L, double lam)
+{
+    double sc = 0;
+    int off = 0;
+    for (int b = 10; b >= 0; b--)
+        if (c & (1 << b)) {
+            sc += (P[k + off + (1 << b)] - P[k + off])
+                * ((double)L + lam * (double)(L - b));
+            off += 1 << b;
+        }
+    return sc;
+}
+
+/* Complete the walk from (k, s) at level L0 following the clamped
+ * baseline counts; returns the exact modeled cost of that completion.
+ * Used as the lookahead scorer for candidate choices. */
+static double jl_nudge_rollout(const double *P, int sigma, double lam,
+                               const int cls_n[JL_LMAX + 1],
+                               int k, int s, int L0)
+{
+    double cost = 0;
+    for (int L = L0; L <= JL_LMAX; L++) {
+        const int c = jl_nudge_clamp(cls_n[L], s, sigma - k,
+                                     JL_LMAX - L);
+        if (c < 0) return INFINITY;
+        cost += jl_nudge_chunkcost(P, k, c, L, lam);
+        k += c;
+        s = 2 * (s - c);
+    }
+    return cost;
+}
+
+/* One greedy walk; returns the committed path's exact modeled cost. */
+static double jl_nudge_walk(const double *P, int sigma, double lam,
+                            const int base[JL_LMAX + 1],
+                            uint16_t out_BL[JL_LMAX + 1])
+{
+    double total = 0;
+    int k = 0, s = 2;
+    for (int L = 1; L <= JL_LMAX; L++) {
+        const int c0 = jl_nudge_clamp(base[L], s, sigma - k,
+                                      JL_LMAX - L);
+        if (c0 < 0) return -1.0;             /* cannot happen from a
+                                              * valid baseline */
+        /* candidates: clamped baseline, its 1- and 2-bit
+         * down-roundings, the next power of two up, and 0 (kill the
+         * level), each re-clamped; scored by exact chunk cost here
+         * plus a clamped-baseline rollout of the remainder. */
+        int cand[5], nc = 0;
+        cand[nc++] = c0;
+        if (c0 > 0) {
+            const int top = 1 << (31 - __builtin_clz((unsigned)c0));
+            const int lowmask = c0 & ~top;
+            cand[nc++] = top;
+            if (lowmask)
+                cand[nc++] = top | (1 << (31 - __builtin_clz((unsigned)lowmask)));
+            if (top != c0)
+                cand[nc++] = top << 1;
+            cand[nc++] = 0;
+        }
+        double best = INFINITY;
+        int bestc = c0;
+        int prev = -1;
+        for (int i = 0; i < nc; i++) {
+            int c = jl_nudge_clamp(cand[i], s, sigma - k, JL_LMAX - L);
+            if (c < 0 || c == prev) continue;
+            prev = c;
+            const double sc = jl_nudge_chunkcost(P, k, c, L, lam)
+                + jl_nudge_rollout(P, sigma, lam, base,
+                                   k + c, 2 * (s - c), L + 1);
+            if (sc < best) { best = sc; bestc = c; }
+        }
+        out_BL[L] = (uint16_t)bestc;   /* binary decomposition == bits */
+        total += jl_nudge_chunkcost(P, k, bestc, L, lam);
+        k += bestc;
+        s = 2 * (s - bestc);
+    }
+    return total;
+}
+
+static double jl_nudge(const double *P, int sigma, double lam,
+                       const int cls_n[JL_LMAX + 1],
+                       uint16_t out_BL[JL_LMAX + 1])
+{
+    /* Score with an inflated lambda: greedy under-commits to
+     * flattening relative to the exact DP, and the caller's adoption
+     * guard judges with the REAL lambda anyway, so biasing the search
+     * toward flatter shapes raises adoption without risking quality. */
+    return jl_nudge_walk(P, sigma, lam * 1.5, cls_n, out_BL);
+}
+
 int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
                                  uint8_t lengths[PIVCO_MAX_SYMBOLS])
 {
@@ -441,8 +574,8 @@ int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
     /* Production model for the adoption guard: bits + exchangeable-model
      * merge passes of the INCOMING lengths. */
     double prod_bits = 0, prod_passes = 0;
+    int    cls_n[JL_LMAX + 1] = {0};
     {
-        int    cls_n[JL_LMAX + 1] = {0};
         double cls_w[JL_LMAX + 1] = {0};
         for (int i = 0; i < sigma; i++) {
             int L = lengths[sf[i].sym];
@@ -493,7 +626,9 @@ int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
     }
 
     uint16_t BL[JL_LMAX + 1] = {0};
-    if (glog) {
+    if (gran == -1) {
+        if (jl_nudge(P, sigma, lam, cls_n, BL) < 0) return -1;
+    } else if (glog) {
         double Pg[PIVCO_MAX_SYMBOLS / 2 + 2];
         const int sp = sigma_pad / gran;
         for (int i = 0; i <= sp; i++) Pg[i] = P[i * gran];

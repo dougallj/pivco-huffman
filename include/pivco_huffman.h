@@ -296,7 +296,8 @@ int    pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
  * freq-sorted symbol groups of that size — 4x/16x/64x fewer DP states
  * for a ~0.13 %/0.25 %/0.4 % mean objective loss on lits-style data
  * (the per-window adoption guard still applies); 0 = auto, which
- * picks by alphabet size so the solve stays roughly <= 10 us. */
+ * picks by alphabet size so the solve stays roughly <= 10 us;
+ * -1 = greedy boundary nudger, no DP at all (~0.2 us solve). */
 void pivco_huffman_set_joint_granularity(int g);
 int  pivco_huffman_get_joint_granularity(void);
 
