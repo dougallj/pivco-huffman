@@ -365,8 +365,13 @@ static uint8_t sched_gen(sched_gen_t *g, int depth)
         g->ci++;
         unsigned b = c->bit;
         unsigned rank0 = g->rank;
-        memcpy(&g->dt->rank_to_sym[rank0], &g->items[c->sym_idx],
-               (size_t)1 << b);
+        /* Width-1/2 chunks dominate skewed alphabets; keep their copies
+         * inline (a variable-size memcpy is a libc dispatch per chunk). */
+        uint8_t *dst = &g->dt->rank_to_sym[rank0];
+        const uint8_t *s = &g->items[c->sym_idx];
+        if (b == 0)      dst[0] = s[0];
+        else if (b == 1) { dst[0] = s[0]; dst[1] = s[1]; }
+        else             memcpy(dst, s, (size_t)1 << b);
         g->rank += 1u << b;
         if (b == 0) return 0;                   /* bare leaf — no record */
         pivco_sched_rec_t *rec = &g->dt->sched[g->dt->sched_len++];
@@ -639,7 +644,13 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         }
     } else {
         /* Sort chunks by depth asc (stable; ties keep their natural order
-           which is L asc by length, larger-bit-first within length). */
+           which is L asc by length, larger-bit-first within length).
+           Insertion sort on purpose: the generation order above is
+           already nearly depth-sorted (exactly sorted in NAIVE mode,
+           where n_chunks can reach 256), so it runs near-linear, and
+           the worst case is bounded by n_chunks <= ~50 in OPTIMIZED.
+           A stable counting sort by depth measured SLOWER here (fixed
+           bin overhead + a cold 3 KB scratch array). */
         for (int i = 1; i < n_chunks; i++) {
             chunk_t cur = chunks[i];
             int j = i - 1;
