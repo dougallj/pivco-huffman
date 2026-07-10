@@ -258,26 +258,45 @@ static void fill_enc_init_aux(pivco_huffman_table_t *table)
  * n_used + n_zero fall short of 256.
  * sym_count[1..PIVCO_MAX_CODE_LEN] must be zeroed by the caller. */
 #ifdef PIVCO_HISTO_NEON
-/* Per-bin equality counting: one cmeq/accumulate sweep of the 256 bytes
- * per bin (12 sweeps counting the zero bin), all lanes independent — no
- * scatter, no chains, inherently in-bounds for ANY input byte. */
-static int length_histogram(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
-                            uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1])
+/* Per-bin equality sweeps, fused with the counting sort: the same cmeq
+ * pass that counts bin L extracts its symbol indices (movemask + bit
+ * loop) into items[], in symbol order, with a REGISTER output cursor.
+ * That kills the second forwarding chain too — the scalar counting
+ * sort's cursor[L]++ serializes same-length runs exactly like the
+ * histogram's bins did.  All lanes independent, no scatter, inherently
+ * in-bounds for ANY input byte. */
+static int length_histogram_sort(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
+                                 uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1],
+                                 uint8_t items[PIVCO_MAX_SYMBOLS],
+                                 int per_len_start[PIVCO_MAX_CODE_LEN + 2])
 {
-    int seen = 0, n_used = 0;
-    for (int L = 0; L <= PIVCO_MAX_CODE_LEN; L++) {
+    /* Zero-bin count (validation accounting only — nothing to extract). */
+    const uint8x16_t vzero = vdupq_n_u8(0);
+    uint8x16_t zacc = vzero;
+    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
+        zacc = vsubq_u8(zacc, vceqq_u8(vld1q_u8(lengths + i), vzero));
+    int seen = (int)vaddlvq_u8(zacc);
+
+    int out = 0;
+    for (int L = 1; L <= PIVCO_MAX_CODE_LEN; L++) {
+        per_len_start[L] = out;
         const uint8x16_t target = vdupq_n_u8((uint8_t)L);
-        uint8x16_t acc = vdupq_n_u8(0);   /* lane counts <= 16 chunks, no overflow */
-        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
-            acc = vsubq_u8(acc, vceqq_u8(vld1q_u8(lengths + i), target));
-        unsigned cnt = vaddlvq_u8(acc);
-        seen += (int)cnt;
-        if (L > 0) {
-            sym_count[L] = (uint16_t)cnt;
-            n_used += (int)cnt;
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16) {
+            uint8x16_t eq = vceqq_u8(vld1q_u8(lengths + i), target);
+            /* narrowing shift = 4-bit-per-lane movemask; reduce to 1 bit */
+            uint64_t m = vget_lane_u64(vreinterpret_u64_u8(
+                             vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+            m &= 0x1111111111111111ull;
+            while (m) {
+                items[out++] = (uint8_t)(i + (__builtin_ctzll(m) >> 2));
+                m &= m - 1;
+            }
         }
+        sym_count[L] = (uint16_t)(out - per_len_start[L]);
     }
-    return (seen == PIVCO_MAX_SYMBOLS) ? n_used : -1;
+    per_len_start[PIVCO_MAX_CODE_LEN + 1] = out;
+    seen += out;
+    return (seen == PIVCO_MAX_SYMBOLS) ? out : -1;
 }
 #else
 /* Four interleaved sub-histograms: same-bin runs split across four
@@ -505,9 +524,17 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 {
     /* Histogram code lengths + validate + count used symbols (n_used is
        the bin sum, so no caller needs its own pre-count pass).  The
-       0/1-symbol dispatch lives here too. */
+       0/1-symbol dispatch lives here too.  On NEON the histogram sweep
+       also performs the counting sort (items / per_len_start filled
+       here); the portable path fills them in its own pass below. */
     uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1] = {0};
+    uint8_t items[PIVCO_MAX_SYMBOLS];   /* symbols, counting-sorted by length */
+    int per_len_start[PIVCO_MAX_CODE_LEN + 2];
+#ifdef PIVCO_HISTO_NEON
+    int n_used = length_histogram_sort(lengths, sym_count, items, per_len_start);
+#else
     int n_used = length_histogram(lengths, sym_count);
+#endif
     if (n_used < 0) return PIVCO_ERR_CORRUPT;
     if (n_used == 0) return PIVCO_ERR_EMPTY;
     if (full) full->num_symbols = (uint16_t)n_used;
@@ -570,12 +597,13 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
      * a bad FSE commit policy (the gate ignores FSE decode cost).  Plain
      * symbol-value order is deterministic from the code lengths alone, so
      * encoder and decoder agree with no rank info transmitted. */
-    uint8_t items[PIVCO_MAX_SYMBOLS];   /* symbols, counting-sorted by length */
-    int per_len_start[PIVCO_MAX_CODE_LEN + 2];
+#ifndef PIVCO_HISTO_NEON
     {
         /* Counting sort by length: prefix-sum the per-length counts, then a
-           single symbol-order pass places each symbol.  Equivalent to the
-           old nested for-L/for-s scan but O(256) instead of O(max_len*256). */
+           single symbol-order pass places each symbol.  (The NEON build
+           did this inside the histogram sweep — see length_histogram_sort;
+           this cursor loop's cursor[L]++ chain serializes same-length runs
+           just like the scalar histogram's bins did.) */
         int acc = 0;
         int cursor[PIVCO_MAX_CODE_LEN + 2];
         for (int L = 1; L <= max_len; L++) {
@@ -589,6 +617,7 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             if (L) items[cursor[L]++] = (uint8_t)s;
         }
     }
+#endif
 
     /* Decompose each c_L into chunks.  Strategy depends on tree mode --
        see pivco_huffman_set_tree_mode().  Default OPTIMIZED matches the
