@@ -44,3 +44,28 @@ is a heuristic (geometric: −10.6 % size available!).
 Raw captures: m4-*-joint-{l01,base}.txt.  Correctness: distorted
 streams roundtrip through decode-side table rebuild + scalar + NEON
 (test_joint_lengths); full suite + strict GuardMalloc green.
+
+## Encode side (same M4 session, purpose-built A/B: table build + block encode)
+
+| dist         | encode   | table build 0 -> J |
+|--------------|----------|--------------------|
+| image_jpeg   | +228.4 % | 3 us -> 7.8 ms     |
+| json_api     | +72.8 %  | 3 us -> 3.3 ms     |
+| chinese_text | +45.6 %  | 5 us -> 5.1 ms     |
+| prose_pride  | +35.9 %  | 3 us -> 3.4 ms     |
+| html_wiki    | +15.2 %  | 4 us -> 7.4 ms     |
+| proba80      | +12.8 %  | 2 us -> 96 us      |
+| english/dna  | ~0 %     | 1 us -> 0.8/1.2 ms (guard kept production; DP cost still paid) |
+
+Encode mirrors decode (partitions instead of merges; flat pack instead
+of flat unpack) — no encode-throughput regressions.  THE real cost of
+the feature is table-build latency: the DP is O(items x sigma x 2^L)
+~= 40 M cells at sigma=256, i.e. 1-8 ms per build vs ~4 us baseline.
+Fine amortized over block streams and large files; dominant for small
+files.  Mitigations, in order of effort: (a) gate the DP on input size
+(e.g. only for >= a few MB); (b) drop the 16 B/state choice masks
+(2/3 of memory traffic) via divide-and-conquer backtracking; (c) the
+hierarchical/dyadic-mass DP — in slot units at level L the ledger is
+bounded by remaining symbols, shrinking states ~100x, but it conflicts
+with the global-cost-order argument that makes the current DP exact;
+open question alongside doc §6.
