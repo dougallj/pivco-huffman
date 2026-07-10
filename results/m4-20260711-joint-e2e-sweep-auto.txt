@@ -1,0 +1,261 @@
+# End-to-end window sweep: PHA, lambda 0 vs 0.1, GRAN=AUTO (coarse DP heuristic)
+# M4 mini, reps=5, 20s cooldown between Gs; companion to the gran=1 (exact) sweep
+# branch joint-flat-lengths, 2026-07-11
+
+G=4K lambda=0.10 reps=5 fse=1 (PHA) gran=0
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6924       121       812       520      1434      25.9         -
+dickens.lits  0.10   0.6879       119      1580      1199      3521      30.9   172/174
+dickens.lits delta  -0.449pp     -1.7%    +94.7%   +130.7%   +145.5%
+mozilla.lits  0.00   0.9653       255      1724      1639      4451      13.5         -
+mozilla.lits  0.10   0.9623       173      2494      3076      7839      22.3 2241/2764
+mozilla.lits delta  -0.306pp    -32.2%    +44.7%    +87.6%    +76.1%
+mr.lits       0.00   0.8207       388      1821      1845      5251       8.3         -
+mr.lits       0.10   0.8204       164      1873      1938      5432      22.8    42/385
+mr.lits      delta  -0.025pp    -57.7%     +2.9%     +5.0%     +3.4%
+nci.lits      0.00   0.5604       719      3434      2390      7254       4.0         -
+nci.lits      0.10   0.5572       386      3878      3016      8169       9.2   185/206
+nci.lits     delta  -0.320pp    -46.4%    +12.9%    +26.2%    +12.6%
+ooffice.lits  0.00   0.9451       340      1784      1408      4654       9.1         -
+ooffice.lits  0.10   0.9400       166      2764      3141      7953      23.4   406/428
+ooffice.lits delta  -0.511pp    -51.2%    +55.0%   +123.2%    +70.9%
+osdb.lits     0.00   0.9293       367      1938      1458      5007       8.3         -
+osdb.lits     0.10   0.9306       168      2701      3109      9229      23.0   500/503
+osdb.lits    delta  +0.124pp    -54.1%    +39.4%   +113.3%    +84.3%
+reymont.lits  0.00   0.7354       745      3161      2573      7315       3.9         -
+reymont.lits  0.10   0.7312       303      3927      3886     10972      12.3     65/92
+reymont.lits delta  -0.419pp    -59.3%    +24.2%    +51.0%    +50.0%
+samba.lits    0.00   0.9142       647      2230      2004      6245       4.3         -
+samba.lits    0.10   0.9111       241      3463      4988     14870      16.2   535/581
+samba.lits   delta  -0.306pp    -62.7%    +55.3%   +148.8%   +138.1%
+sao.lits      0.00   0.9935       568      1967      1951      5213       5.1         -
+sao.lits      0.10   0.9964       178      2342      3182      7597      21.6   948/958
+sao.lits     delta  +0.288pp    -68.6%    +19.1%    +63.1%    +45.7%
+webster.lits  0.00   0.7049       515      2060      1453      4422       5.1         -
+webster.lits  0.10   0.6985       306      3722      2643      8407      11.8   703/707
+webster.lits delta  -0.636pp    -40.5%    +80.7%    +81.9%    +90.1%
+x-ray.lits    0.00   0.8833       446      1692      1765      4689       6.9         -
+x-ray.lits    0.10   0.8787       175      2492      2991      7635      22.0 1149/1184
+x-ray.lits   delta  -0.457pp    -60.7%    +47.3%    +69.5%    +62.8%
+xml.lits      0.00   0.7181       670      2890      2983      7707       4.7         -
+xml.lits      0.10   0.7146       285      3627      4021     10276      13.1     38/46
+xml.lits     delta  -0.349pp    -57.4%    +25.5%    +34.8%    +33.3%
+== geomean over 12 files (G=4K)
+lam=0.00: enc-e2e    435  dec-e2e   2005  enc-k   1703  dec-k   4948
+lam=0.10: enc-e2e    210  dec-e2e   2797  enc-k   2937  dec-k   8045
+delta   : enc-e2e -51.7%  dec-e2e +39.5%  enc-k +72.5%  dec-k +62.6%  ratio -0.281pp avg
+
+G=8K lambda=0.10 reps=5 fse=1 (PHA) gran=0
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6711       363      2222      1274      3292      16.1         -
+dickens.lits  0.10   0.6704       279      3503      2558      6646      26.1     87/87
+dickens.lits delta  -0.075pp    -23.2%    +57.6%   +100.7%   +101.9%
+mozilla.lits  0.00   0.9519       477      2999      2360      6165      13.7         -
+mozilla.lits  0.10   0.9528       327      4349      4191     10089      23.1 1111/1382
+mozilla.lits delta  +0.091pp    -31.4%    +45.0%    +77.6%    +63.6%
+mr.lits       0.00   0.8040       682      3395      2896      7684       9.2         -
+mr.lits       0.10   0.8043       314      3516      3035      7684      23.3    21/193
+mr.lits      delta  +0.035pp    -54.0%     +3.6%     +4.8%     +0.0%
+nci.lits      0.00   0.5395      1034      5226      3313      8951       5.4         -
+nci.lits      0.10   0.5368       582      5685      3658      9048      11.8    94/103
+nci.lits     delta  -0.269pp    -43.7%     +8.8%    +10.4%     +1.1%
+ooffice.lits  0.00   0.9283       641      3240      2305      5911       9.2         -
+ooffice.lits  0.10   0.9290       321      4464      4136     10232      23.5   205/214
+ooffice.lits delta  +0.070pp    -49.9%    +37.8%    +79.4%    +73.1%
+osdb.lits     0.00   0.9077       723      3524      2374      7171       7.9         -
+osdb.lits     0.10   0.9138       340      4360      4494     11308      22.2   252/252
+osdb.lits    delta  +0.606pp    -53.0%    +23.7%    +89.3%    +57.7%
+reymont.lits  0.00   0.7140      1054      5041      3768      9817       5.5         -
+reymont.lits  0.10   0.7123       585      6217      5110     12864      12.3     27/46
+reymont.lits delta  -0.165pp    -44.5%    +23.3%    +35.6%    +31.0%
+samba.lits    0.00   0.8984       952      4005      3160      7852       6.0         -
+samba.lits    0.10   0.8984       433      6196      6798     20870      17.7   277/291
+samba.lits   delta  -0.001pp    -54.5%    +54.7%   +115.1%   +165.8%
+sao.lits      0.00   0.9775      1015      3677      3253      7672       5.6         -
+sao.lits      0.10   0.9818       362      4017      4202      9033      20.6   427/479
+sao.lits     delta  +0.432pp    -64.3%     +9.2%    +29.2%    +17.7%
+webster.lits  0.00   0.6828       859      3805      2351      7123       6.0         -
+webster.lits  0.10   0.6806       554      6328      3903     11756      12.7   354/354
+webster.lits delta  -0.216pp    -35.5%    +66.3%    +66.0%    +65.0%
+x-ray.lits    0.00   0.8625       701      3069      2796      6588       8.8         -
+x-ray.lits    0.10   0.8632       320      3997      4007      9114      23.5   583/592
+x-ray.lits   delta  +0.074pp    -54.3%    +30.3%    +43.3%    +38.3%
+xml.lits      0.00   0.6996       953      4867      3775      8808       6.3         -
+xml.lits      0.10   0.6991       484      6165      4743     12331      14.9     18/23
+xml.lits     delta  -0.050pp    -49.2%    +26.7%    +25.6%    +40.0%
+== geomean over 12 files (G=8K)
+lam=0.00: enc-e2e    753  dec-e2e   3656  enc-k   2702  dec-k   7026
+lam=0.10: enc-e2e    395  dec-e2e   4782  enc-k   4120  dec-k  10466
+delta   : enc-e2e -47.5%  dec-e2e +30.8%  enc-k +52.5%  dec-k +49.0%  ratio +0.044pp avg
+
+G=16K lambda=0.10 reps=5 fse=1 (PHA) gran=0
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6609       374      2175      1201      2879      29.7         -
+dickens.lits  0.10   0.6616       296      3685      1927      5556      46.2     44/44
+dickens.lits delta  +0.070pp    -20.9%    +69.4%    +60.4%    +93.0%
+mozilla.lits  0.00   0.9471       617      4658      2643      6923      20.4         -
+mozilla.lits  0.10   0.9502       601      6839      5262     12250      24.1   530/691
+mozilla.lits delta  +0.310pp     -2.5%    +46.8%    +99.1%    +76.9%
+mr.lits       0.00   0.7986       960      5049      3842      8608      12.7         -
+mr.lits       0.10   0.7990       526      5148      3852      9053      26.7      5/97
+mr.lits      delta  +0.033pp    -45.2%     +2.0%     +0.2%     +5.2%
+nci.lits      0.00   0.5292      1263      6954      3878     10261       8.6         -
+nci.lits      0.10   0.5268       832      7254      4145      9562      15.5     49/52
+nci.lits     delta  -0.234pp    -34.1%     +4.3%     +6.9%     -6.8%
+ooffice.lits  0.00   0.9215      1103      4929      3271      7383       9.8         -
+ooffice.lits  0.10   0.9251       593      6386      4887     10292      24.2   103/107
+ooffice.lits delta  +0.361pp    -46.3%    +29.6%    +49.4%    +39.4%
+osdb.lits     0.00   0.8969      1241      5020      3374      8265       8.3         -
+osdb.lits     0.10   0.9056       637      6431      5318     11760      22.6   126/126
+osdb.lits    delta  +0.863pp    -48.7%    +28.1%    +57.6%    +42.3%
+reymont.lits  0.00   0.7064      1372      7039      4606      9817       8.3         -
+reymont.lits  0.10   0.7058       876      8110      5568     14348      15.6     17/23
+reymont.lits delta  -0.066pp    -36.2%    +15.2%    +20.9%    +46.2%
+samba.lits    0.00   0.8925      1364      5761      4226      9367       8.1         -
+samba.lits    0.10   0.8938       722     10081      7601     23792      20.4   136/146
+samba.lits   delta  +0.131pp    -47.1%    +75.0%    +79.9%   +154.0%
+sao.lits      0.00   0.9729      1401      5199      4004      8376       7.6         -
+sao.lits      0.10   0.9764       623      5641      4532      9095      22.6   174/240
+sao.lits     delta  +0.350pp    -55.6%     +8.5%    +13.2%     +8.6%
+webster.lits  0.00   0.6718      1224      6075      3246      8531       8.3         -
+webster.lits  0.10   0.6718       892      8506      4836     12465      14.9   177/177
+webster.lits delta  -0.006pp    -27.1%    +40.0%    +49.0%    +46.1%
+x-ray.lits    0.00   0.8524       911      4698      3584      7635      13.4         -
+x-ray.lits    0.10   0.8554       512      5835      4498      9855      28.4   294/296
+x-ray.lits   delta  +0.302pp    -43.8%    +24.2%    +25.5%    +29.1%
+xml.lits      0.00   0.6973      1225      6850      4021      9735       8.7         -
+xml.lits      0.10   0.6982       777      7707      5440     12331      17.0     10/12
+xml.lits     delta  +0.097pp    -36.6%    +12.5%    +35.3%    +26.7%
+== geomean over 12 files (G=16K)
+lam=0.00: enc-e2e   1027  dec-e2e   5168  enc-k   3336  dec-k   7822
+lam=0.10: enc-e2e    633  dec-e2e   6599  enc-k   4624  dec-k  11061
+delta   : enc-e2e -38.4%  dec-e2e +27.7%  enc-k +38.6%  dec-k +41.4%  ratio +0.184pp avg
+
+G=32K lambda=0.10 reps=5 fse=1 (PHA) gran=0
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6581       520      2963      1591      3610      41.9         -
+dickens.lits  0.10   0.6585       494      5191      2654      6465      53.3     22/22
+dickens.lits delta  +0.034pp     -5.0%    +75.2%    +66.8%    +79.1%
+mozilla.lits  0.00   0.9476       839      6011      2735      7628      27.1         -
+mozilla.lits  0.10   0.9514       948      8782      5219     12004      28.3   219/346
+mozilla.lits delta  +0.380pp    +13.0%    +46.1%    +90.8%    +57.4%
+mr.lits       0.00   0.7987      1073      6301      3330      8335      20.3         -
+mr.lits       0.10   0.7987       736      6352      3366      8608      34.1      1/49
+mr.lits      delta  -0.001pp    -31.4%     +0.8%     +1.1%     +3.3%
+nci.lits      0.00   0.5260      1362      8414      3825      9899      15.3         -
+nci.lits      0.10   0.5230      1021      8249      3988      9784      23.6     26/26
+nci.lits     delta  -0.295pp    -25.0%     -2.0%     +4.3%     -1.2%
+ooffice.lits  0.00   0.9212      1370      5951      3176      7477      13.4         -
+ooffice.lits  0.10   0.9250       936      7742      4794     10415      27.9     50/54
+ooffice.lits delta  +0.376pp    -31.7%    +30.1%    +51.0%    +39.3%
+osdb.lits     0.00   0.8933      1496      6431      3391      8400      12.2         -
+osdb.lits     0.10   0.9024      1002      8332      5264     11246      26.4     63/63
+osdb.lits    delta  +0.901pp    -33.0%    +29.6%    +55.2%    +33.9%
+reymont.lits  0.00   0.7030      1523      8882      4845     11658      14.0         -
+reymont.lits  0.10   0.7025      1100      9565      5652     13817      22.7      5/12
+reymont.lits delta  -0.053pp    -27.7%     +7.7%    +16.7%    +18.5%
+samba.lits    0.00   0.8919      1516      7039      3972      9555      13.3         -
+samba.lits    0.10   0.8924      1078     11837      7039     17888      25.6     60/73
+samba.lits   delta  +0.050pp    -28.9%    +68.2%    +77.2%    +87.2%
+sao.lits      0.00   0.9731      1604      6003      3593      7747      11.3         -
+sao.lits      0.10   0.9756       941      6426      3878      8504      26.3    49/120
+sao.lits     delta  +0.254pp    -41.3%     +7.0%     +7.9%     +9.8%
+webster.lits  0.00   0.6687      1391      7158      3199      8033      13.2         -
+webster.lits  0.10   0.6685      1218     10219      4893     12050      20.0     89/89
+webster.lits delta  -0.017pp    -12.5%    +42.8%    +53.0%    +50.0%
+x-ray.lits    0.00   0.8491      1034      6008      3753      7871      23.0         -
+x-ray.lits    0.10   0.8522       726      7183      4420      9716      37.7   145/148
+x-ray.lits   delta  +0.309pp    -29.8%    +19.6%    +17.8%    +23.4%
+xml.lits      0.00   0.7049      1434      7114      4021      9248      13.8         -
+xml.lits      0.10   0.7060      1005      8407      4999     10880      24.5       4/6
+xml.lits     delta  +0.107pp    -29.9%    +18.2%    +24.3%    +17.6%
+== geomean over 12 files (G=32K)
+lam=0.00: enc-e2e   1211  dec-e2e   6332  enc-k   3349  dec-k   8031
+lam=0.10: enc-e2e    911  dec-e2e   8004  enc-k   4548  dec-k  10616
+delta   : enc-e2e -24.8%  dec-e2e +26.4%  enc-k +35.8%  dec-k +32.2%  ratio +0.170pp avg
+
+G=64K lambda=0.10 reps=5 fse=1 (PHA) gran=0
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6572       452      2822      1057      3119      81.7         -
+dickens.lits  0.10   0.6571       508      4938      2265      5600      98.7     11/11
+dickens.lits delta  -0.005pp    +12.3%    +75.0%   +114.3%    +79.5%
+mozilla.lits  0.00   0.9489       837      6524      2449      7048      51.5         -
+mozilla.lits  0.10   0.9539      1288     10413      5260     12224      38.4   121/173
+mozilla.lits delta  +0.501pp    +53.9%    +59.6%   +114.8%    +73.4%
+mr.lits       0.00   0.7980      1137      6178      3001      7001      34.4         -
+mr.lits       0.10   0.7979       905      6251      3077      7226      49.2      1/25
+mr.lits      delta  -0.001pp    -20.4%     +1.2%     +2.5%     +3.2%
+nci.lits      0.00   0.5248      1431      9048      3740      9672      27.9         -
+nci.lits      0.10   0.5213      1194      8857      4045     10017      38.2     13/13
+nci.lits     delta  -0.354pp    -16.6%     -2.1%     +8.2%     +3.6%
+ooffice.lits  0.00   0.9223      1464      6183      2887      7055      21.8         -
+ooffice.lits  0.10   0.9275      1314      8494      4781      9561      35.8     27/27
+ooffice.lits delta  +0.519pp    -10.3%    +37.4%    +65.6%    +35.5%
+osdb.lits     0.00   0.8914      1679      7403      3554      8366      20.2         -
+osdb.lits     0.10   0.9008      1372      9800      5171     11828      34.4     32/32
+osdb.lits    delta  +0.939pp    -18.3%    +32.4%    +45.5%    +41.4%
+reymont.lits  0.00   0.7023      1665      7937      4495     10082      23.5         -
+reymont.lits  0.10   0.7045      1392     11304      5739     14348      33.8       3/6
+reymont.lits delta  +0.220pp    -16.4%    +42.4%    +27.7%    +42.3%
+samba.lits    0.00   0.8924      1592      7166      3683      8065      22.9         -
+samba.lits    0.10   0.8936      1397     12723      6378     15756      35.9     32/37
+samba.lits   delta  +0.121pp    -12.3%    +77.5%    +73.2%    +95.4%
+sao.lits      0.00   0.9761      1704      6747      3397      7687      19.1         -
+sao.lits      0.10   0.9768      1226      6914      3424      7952      34.2      7/60
+sao.lits     delta  +0.068pp    -28.1%     +2.5%     +0.8%     +3.4%
+webster.lits  0.00   0.6671      1517      7712      3257      8263      22.6         -
+webster.lits  0.10   0.6670      1484     11385      4788     12910      29.9     45/45
+webster.lits delta  -0.007pp     -2.2%    +47.6%    +47.0%    +56.3%
+x-ray.lits    0.00   0.8475      1101      7027      3767      8041      42.1         -
+x-ray.lits    0.10   0.8508       910      8491      4348      9855      56.9     73/74
+x-ray.lits   delta  +0.335pp    -17.3%    +20.8%    +15.4%    +22.6%
+xml.lits      0.00   0.7113      1480      7707      3775      8407      25.3         -
+xml.lits      0.10   0.7141      1233      9735      4624      9735      36.7       3/3
+xml.lits     delta  +0.279pp    -16.7%    +26.3%    +22.5%    +15.8%
+== geomean over 12 files (G=64K)
+lam=0.00: enc-e2e   1266  dec-e2e   6655  enc-k   3096  dec-k   7480
+lam=0.10: enc-e2e   1145  dec-e2e   8821  enc-k   4336  dec-k  10186
+delta   : enc-e2e  -9.6%  dec-e2e +32.5%  enc-k +40.1%  dec-k +36.2%  ratio +0.218pp avg
+
+G=128K lambda=0.10 reps=5 fse=1 (PHA) gran=0
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6578       607      3486      1605      3685     121.5         -
+dickens.lits  0.10   0.6569       688      6027      2586      6465     126.5       6/6
+dickens.lits delta  -0.095pp    +13.3%    +72.9%    +61.1%    +75.5%
+mozilla.lits  0.00   0.9501       994      7270      2595      7070      80.7         -
+mozilla.lits  0.10   0.9555      1651     11285      5324     12453      54.3     65/87
+mozilla.lits delta  +0.548pp    +66.1%    +55.2%   +105.2%    +76.1%
+mr.lits       0.00   0.7972      1179      6647      3041      7064      62.9         -
+mr.lits       0.10   0.7972      1038      6647      3113      7160      77.8      1/13
+mr.lits      delta  -0.001pp    -12.0%     +0.0%     +2.4%     +1.4%
+nci.lits      0.00   0.5242      1466      9562      3690      9899      49.4         -
+nci.lits      0.10   0.5206      1319      9454      4085      9784      61.7       7/7
+nci.lits     delta  -0.357pp    -10.0%     -1.1%    +10.7%     -1.2%
+ooffice.lits  0.00   0.9244      1554      6578      2951      6808      38.1         -
+ooffice.lits  0.10   0.9301      1582      9614      4807     10353      53.0     14/14
+ooffice.lits delta  +0.566pp     +1.8%    +46.2%    +62.9%    +52.1%
+osdb.lits     0.00   0.8902      1796      8232      3669      8871      36.6         -
+osdb.lits     0.10   0.9001      1688     10775      5210     11896      51.5     16/16
+osdb.lits    delta  +0.990pp     -6.0%    +30.9%    +42.0%    +34.1%
+reymont.lits  0.00   0.7039      1510      6908      3694      7174      48.7         -
+reymont.lits  0.10   0.7049      1474      6908      4288      7315      55.3       1/3
+reymont.lits delta  +0.105pp     -2.4%     +0.0%    +16.1%     +2.0%
+samba.lits    0.00   0.8942      1574      6261      3277      6500      41.4         -
+samba.lits    0.10   0.8948      1634     10435      5507     11384      53.9     17/19
+samba.lits   delta  +0.063pp     +3.8%    +66.7%    +68.1%    +75.1%
+sao.lits      0.00   0.9789      1768      7128      3339      7481      34.8         -
+sao.lits      0.10   0.9789      1472      7206      3319      7657      49.4      0/30
+sao.lits     delta  +0.000pp    -16.8%     +1.1%     -0.6%     +2.3%
+webster.lits  0.00   0.6664      1563      8055      3188      8146      41.0         -
+webster.lits  0.10   0.6663      1674     12100      4844     12740      49.2     23/23
+webster.lits delta  -0.013pp     +7.1%    +50.2%    +51.9%    +56.4%
+x-ray.lits    0.00   0.8471      1132      7635      3756      7975      80.9         -
+x-ray.lits    0.10   0.8504      1042      9200      4345      9875      95.6     35/37
+x-ray.lits   delta  +0.327pp     -8.0%    +20.5%    +15.7%    +23.8%
+xml.lits      0.00   0.7216      1567      7114      3699      7398      34.0         -
+xml.lits      0.10   0.7216      1370      9735      4743     10276      48.0       2/2
+xml.lits     delta  -0.006pp    -12.6%    +36.8%    +28.2%    +38.9%
+== geomean over 12 files (G=128K)
+lam=0.00: enc-e2e   1341  dec-e2e   6906  enc-k   3136  dec-k   7170
+lam=0.10: enc-e2e   1345  dec-e2e   8907  enc-k   4246  dec-k   9546
+delta   : enc-e2e  +0.3%  dec-e2e +29.0%  enc-k +35.4%  dec-k +33.1%  ratio +0.177pp avg

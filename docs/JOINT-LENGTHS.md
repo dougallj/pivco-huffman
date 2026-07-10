@@ -306,22 +306,60 @@ under joint lengths FSE fires MORE at small G than baseline (nci
 the surviving merges pair very unequal subtrees, whose skewed
 bitmaps are exactly what FSE compresses.
 
-What any heuristic could still buy is bounded by the all-in ENCODE
-throughput (G / (encode + table build) per window; decode and ratio
-gain nothing).  At G = 64 K on M4, joint all-in currently runs at
-0.42-0.90x of baseline all-in; replacing the DP with a FREE solver of
-equal quality would reach 1.06-1.19x of baseline (joint lengths speed
-encoding up too), i.e. a ceiling of 1.2-3.0x over today — at which
-point the plain Huffman table build (8-55 us/window) is the equal
-bottleneck.  Against that ceiling a greedy-carry heuristic brings
-approximation risk exactly where the model is known to be thin
-(kappa/condition (M), the geometric case) and a second solver to
-maintain.  Deferred; better first moves if encode-side cost matters:
-shave the generic build_table (shared by baseline), or amortize the
-joint solve across windows by re-running it only on histogram drift.
-The sweeps themselves are compute-bound at ~0.4 ns/cell NEON with
-89 % state density, so only an inexact search could go much below
-the current cost.
+## The coarse-granularity heuristic (shipped)
+
+An earlier evaluation deferred the heuristic (free-solver ceiling
+1.2-3.0x on all-in encode, nothing on decode/ratio).  Studying how
+the DP transforms trees on lits windows (scratch tool
+study_transform) revived it by killing one idea and producing a
+better one:
+
+* 98.4 % of moved symbols move exactly +-1 level, but in RUNS —
+  per-level count deltas reach the tens, popcount(c_L) drops
+  2.4 -> 1.5, levels-in-use 6.5 -> 5.4, flat coverage 84 -> 92 %,
+  merge passes x0.60.  The DP is a boundary nudger that rounds class
+  counts to few powers of two.
+* The optimal trajectory is NOT near the baseline's (max |dk| up to
+  144), so warm-start banding fails.  But near-optimal solutions are
+  everywhere: the J landscape is nearly degenerate.
+
+That degeneracy is the heuristic: solve on GROUPS of g freq-sorted
+symbols.  A group of g = 2^G at real level L is a depth-G flat, so
+the coarse problem is the SAME solver with sigma' = sigma/g,
+lmax' = 11-G, bcap' = 8-G (identical cost form up to a constant),
+4^G fewer states, ghost-padded with <= g-1 zero-frequency unused
+byte values when g does not divide sigma.  Measured against exact
+on all lits windows (study_coarse):
+
+| g | solve us (sigma=256) | mean/max J gap | adoption agreement |
+|---|------|----------------|--------|
+| 2 | 25   | 0.13 % / 1.0 % | 94-96 %|
+| 4 | 8.3  | 0.21 % / 2.2 % | 80-88 %|
+| 8 | 3.2  | 0.40 % / 2.0 % | 73 %   |
+
+pivco_huffman_set_joint_granularity: 1 exact (default), 2/4/8 fixed,
+0 auto (exact to sigma 64, g=2 to 128, g=4 above — solve stays
+~<= 10 us at every sigma).  The per-window adoption guard applies
+unchanged, so the heuristic is never-worse-than-baseline by
+construction (modulo the shared model).
+
+End-to-end effect (M4 sweep, PHA, auto granularity, geomean):
+
+| G     | enc-e2e 0 -> J (exact was) | dec-e2e | ratio avg |
+|-------|----------------------------|---------|-----------|
+| 4 K   | -51.7 % (-79 %)            | +39.5 % | -0.28 pp  |
+| 8 K   | -47.5 % (-77 %)            | +30.8 % | +0.04 pp  |
+| 16 K  | -38.4 % (-71 %)            | +27.7 % | +0.18 pp  |
+| 32 K  | -24.8 % (-61 %)            | +26.4 % | +0.17 pp  |
+| 64 K  | -9.6 %  (-44 %)            | +32.5 % | +0.22 pp  |
+| 128 K | +0.3 %  (-30 %)            | +29.0 % | +0.18 pp  |
+
+Decode wins are indistinguishable from the exact DP's; encode-side
+break-even arrives at ~128 K windows, and at 4 K the joint result
+still nets a ratio IMPROVEMENT over baseline.  The remaining encode
+gap at small G is mostly qsort + model + residual solve; the next
+lever there is amortizing the joint solve across windows (re-run on
+histogram drift), not a faster solver.
 
 ## PH vs PHA on this workload
 

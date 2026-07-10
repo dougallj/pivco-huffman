@@ -416,6 +416,39 @@ static int test_joint_lengths(void)
              * real invariant. */
             (void)base_len;
         }
+        /* Granularity variants: coarse solves must still produce valid
+         * complete trees (incl. ghost-padded alphabets) that roundtrip
+         * through the decode-side rebuild. */
+        static const int grans[] = { 0, 2, 4, 8 };
+        pivco_huffman_set_joint_lambda(0.1);
+        for (size_t gi = 0; gi < sizeof(grans)/sizeof(*grans); gi++) {
+            pivco_huffman_set_joint_granularity(grans[gi]);
+            pivco_huffman_table_t table, dtable;
+            static uint8_t enc[PIVCO_MAX_ENCODED_SIZE], dec[PIVCO_BLOCK_SIZE];
+            size_t enc_len, consumed;
+            if (pivco_huffman_build_table(freq, &table) != PIVCO_OK
+                || pivco_huffman_encode_scalar(symbols, PIVCO_BLOCK_SIZE, &table,
+                                               enc, &enc_len) != PIVCO_OK
+                || pivco_huffman_build_table_from_code_lens(table.code_len,
+                                                            &dtable) != PIVCO_OK
+                || pivco_huffman_decode_scalar(enc, enc_len, &dtable,
+                                               dec, &consumed) != PIVCO_OK
+                || memcmp(symbols, dec, PIVCO_BLOCK_SIZE) != 0) {
+                pivco_huffman_set_joint_lambda(0.0);
+                pivco_huffman_set_joint_granularity(1);
+                FAIL("gran=%d roundtrip dist=%d", grans[gi], d);
+            }
+#ifdef PIVCO_HAS_NEON
+            if (pivco_huffman_decode_bu_neon(enc, enc_len, &dtable,
+                                             dec, &consumed) != PIVCO_OK
+                || memcmp(symbols, dec, PIVCO_BLOCK_SIZE) != 0) {
+                pivco_huffman_set_joint_lambda(0.0);
+                pivco_huffman_set_joint_granularity(1);
+                FAIL("gran=%d neon roundtrip dist=%d", grans[gi], d);
+            }
+#endif
+        }
+        pivco_huffman_set_joint_granularity(1);
     }
     pivco_huffman_set_joint_lambda(0.0);
     printf("PASS\n");

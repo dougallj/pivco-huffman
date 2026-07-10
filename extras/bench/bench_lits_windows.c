@@ -20,8 +20,10 @@
  *   - enc/dec kernel-only MB/s, table-build us/window, adopted windows
  * plus a geomean summary over all files.
  *
- * Usage: bench_lits_windows [--G=KB] [--joint=L] [--reps=N] [--fse=0|1] file...
+ * Usage: bench_lits_windows [--G=KB] [--joint=L] [--reps=N] [--fse=0|1]
+ *        [--gran=N] file...
  * --fse=0 benches PH (no per-node FSE attempt); default 1 = PHA.
+ * --gran: joint solve granularity (1 exact, 2/4/8 coarse, 0 auto).
  */
 #include "pivco_huffman.h"
 #include <math.h>
@@ -168,17 +170,19 @@ int main(int argc, char **argv)
 {
     size_t G = 64 * 1024;
     double lam = 0.0;
-    int reps = 5, fse = 1;
+    int reps = 5, fse = 1, gran = 1;
     int argi = 1;
     for (; argi < argc && argv[argi][0] == '-'; argi++) {
         if (!strncmp(argv[argi], "--G=", 4)) G = (size_t)atoi(argv[argi] + 4) * 1024;
         else if (!strncmp(argv[argi], "--joint=", 8)) lam = atof(argv[argi] + 8);
         else if (!strncmp(argv[argi], "--reps=", 7)) reps = atoi(argv[argi] + 7);
         else if (!strncmp(argv[argi], "--fse=", 6)) fse = atoi(argv[argi] + 6);
+        else if (!strncmp(argv[argi], "--gran=", 7)) gran = atoi(argv[argi] + 7);
     }
+    pivco_huffman_set_joint_granularity(gran);
     pivco_huffman_set_fse_enabled(fse);
-    printf("G=%zuK lambda=%.2f reps=%d fse=%d (%s)\n", G / 1024, lam, reps,
-           fse, fse ? "PHA" : "PH");
+    printf("G=%zuK lambda=%.2f reps=%d fse=%d (%s) gran=%d\n", G / 1024, lam,
+           reps, fse, fse ? "PHA" : "PH", gran);
     printf("%-12s %5s %8s %9s %9s %9s %9s %9s %9s\n",
            "file", "lam", "ratio", "enc-e2e", "dec-e2e", "enc-k", "dec-k",
            "build u/w", "adopted");
