@@ -100,6 +100,7 @@ five phases ending 2026-05-14; before that, each backend had its own
 - `src/pivco_huffman_neon_flat.h` — D=2..6 NEON unpack helpers (shared with bench_micro)
 - `src/pivco_huffman_x86_flat.h` — D=4 SSE unpack helper
 - `src/pivco_huffman_avx512_flat.h` — D=2..6 AVX-512 VBMI2 unpack helpers
+- `extras/pivcoh.h` — stb-style single-header PH-only codec (scalar, wire-compatible with non-FSE streams; verified byte-for-byte by `extras/bench/bench_pivcoh_check.c`)
 - `extras/pivco_huffman_neon_prefix.c` — retired research prefix-radix backend (moved to extras 2026-05-14; BU on the standard 2-way wire format beat it on every dist/host)
 - `extras/legacy_td/README.md` — git-archaeology pointer for the retired top-down decoders
 - `bench/bench_main.c` — benchmark harness (4M × repeats methodology)

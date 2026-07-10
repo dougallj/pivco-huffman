@@ -538,3 +538,10 @@ endif()
 # were not wired into the top CMake; they're left as orphan sources for
 # manual compilation.  (Add add_executable() blocks here if they get
 # resurrected.)
+
+# -------- pivcoh single-header codec verifier --------
+# Cross-checks extras/pivcoh.h against the production library (identical
+# code lengths, byte-identical wire, cross-decode, hostile-stream fuzz).
+add_executable(pivco_bench_pivcoh_check bench_pivcoh_check.c)
+target_include_directories(pivco_bench_pivcoh_check PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(pivco_bench_pivcoh_check pivco_huffman)
