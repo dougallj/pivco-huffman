@@ -4,14 +4,23 @@
 #include <stddef.h>
 #include "pivco_check.h"
 
-/* The length histogram is the hottest part of the decode-table build and
- * is SIMD-friendly (256 bytes, <= 12 bins), so it gets a NEON path here —
- * a deliberate exception to the "intrinsics live in the primitives
- * headers" rule, since this file is backend-agnostic and compiled once.
- * -DPIVCO_HISTO_PORTABLE forces the portable path (for A/B). */
-#if (defined(__aarch64__) || defined(__ARM_NEON)) && !defined(PIVCO_HISTO_PORTABLE)
-#define PIVCO_HISTO_NEON 1
-#include <arm_neon.h>
+/* The length histogram + counting sort is the hottest part of the
+ * decode-table build and is SIMD-friendly (256 bytes, <= 12 bins), so it
+ * gets NEON and SSE2 paths here — a deliberate exception to the
+ * "intrinsics live in the primitives headers" rule, since this file is
+ * backend-agnostic and compiled once.  SSE2 is x86-64 baseline, so no
+ * dispatch is needed.  -DPIVCO_HISTO_PORTABLE forces the portable path
+ * (for A/B). */
+#ifndef PIVCO_HISTO_PORTABLE
+#  if defined(__aarch64__) || defined(__ARM_NEON)
+#    define PIVCO_HISTO_SIMD 1
+#    define PIVCO_HISTO_SIMD_NEON 1
+#    include <arm_neon.h>
+#  elif defined(__x86_64__) || defined(__i386__)
+#    define PIVCO_HISTO_SIMD 1
+#    define PIVCO_HISTO_SIMD_SSE 1
+#    include <emmintrin.h>
+#  endif
 #endif
 
 /* ---------- Code lengths via van Leeuwen's two-queue method ----------
@@ -257,29 +266,50 @@ static void fill_enc_init_aux(pivco_huffman_table_t *table)
  * sweep: zeros are counted too, and any byte outside 0..MAX makes
  * n_used + n_zero fall short of 256.
  * sym_count[1..PIVCO_MAX_CODE_LEN] must be zeroed by the caller. */
-#ifdef PIVCO_HISTO_NEON
+#ifdef PIVCO_HISTO_SIMD
 /* Per-bin equality sweeps, fused with the counting sort: the same cmeq
  * pass that counts bin L extracts its symbol indices (movemask + bit
  * loop) into items[], in symbol order, with a REGISTER output cursor.
  * That kills the second forwarding chain too — the scalar counting
  * sort's cursor[L]++ serializes same-length runs exactly like the
  * histogram's bins did.  All lanes independent, no scatter, inherently
- * in-bounds for ANY input byte. */
+ * in-bounds for ANY input byte.
+ *
+ * NEON has no byte movemask, so the compare narrows to a 4-bit-per-lane
+ * nibble mask (vshrn) reduced to 1 bit per lane; SSE2's pmovmskb gives
+ * the bitmask directly. */
 static int length_histogram_sort(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                                  uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1],
                                  uint8_t items[PIVCO_MAX_SYMBOLS],
                                  int per_len_start[PIVCO_MAX_CODE_LEN + 2])
 {
     /* Zero-bin count (validation accounting only — nothing to extract). */
-    const uint8x16_t vzero = vdupq_n_u8(0);
-    uint8x16_t zacc = vzero;
-    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
-        zacc = vsubq_u8(zacc, vceqq_u8(vld1q_u8(lengths + i), vzero));
-    int seen = (int)vaddlvq_u8(zacc);
+    int seen;
+#ifdef PIVCO_HISTO_SIMD_NEON
+    {
+        const uint8x16_t vzero = vdupq_n_u8(0);
+        uint8x16_t zacc = vzero;
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
+            zacc = vsubq_u8(zacc, vceqq_u8(vld1q_u8(lengths + i), vzero));
+        seen = (int)vaddlvq_u8(zacc);
+    }
+#else
+    {
+        const __m128i vzero = _mm_setzero_si128();
+        __m128i zacc = vzero;
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
+            zacc = _mm_sub_epi8(zacc, _mm_cmpeq_epi8(
+                       _mm_loadu_si128((const __m128i *)(lengths + i)), vzero));
+        __m128i s = _mm_sad_epu8(zacc, vzero);   /* horizontal u8 sum */
+        seen = _mm_cvtsi128_si32(s)
+             + _mm_cvtsi128_si32(_mm_srli_si128(s, 8));
+    }
+#endif
 
     int out = 0;
     for (int L = 1; L <= PIVCO_MAX_CODE_LEN; L++) {
         per_len_start[L] = out;
+#ifdef PIVCO_HISTO_SIMD_NEON
         const uint8x16_t target = vdupq_n_u8((uint8_t)L);
         for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16) {
             uint8x16_t eq = vceqq_u8(vld1q_u8(lengths + i), target);
@@ -292,6 +322,17 @@ static int length_histogram_sort(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 m &= m - 1;
             }
         }
+#else
+        const __m128i target = _mm_set1_epi8((char)L);
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16) {
+            unsigned m = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(
+                _mm_loadu_si128((const __m128i *)(lengths + i)), target));
+            while (m) {
+                items[out++] = (uint8_t)(i + (int)__builtin_ctz(m));
+                m &= m - 1;
+            }
+        }
+#endif
         sym_count[L] = (uint16_t)(out - per_len_start[L]);
     }
     per_len_start[PIVCO_MAX_CODE_LEN + 1] = out;
@@ -547,13 +588,14 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 {
     /* Histogram code lengths + validate + count used symbols (n_used is
        the bin sum, so no caller needs its own pre-count pass).  The
-       0/1-symbol dispatch lives here too.  On NEON the histogram sweep
-       also performs the counting sort (items / per_len_start filled
-       here); the portable path fills them in its own pass below. */
+       0/1-symbol dispatch lives here too.  On NEON/SSE2 the histogram
+       sweep also performs the counting sort (items / per_len_start
+       filled here); the portable path fills them in its own pass
+       below. */
     uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1] = {0};
     uint8_t items[PIVCO_MAX_SYMBOLS];   /* symbols, counting-sorted by length */
     int per_len_start[PIVCO_MAX_CODE_LEN + 2];
-#ifdef PIVCO_HISTO_NEON
+#ifdef PIVCO_HISTO_SIMD
     int n_used = length_histogram_sort(lengths, sym_count, items, per_len_start);
 #else
     int n_used = length_histogram(lengths, sym_count);
@@ -620,10 +662,10 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
      * a bad FSE commit policy (the gate ignores FSE decode cost).  Plain
      * symbol-value order is deterministic from the code lengths alone, so
      * encoder and decoder agree with no rank info transmitted. */
-#ifndef PIVCO_HISTO_NEON
+#ifndef PIVCO_HISTO_SIMD
     {
         /* Counting sort by length: prefix-sum the per-length counts, then a
-           single symbol-order pass places each symbol.  (The NEON build
+           single symbol-order pass places each symbol.  (The SIMD build
            did this inside the histogram sweep — see length_histogram_sort;
            this cursor loop's cursor[L]++ chain serializes same-length runs
            just like the scalar histogram's bins did.) */

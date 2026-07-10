@@ -40,9 +40,16 @@
 #include "pivco_huffman.h"
 #include <string.h>
 
-#if (defined(__aarch64__) || defined(__ARM_NEON)) && !defined(PIVCO_HISTO_PORTABLE)
-#define REF_HISTO_NEON 1
-#include <arm_neon.h>
+#ifndef PIVCO_HISTO_PORTABLE
+#  if defined(__aarch64__) || defined(__ARM_NEON)
+#    define REF_HISTO_SIMD 1
+#    define REF_HISTO_SIMD_NEON 1
+#    include <arm_neon.h>
+#  elif defined(__x86_64__) || defined(__i386__)
+#    define REF_HISTO_SIMD 1
+#    define REF_HISTO_SIMD_SSE 1
+#    include <emmintrin.h>
+#  endif
 #endif
 
 /* A chunk: 2^bit same-length leaves under one root at `depth`.
@@ -55,7 +62,7 @@ typedef struct {
 
 /* ---- 1. histogram + counting sort ---- */
 
-#ifdef REF_HISTO_NEON
+#ifdef REF_HISTO_SIMD
 /* One cmeq sweep per bin counts it AND extracts its symbols (movemask +
  * bit loop, register output cursor) — no scatter, no store-forwarding
  * chains.  Returns n_used or -1 on invalid lengths. */
@@ -64,15 +71,32 @@ static int ref_histo_sort(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                           uint8_t items[PIVCO_MAX_SYMBOLS],
                           int per_len_start[PIVCO_MAX_CODE_LEN + 2])
 {
-    const uint8x16_t vzero = vdupq_n_u8(0);
-    uint8x16_t zacc = vzero;
-    for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
-        zacc = vsubq_u8(zacc, vceqq_u8(vld1q_u8(lengths + i), vzero));
-    int seen = (int)vaddlvq_u8(zacc);
+    int seen;
+#ifdef REF_HISTO_SIMD_NEON
+    {
+        const uint8x16_t vzero = vdupq_n_u8(0);
+        uint8x16_t zacc = vzero;
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
+            zacc = vsubq_u8(zacc, vceqq_u8(vld1q_u8(lengths + i), vzero));
+        seen = (int)vaddlvq_u8(zacc);
+    }
+#else
+    {
+        const __m128i vzero = _mm_setzero_si128();
+        __m128i zacc = vzero;
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16)
+            zacc = _mm_sub_epi8(zacc, _mm_cmpeq_epi8(
+                       _mm_loadu_si128((const __m128i *)(lengths + i)), vzero));
+        __m128i s = _mm_sad_epu8(zacc, vzero);
+        seen = _mm_cvtsi128_si32(s)
+             + _mm_cvtsi128_si32(_mm_srli_si128(s, 8));
+    }
+#endif
 
     int out = 0;
     for (int L = 1; L <= PIVCO_MAX_CODE_LEN; L++) {
         per_len_start[L] = out;
+#ifdef REF_HISTO_SIMD_NEON
         const uint8x16_t target = vdupq_n_u8((uint8_t)L);
         for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16) {
             uint8x16_t eq = vceqq_u8(vld1q_u8(lengths + i), target);
@@ -84,6 +108,17 @@ static int ref_histo_sort(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 m &= m - 1;
             }
         }
+#else
+        const __m128i target = _mm_set1_epi8((char)L);
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i += 16) {
+            unsigned m = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(
+                _mm_loadu_si128((const __m128i *)(lengths + i)), target));
+            while (m) {
+                items[out++] = (uint8_t)(i + (int)__builtin_ctz(m));
+                m &= m - 1;
+            }
+        }
+#endif
         sym_count[L] = (uint16_t)(out - per_len_start[L]);
     }
     per_len_start[PIVCO_MAX_CODE_LEN + 1] = out;
