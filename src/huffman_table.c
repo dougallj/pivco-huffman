@@ -36,7 +36,7 @@
  * before internals (indices >=n), so on an equal frequency a leaf wins -- the
  * `<=` below -- and within a queue the front already holds the lowest index
  * (leaves sorted by (freq,sym); internals in creation order). */
-typedef struct { uint64_t freq; uint16_t sym; } leaf_t;
+typedef pivco_huffman_leaf_t leaf_t;   /* { u64 freq; u16 sym } */
 
 /* Stable sort of leaf[0..n) by frequency ascending.  Stability over the
  * symbol-ordered seed keeps the (freq,sym) tie discipline the heap relied on.
@@ -547,7 +547,7 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
      * No-op unless pivco_huffman_set_joint_lambda(>0) was called; on
      * any internal failure the Huffman lengths above are kept. */
     if (pivco_huffman_get_joint_lambda() > 0.0)
-        (void)pivco_joint_optimize_lengths(freq, lengths);
+        (void)pivco_joint_optimize_lengths_leaves(leaf, n_used, lengths);
 
     return build_table_finish(lengths, table);
 }
@@ -1071,7 +1071,7 @@ int pivco_huffman_build_codec_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
      * No-op unless pivco_huffman_set_joint_lambda(>0) was called; on
      * any internal failure the Huffman lengths above are kept. */
     if (pivco_huffman_get_joint_lambda() > 0.0)
-        (void)pivco_joint_optimize_lengths(freq, ct->code_len);
+        (void)pivco_joint_optimize_lengths_leaves(leaf, n_used, ct->code_len);
 
     int rc = build_core(ct->code_len, &ct->dec, NULL);
     if (rc != PIVCO_OK) return rc;   /* unreachable: lengths are Kraft-exact */

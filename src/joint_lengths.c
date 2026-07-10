@@ -554,19 +554,16 @@ static double jl_nudge(const double *P, int sigma, double lam,
     return jl_nudge_walk(P, sigma, lam * 1.5, cls_n, out_BL);
 }
 
-int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
-                                 uint8_t lengths[PIVCO_MAX_SYMBOLS])
+/* Core over an already freq-desc-sorted symbol list.  sf is caller
+ * scratch sized PIVCO_MAX_SYMBOLS: ghost-padding may append to it. */
+static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
+                            const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                            uint8_t lengths[PIVCO_MAX_SYMBOLS])
 {
     const double lam = g_joint_lambda;
     if (lam <= 0.0) return -1;
-
-    /* Symbols sorted by frequency desc + prefix sums. */
-    jl_sf_t sf[PIVCO_MAX_SYMBOLS];
-    int sigma = 0;
-    for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++)
-        if (freq[s]) { sf[sigma].freq = freq[s]; sf[sigma].sym = (uint8_t)s; sigma++; }
     if (sigma < 2 || sigma > (1 << JL_LMAX)) return -1;
-    qsort(sf, (size_t)sigma, sizeof(jl_sf_t), jl_cmp_sf);
+
     double P[PIVCO_MAX_SYMBOLS + 1];
     P[0] = 0.0;
     for (int i = 0; i < sigma; i++) P[i + 1] = P[i] + (double)sf[i].freq;
@@ -672,4 +669,39 @@ int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
                         lengths[sf[cur++].sym] = (uint8_t)L;
     }
     return 0;
+}
+
+int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                                 uint8_t lengths[PIVCO_MAX_SYMBOLS])
+{
+    if (g_joint_lambda <= 0.0) return -1;
+    jl_sf_t sf[PIVCO_MAX_SYMBOLS];
+    int sigma = 0;
+    for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++)
+        if (freq[s]) { sf[sigma].freq = freq[s]; sf[sigma].sym = (uint8_t)s; sigma++; }
+    if (sigma < 2) return -1;
+    qsort(sf, (size_t)sigma, sizeof(jl_sf_t), jl_cmp_sf);
+    return jl_optimize_core(sf, sigma, freq, lengths);
+}
+
+/* Fast path: the table builds hand over their two-queue input, already
+ * sorted frequency-ascending (symbol-stable), so the joint pass skips
+ * its own scan + qsort — most of its fixed overhead.  Reversal gives
+ * frequency-descending; within equal frequencies the tie order flips
+ * relative to the qsort path, which is cost-neutral (equal weights)
+ * and wire-legal either way. */
+int pivco_joint_optimize_lengths_leaves(const pivco_huffman_leaf_t *leaf_asc,
+                                        int n_used,
+                                        uint8_t lengths[PIVCO_MAX_SYMBOLS])
+{
+    if (g_joint_lambda <= 0.0) return -1;
+    if (n_used < 2 || n_used > PIVCO_MAX_SYMBOLS) return -1;
+    jl_sf_t sf[PIVCO_MAX_SYMBOLS];
+    uint64_t freq[PIVCO_MAX_SYMBOLS] = {0};
+    for (int i = 0; i < n_used; i++) {
+        sf[i].freq = leaf_asc[n_used - 1 - i].freq;
+        sf[i].sym  = (uint8_t)leaf_asc[n_used - 1 - i].sym;
+        freq[sf[i].sym] = sf[i].freq;
+    }
+    return jl_optimize_core(sf, n_used, freq, lengths);
 }

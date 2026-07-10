@@ -386,6 +386,17 @@ double pivco_huffman_get_joint_lambda(void);
 int    pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
                                     uint8_t lengths[PIVCO_MAX_SYMBOLS]);
 
+/* Internal fast path for the table builds: identical to
+ * pivco_joint_optimize_lengths, but takes the build's already-sorted
+ * leaf array (frequency ascending, the two-queue input) instead of
+ * re-scanning and re-sorting the 256-entry freq table — that sort was
+ * most of the joint pass's fixed overhead.  Layout matches the
+ * builder's internal leaf_t. */
+typedef struct { uint64_t freq; uint16_t sym; } pivco_huffman_leaf_t;
+int pivco_joint_optimize_lengths_leaves(const pivco_huffman_leaf_t *leaf_asc,
+                                        int n_used,
+                                        uint8_t lengths[PIVCO_MAX_SYMBOLS]);
+
 /* Solve granularity: 1 (default) = exact DP; 2/4/8 = solve on
  * freq-sorted symbol groups of that size — 4x/16x/64x fewer DP states
  * for a ~0.13 %/0.25 %/0.4 % mean objective loss on lits-style data
