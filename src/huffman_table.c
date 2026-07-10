@@ -42,8 +42,10 @@ typedef struct { uint64_t freq; uint16_t sym; } leaf_t;
  * symbol-ordered seed keeps the (freq,sym) tie discipline the heap relied on.
  *
  * Small alphabets take an insertion sort: a radix pass costs 256 bins of
- * zero + prefix regardless of n, which dwarfs n^2/4 compares up to a few
- * dozen leaves.
+ * zero + prefix regardless of n.  Measured crossover on M4: insertion
+ * wins through n = 40 even on its worst case (freqs descending in symbol
+ * order — a ranked alphabet), breaks even at ~48, loses past that; on
+ * randomly-ordered freqs it wins through ~64.  40 never loses either way.
  *
  * Larger ones take an LSD radix over only the bytes that VARY across the
  * frequencies (`vary` = OR ^ AND of all freqs, a free by-product of the
@@ -54,7 +56,7 @@ typedef struct { uint64_t freq; uint16_t sym; } leaf_t;
  * gathered in ONE pass over the leaves (u16 bins suffice for n <= 256), so
  * same-byte runs split across the planes' independent forwarding chains
  * instead of hammering one bin per pass. */
-#define PIVCO_LEAF_SORT_INSERTION_MAX 24
+#define PIVCO_LEAF_SORT_INSERTION_MAX 40
 
 static void sort_leaves_by_freq(leaf_t *leaf, int n, uint64_t vary)
 {
