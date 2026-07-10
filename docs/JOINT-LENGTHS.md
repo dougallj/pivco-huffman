@@ -477,3 +477,29 @@ envelope of one line per candidate tree).  Caveat at large lambda:
 the model runs kappa = 0, and deep-flat regimes are exactly where
 per-D kernel differences bite, so the far end of the frontier is the
 least trustworthy part of it.
+
+## Skipping the guard: what it actually protects (and what it can't)
+
+In-model the guard is REDUNDANT for the exact DP: the baseline is a
+feasible point, so bits + lambda*passes <= baseline always — the
+price alone guarantees every adopted trade is favorable as the model
+prices it.  The guard is therefore purely (a) a floor that skips
+not-worth-shipping wins and (b) a firewall against model-vs-reality
+gaps.  Measured A/B (results/m4-20260711-guard-ab.txt):
+
+* Lits-style data: guard on == guard off (92 % adoption already; the
+  extra guard-off adoptions are washes).
+* bell_s10: guard off ships a MEASURED -14.3 % decode regression
+  (with -3.4 % size); the guard catches it.
+* geometric: -28 % decode ships WITH THE GUARD ON (alongside -10.6 %
+  size).  The model prices this tree as better on both axes — the
+  baseline limit_code_lengths heuristic is ~10 % off optimal bits on
+  deep-natural-depth shapes, so the DP legitimately grabs the bits —
+  and the guard judges with the same kappa = 0 model, so it cannot
+  veto what the model itself mispriced.  This is the long-standing
+  open item: per-D kappa terms (+ condition (M)) in solver AND guard.
+
+So: the price is the right mechanism; the failure mode lives in the
+cost model on deep-tree shapes (geometric / narrow-bell), where the
+"win" ships as much-smaller-but-slower.  pivco_huffman_set_joint_guard
+exposes the thresholds (defaults 1.015 / 0.90).

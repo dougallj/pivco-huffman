@@ -1,0 +1,13 @@
+# Guard A/B: measured decode, baseline vs joint(guarded) vs joint(guard off), lambda=0.1 exact, PHA
+# M4 mini, codec-table decode path, 4M x 6 reps best-of-4; focused dist set
+# (proba80 rows: no adoption either arm — same trees; delta = pure noise gauge)
+dist           | base MB/s |  guarded     d% adopt |  noguard     d% adopt size d%
+proba80        |     5755 |     6940 +20.6%    no |     7840 +36.2%    no  +0.00%
+bell_s10       |     9175 |     9168  -0.1%    no |     7857 -14.4%   yes  -3.42%
+bell_s30       |     8551 |    13135 +53.6%   yes |    13128 +53.5%   yes  -0.65%
+uniform        |    90851 |    89241  -1.8%    no |    89241  -1.8%    no  +0.00%
+english        |    12041 |    11859  -1.5%    no |    12122  +0.7%   yes  +0.05%
+geometric      |     7715 |     5510 -28.6%   yes |     5515 -28.5%   yes -10.63%
+image_jpeg     |    10193 |    91512 +797.8%   yes |    90851 +791.3%   yes  +0.85%
+chinese_text   |     7794 |    11255 +44.4%   yes |    11210 +43.8%   yes  -0.79%
+calgary_pic    |     9877 |     9861  -0.2%    no |    10164  +2.9%   yes  -1.26%

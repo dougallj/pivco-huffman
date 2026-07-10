@@ -406,6 +406,12 @@ int pivco_joint_optimize_lengths_leaves(const pivco_huffman_leaf_t *leaf_asc,
 void pivco_huffman_set_joint_granularity(int g);
 int  pivco_huffman_get_joint_granularity(void);
 
+/* Adoption-guard thresholds (defaults 1.015, 0.90): a joint result is
+ * adopted only if modeled bits <= bits_cap * baseline and modeled
+ * merge passes <= pass_cap * baseline; otherwise the window keeps its
+ * plain Huffman lengths.  Pass big values to disable (experiments). */
+void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap);
+
 /* ---------- Table construction ---------- */
 
 int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
