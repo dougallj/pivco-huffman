@@ -139,6 +139,61 @@ static inline int wire_read_kr_header(const pivco_huffman_table_t *table,
     return wire_read_kr(in_ptr);
 }
 
+/* Bounds-checked reads for the production decoder: the stream is
+ * untrusted, so every record read is validated against `end` before
+ * dereferencing.  wire_read_kr_checked returns -1 on truncation;
+ * wire_read_bitmap_checked returns NULL on truncation, a bad FSE
+ * marker, or an FSE payload that fails to decode to exactly the bitmap
+ * size.  Costs a couple of predictable compares per NODE record —
+ * nothing per symbol. */
+static inline int wire_read_kr_checked(const uint8_t **in_ptr,
+                                       const uint8_t *end)
+{
+    if (end - *in_ptr < KR_HEADER_BYTES) return -1;
+    return wire_read_kr(in_ptr);
+}
+
+static inline const uint8_t *wire_read_bitmap_checked(const uint8_t **in_ptr,
+                                                      const uint8_t *end,
+                                                      int n, uint8_t *scratch)
+{
+    PROF_TIC();
+    int nbytes = bitmap_bytes(n);
+    if (*in_ptr >= end) return NULL;
+    uint8_t marker = **in_ptr;
+    *in_ptr += 1;
+    if (marker == 0) {
+        if (end - *in_ptr < nbytes) return NULL;
+        const uint8_t *bm = *in_ptr;
+        *in_ptr += nbytes;
+        PROF_TOC(PROF_WIRE_BITMAP_RAW, n);
+        return bm;
+    }
+#ifdef PIVCO_HAS_FSE
+    int t_id = marker & 0x7F;
+    int xor_flag = (marker >> 7) & 1;
+    if (end - *in_ptr < 2) return NULL;
+    uint16_t fse_len;
+    memcpy(&fse_len, *in_ptr, 2);
+    *in_ptr += 2;
+    if (end - *in_ptr < (ptrdiff_t)fse_len) return NULL;
+    size_t out_len = 0;
+    if (pivco_fse_decompress(t_id, *in_ptr, fse_len,
+                             scratch, (size_t)nbytes,
+                             (size_t)nbytes, &out_len) != PIVCO_FSE_OK
+        || out_len != (size_t)nbytes)
+        return NULL;    /* bad table id / malformed payload */
+    *in_ptr += fse_len;
+    if (xor_flag) pivco_fse_flip_bits(scratch, (size_t)nbytes);
+    PROF_TOC(PROF_WIRE_BITMAP_FSE, n);
+    return scratch;
+#else
+    /* FSE not built but the stream claims an FSE record: reject. */
+    (void)scratch;
+    return NULL;
+#endif
+}
+
 /* Read the per-node bitmap body (marker + payload).  Returns a pointer
  * to the usable n-bit bitmap (either pointing into the input stream
  * for marker==0, or into the caller-provided `scratch` for the FSE

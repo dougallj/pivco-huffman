@@ -135,6 +135,13 @@ target_include_directories(pivco_bench_tree_table PRIVATE
     ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Decoder robustness fuzzer: corrupt valid streams (flips, truncations,
+# garbage) and require OK/CORRUPT with canary-guarded output intact.
+# Best run sanitized: cc -fsanitize=address,undefined against a
+# sanitized lib build (see the file header).
+add_executable(pivco_fuzz_decode ${CMAKE_SOURCE_DIR}/extras/fuzz_decode.c)
+target_link_libraries(pivco_fuzz_decode pivco_huffman m)
+
 # ryg-realism context bench: decode throughput of LZ literal streams when
 # the Huffman table is rebuilt every 5-100 KB.  Feed it .lits files from
 # pivco_lz4_lits (below) over e.g. the Silesia corpus.

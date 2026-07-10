@@ -497,10 +497,17 @@ int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
  * is on.  The root call passes 0 -- the caller's output buffer has no
  * over-read slack. */
 
-static void codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
+/* Returns 0, or -1 when the (untrusted) stream is truncated or carries
+ * an impossible K_right / bad FSE record.  All stream reads are checked
+ * against in_end BEFORE dereferencing; K_right is clamped to [0, K] so
+ * child sizes, scratch carves and merge extents stay within the bounds
+ * the entry sized for N.  (A bitmap whose popcount disagrees with
+ * K_right yields garbage output but touches only in-bounds memory.) */
+static int codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
                                    unsigned *cursor, int K,
                                    uint8_t *out_buf,
                                    const uint8_t **in_ptr,
+                                   const uint8_t *in_end,
                                    uint8_t *scratch_top, int tail_ok)
 {
     const pivco_sched_rec_t *rec = &dt->sched[(*cursor)++];
@@ -511,43 +518,51 @@ static void codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
          * slice of rank_to_sym (ranks are in code order). */
         int D = rec->kd >> 2;
         int total_bytes = (K * D + 7) >> 3;
+        if (in_end - *in_ptr < (ptrdiff_t)total_bytes) return -1;
         const uint8_t *bm = *in_ptr;
         *in_ptr += total_bytes;
         prim_merge_flat(out_buf, K, bm, D, &dt->rank_to_sym[rec->param]);
-        return;
+        return 0;
     }
 
     if (kind == PIVCO_SCHED_PAIR) {
         /* Both children leaves; no K_right header. */
         uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
-        const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch);
+        const uint8_t *bm = wire_read_bitmap_checked(in_ptr, in_end, K,
+                                                     bm_scratch);
+        if (!bm) return -1;
         prim_merge_cst_cst(bm, K,
                            dt->rank_to_sym[rec->param],
                            dt->rank_to_sym[rec->param + 1],
                            out_buf);
-        return;
+        return 0;
     }
 
     /* At least one non-leaf child: K_right header, then bitmap. */
-    int K_right = wire_read_kr(in_ptr);
+    int K_right = wire_read_kr_checked(in_ptr, in_end);
+    if (K_right < 0 || K_right > K) return -1;
     uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
-    const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch);
+    const uint8_t *bm = wire_read_bitmap_checked(in_ptr, in_end, K,
+                                                 bm_scratch);
+    if (!bm) return -1;
 
     if (kind == PIVCO_SCHED_LEAF_LEFT) {
         /* Left child is a lone leaf (a lone leaf child is always left). */
         uint8_t *right_buf = tail_ok
             ? place_tail(out_buf, K - K_right, K_right, &scratch_top)
             : scratch_carve(&scratch_top, K_right);
-        if (K_right > 0)
-            codec_decode_subtree(dt, cursor, K_right,
-                                  right_buf, in_ptr, scratch_top,
-                                  g_dec_inplace);
-        else
+        if (K_right > 0) {
+            if (codec_decode_subtree(dt, cursor, K_right,
+                                     right_buf, in_ptr, in_end, scratch_top,
+                                     g_dec_inplace) != 0)
+                return -1;
+        } else {
             *cursor += dt->sched[*cursor].skip;
+        }
         prim_merge_cst_vec(bm, K,
                            dt->rank_to_sym[rec->param],
                            right_buf, out_buf);
-        return;
+        return 0;
     }
 
     /* Both children internal.  Recurse into both with disjoint
@@ -569,17 +584,24 @@ static void codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
         right_buf = scratch_carve(&scratch_top, K_right);
     }
 
-    if (K_left > 0)
-        codec_decode_subtree(dt, cursor, K_left,
-                              left_buf,  in_ptr, scratch_top, g_dec_inplace);
-    else
+    if (K_left > 0) {
+        if (codec_decode_subtree(dt, cursor, K_left,
+                                 left_buf,  in_ptr, in_end, scratch_top,
+                                 g_dec_inplace) != 0)
+            return -1;
+    } else {
         *cursor += dt->sched[*cursor].skip;
-    if (K_right > 0)
-        codec_decode_subtree(dt, cursor, K_right,
-                              right_buf, in_ptr, scratch_top, g_dec_inplace);
-    else
+    }
+    if (K_right > 0) {
+        if (codec_decode_subtree(dt, cursor, K_right,
+                                 right_buf, in_ptr, in_end, scratch_top,
+                                 g_dec_inplace) != 0)
+            return -1;
+    } else {
         *cursor += dt->sched[*cursor].skip;
+    }
     prim_merge_vec_vec(bm, K, left_buf, right_buf, out_buf);
+    return 0;
 }
 
 int CODEC_DECODE_DT_ENTRY(const uint8_t *in, size_t in_len,
@@ -587,11 +609,14 @@ int CODEC_DECODE_DT_ENTRY(const uint8_t *in, size_t in_len,
                           uint8_t *symbols, size_t *consumed)
 {
     if (!in || !dt || !symbols || !consumed) return PIVCO_ERR_NULL;
-    (void)in_len;
     prim_codec_init();
 
-    /* Block header: first 2 bytes are N (symbol count for this block). */
+    /* Block header: first 2 bytes are N (symbol count for this block).
+     * The stream is untrusted: every read below is bounds-checked
+     * against in_end. */
+    if (in_len < PIVCO_BLOCK_N_BYTES) return PIVCO_ERR_CORRUPT;
     const uint8_t *ptr = in;
+    const uint8_t *in_end = in + in_len;
     const int N = wire_read_block_n(&ptr);
     if (N <= 0 || N > PIVCO_WIRE_MAX_N) return PIVCO_ERR_CORRUPT;
 
@@ -605,7 +630,9 @@ int CODEC_DECODE_DT_ENTRY(const uint8_t *in, size_t in_len,
      * extreme-case optimization. */
     if (dt->num_ranks == 2) {
         uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
-        const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch);
+        const uint8_t *bm = wire_read_bitmap_checked(&ptr, in_end, N,
+                                                     bm_scratch);
+        if (!bm) return PIVCO_ERR_CORRUPT;
         prim_merge_cst_cst(bm, N,
                                dt->rank_to_sym[0],
                                dt->rank_to_sym[1],
@@ -631,8 +658,10 @@ int CODEC_DECODE_DT_ENTRY(const uint8_t *in, size_t in_len,
     g_scratch_pad_left = PIVCO_SCRATCH_PAD_BUDGET;
 
     unsigned sched_cursor = 0;
-    codec_decode_subtree(dt, &sched_cursor, N,
-                          symbols, &ptr, scratch, /*tail_ok=*/0);
+    if (codec_decode_subtree(dt, &sched_cursor, N,
+                             symbols, &ptr, in_end, scratch,
+                             /*tail_ok=*/0) != 0)
+        return PIVCO_ERR_CORRUPT;
 
     *consumed = (size_t)(ptr - in);
     return PIVCO_OK;

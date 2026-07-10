@@ -121,8 +121,8 @@ static inline void merge_neon_16B(uint8_t *dest, const uint8_t *l_list,
                                   const uint8_t *r_list, intptr_t mask,
                                   const int8_t *tab0, const int8_t *tab1)
 {
-    int8x16_t shuf0 = vld1q_s8(&tab0[(mask << 4) & 0xff0]);
-    int8x16_t shuf1 = vld1q_s8(&tab1[(mask >> 4) & 0xff0]);
+    int8x16_t shuf0 = vld1q_s8(&tab0[((uintptr_t)mask << 4) & 0xff0]);
+    int8x16_t shuf1 = vld1q_s8(&tab1[((uintptr_t)mask >> 4) & 0xff0]);
     uint8x16_t shuf = vreinterpretq_u8_s8(vabdq_s8(shuf0, shuf1));
     uint8x16x2_t src;
     src.val[0] = vld1q_u8(r_list);
@@ -225,8 +225,8 @@ static inline void merge_cst_vec_neon(const uint8_t *bm, int K,
         uint64_t pfx = vget_lane_u64(vreinterpret_u64_u8(pop8), 0) * 0x0101010101010101ull;
         intptr_t p0 = (pfx >> 8) & 0xff, p1 = (pfx >> 24) & 0xff, p2 = (pfx >> 40) & 0xff, p3 = pfx >> 56;
 #define _MCV(off, rd, mk) do {                                                   \
-        int8x16_t s0 = vld1q_s8(&g_merge_shuf0[(((intptr_t)(mk)) << 4) & 0xff0]); \
-        int8x16_t s1 = vld1q_s8(&g_merge_shuf1[(((intptr_t)(mk)) >> 4) & 0xff0]); \
+        int8x16_t s0 = vld1q_s8(&g_merge_shuf0[(((uintptr_t)(mk)) << 4) & 0xff0]); \
+        int8x16_t s1 = vld1q_s8(&g_merge_shuf1[(((uintptr_t)(mk)) >> 4) & 0xff0]); \
         uint8x16_t sh = vreinterpretq_u8_s8(vabdq_s8(s0, s1));                    \
         uint8x16x2_t src; src.val[0] = vld1q_u8(rd); src.val[1] = Lb;            \
         vst1q_u8(out + i + (off), vqtbl2q_u8(src, sh));                          \
