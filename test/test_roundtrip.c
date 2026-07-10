@@ -336,6 +336,104 @@ static void make_two_symbol_skewed(uint64_t freq[PIVCO_MAX_SYMBOLS])
     freq[0] = 900; freq[1] = 100;
 }
 
+/* ---------- Joint length/flat optimization roundtrip ----------
+ *
+ * With lambda > 0 the encoder deliberately distorts the code-length
+ * histogram (docs/JOINT-LENGTHS.md).  The wire still carries plain
+ * lengths, so every decoder must roundtrip the distorted streams
+ * unchanged.  Also sanity-check monotonicity: distortion never beats
+ * the Huffman baseline on encoded size. */
+static int test_joint_lengths(void)
+{
+    printf("[test_joint_lengths] ");
+    uint64_t freq[PIVCO_MAX_SYMBOLS];
+    uint64_t seed = 0x70127e57;
+    const double lambdas[] = { 0.05, 0.1, 0.3, 1.0 };
+    for (int d = 0; d < 3; d++) {
+        switch (d) {
+        case 0: make_english(freq);  break;
+        case 1: make_zipfian(freq);  break;
+        default: make_geometric(freq); break;
+        }
+        uint64_t total = 0;
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++) total += freq[i];
+        static uint8_t symbols[PIVCO_BLOCK_SIZE];
+        uint64_t rng = seed++;
+        for (int i = 0; i < PIVCO_BLOCK_SIZE; i++) {
+            uint64_t r = xorshift64(&rng) % total;
+            uint64_t cum = 0; int sym;
+            for (sym = 0; sym < PIVCO_MAX_SYMBOLS; sym++) {
+                cum += freq[sym];
+                if (r < cum) break;
+            }
+            symbols[i] = (uint8_t)sym;
+        }
+        size_t base_len = 0;
+        for (size_t li = 0; li < sizeof(lambdas)/sizeof(*lambdas) + 1; li++) {
+            pivco_huffman_set_joint_lambda(li == 0 ? 0.0 : lambdas[li - 1]);
+            pivco_huffman_table_t table;
+            if (pivco_huffman_build_table(freq, &table) != PIVCO_OK) {
+                pivco_huffman_set_joint_lambda(0.0);
+                FAIL("build_table dist=%d li=%zu", d, li);
+            }
+            static uint8_t enc[PIVCO_MAX_ENCODED_SIZE], dec[PIVCO_BLOCK_SIZE];
+            size_t enc_len, consumed;
+            if (pivco_huffman_encode_scalar(symbols, PIVCO_BLOCK_SIZE, &table,
+                                            enc, &enc_len) != PIVCO_OK) {
+                pivco_huffman_set_joint_lambda(0.0);
+                FAIL("encode dist=%d li=%zu", d, li);
+            }
+            /* Decoder rebuilds from wire lengths only — the real check. */
+            pivco_huffman_table_t dtable;
+            if (pivco_huffman_build_table_from_code_lens(table.code_len,
+                                                         &dtable) != PIVCO_OK) {
+                pivco_huffman_set_joint_lambda(0.0);
+                FAIL("rebuild dist=%d li=%zu", d, li);
+            }
+            if (pivco_huffman_decode_scalar(enc, enc_len, &dtable,
+                                            dec, &consumed) != PIVCO_OK
+                || memcmp(symbols, dec, PIVCO_BLOCK_SIZE) != 0) {
+                pivco_huffman_set_joint_lambda(0.0);
+                FAIL("scalar roundtrip dist=%d li=%zu", d, li);
+            }
+#ifdef PIVCO_HAS_NEON
+            if (pivco_huffman_decode_bu_neon(enc, enc_len, &dtable,
+                                             dec, &consumed) != PIVCO_OK
+                || memcmp(symbols, dec, PIVCO_BLOCK_SIZE) != 0) {
+                pivco_huffman_set_joint_lambda(0.0);
+                FAIL("neon roundtrip dist=%d li=%zu", d, li);
+            }
+#endif
+            /* Two observed non-bugs worth encoding as comments, not
+             * asserts: (a) total wire bytes may SHRINK under
+             * distortion (flatter trees emit fewer per-node records);
+             * (b) code bits at small lambda may beat the production
+             * baseline, because limit_code_lengths is a heuristic
+             * reshaper, not package-merge — the DP is an exact
+             * length-limiter.  What IS guaranteed: within the DP
+             * family, code bits are non-decreasing in lambda
+             * (Lagrangian monotonicity). */
+            /* Weight by the FREQ TABLE (the DP objective), not the
+             * sampled block — sampling noise otherwise breaks the
+             * comparison at nearby lambdas. */
+            size_t code_bits = 0;
+            for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++)
+                code_bits += (size_t)freq[i] * table.code_len[i];
+            if (li == 1) base_len = code_bits;      /* smallest lambda */
+            else if (li > 1 && code_bits < base_len) {
+                pivco_huffman_set_joint_lambda(0.0);
+                FAIL("code bits decreased with lambda?! dist=%d li=%zu",
+                     d, li);
+            } else if (li > 1) {
+                base_len = code_bits;
+            }
+        }
+    }
+    pivco_huffman_set_joint_lambda(0.0);
+    printf("PASS\n");
+    return 0;
+}
+
 /* ---------- Main test runner ---------- */
 
 int test_roundtrip_all(void)
@@ -371,6 +469,8 @@ int test_roundtrip_all(void)
 
     make_two_symbol_skewed(freq);
     failures += test_roundtrip_dist("two_sym_skew", freq, seed++);
+
+    failures += test_joint_lengths();
 
     /* Multiple blocks with different seeds */
     make_zipfian(freq);

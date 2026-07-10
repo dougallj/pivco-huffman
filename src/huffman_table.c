@@ -542,6 +542,13 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
     if (max_len > PIVCO_MAX_CODE_LEN)
         limit_code_lengths(lengths, PIVCO_MAX_SYMBOLS, PIVCO_MAX_CODE_LEN);
 
+    /* Optional joint length/flat-shape optimization (encoder-side only;
+     * the decoder rebuilds identically from the transmitted lengths).
+     * No-op unless pivco_huffman_set_joint_lambda(>0) was called; on
+     * any internal failure the Huffman lengths above are kept. */
+    if (pivco_huffman_get_joint_lambda() > 0.0)
+        (void)pivco_joint_optimize_lengths(freq, lengths);
+
     return build_table_finish(lengths, table);
 }
 
