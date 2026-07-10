@@ -64,3 +64,38 @@ sao.lits       0.9729      8597      4175        7.6      1.93x      0/240
 webster.lits   0.6718      8871      3359        8.3      1.71x      0/177
 x-ray.lits     0.8524      8054      3738       13.4      3.06x      0/296
 xml.lits       0.6973     10276      4204        8.7      2.36x      0/12
+
+== G=64K lambda=0.1 fse=0 (PH)
+G=64K lambda=0.10 reps=6 fse=0 (PH)
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6576      4336      1566      127.2      3.08x     11/11
+mozilla.lits   0.9518     12224      4965      186.0     14.11x    139/173
+mr.lits        0.8014      9490      4579      115.5      8.40x     18/25
+nci.lits       0.5250     14261      5131       38.8      3.07x     13/13
+ooffice.lits   0.9282     11005      5177       87.5      6.99x     27/27
+osdb.lits      0.8962     12178      5332       84.4      7.00x     32/32
+reymont.lits   0.7047     15544      6116       53.7      5.28x      3/6
+samba.lits     0.8982     22877      7750       75.0      9.04x     32/37
+sao.lits       0.9782      8971      4215       84.4      5.45x     12/60
+webster.lits   0.6671     12968      4960       39.6      3.05x     45/45
+x-ray.lits     0.8498      9935      4473      108.1      7.38x     67/74
+xml.lits       0.7158     14228      5440       49.0      4.32x      3/3
+
+== G=64K lambda=0 fse=0 (PH baseline)
+G=64K lambda=0.00 reps=6 fse=0 (PH)
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6572      4284      1769       58.5      1.60x      0/11
+mozilla.lits   0.9504      8120      2996       47.2      2.16x      0/173
+mr.lits        0.8010      8120      3842       39.8      2.42x      0/25
+nci.lits       0.5248     10017      4598       29.8      2.12x      0/13
+ooffice.lits   0.9249      7882      3514       22.1      1.20x      0/27
+osdb.lits      0.8914      8909      3811       20.3      1.21x      0/32
+reymont.lits   0.7041     11658      5110       24.2      1.99x      0/6
+samba.lits     0.8976     10124      4593       22.8      1.63x      0/37
+sao.lits       0.9782      8578      4197       18.8      1.21x      0/60
+webster.lits   0.6671      8286      3501       22.5      1.23x      0/45
+x-ray.lits     0.8477      8462      4130       42.1      2.66x      0/74
+xml.lits       0.7148      9735      4301       25.7      1.79x      0/3
+
+# NB: M4-mini batch thermal drift up to ~2x on late files (dickens standalone PH: 6238 dec);
+# use for build-us and coarse deltas only.

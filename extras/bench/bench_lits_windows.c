@@ -12,7 +12,8 @@
  *   - table-build us/window and its share of total encode wall
  *   - windows where the joint DP's result was adopted vs kept
  *
- * Usage: bench_lits_windows [--G=KB] [--joint=L] [--reps=N] file...
+ * Usage: bench_lits_windows [--G=KB] [--joint=L] [--reps=N] [--fse=0|1] file...
+ * --fse=0 benches PH (no per-node FSE attempt); default 1 = PHA.
  */
 #include "pivco_huffman.h"
 #include <stdio.h>
@@ -39,15 +40,18 @@ int main(int argc, char **argv)
 {
     size_t G = 64 * 1024;
     double lam = 0.0;
-    int reps = 6;
+    int reps = 6, fse = 1;
     int argi = 1;
     for (; argi < argc && argv[argi][0] == '-'; argi++) {
         if (!strncmp(argv[argi], "--G=", 4)) G = (size_t)atoi(argv[argi] + 4) * 1024;
         else if (!strncmp(argv[argi], "--joint=", 8)) lam = atof(argv[argi] + 8);
         else if (!strncmp(argv[argi], "--reps=", 7)) reps = atoi(argv[argi] + 7);
+        else if (!strncmp(argv[argi], "--fse=", 6)) fse = atoi(argv[argi] + 6);
     }
     pivco_huffman_set_joint_lambda(lam);
-    printf("G=%zuK lambda=%.2f reps=%d\n", G / 1024, lam, reps);
+    pivco_huffman_set_fse_enabled(fse);
+    printf("G=%zuK lambda=%.2f reps=%d fse=%d (%s)\n", G / 1024, lam, reps,
+           fse, fse ? "PHA" : "PH");
     printf("%-12s %9s %9s %9s %10s %10s %9s\n",
            "file", "ratio", "dec MB/s", "enc MB/s", "build us/w", "build:enc", "adopted");
 

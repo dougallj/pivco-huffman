@@ -239,7 +239,36 @@ build time / the window's own encode time):
 The joint DP's incremental cost over the plain Huffman build is now
 8-124 us/window on M4 (0.3-2.3x the baseline build itself).  Decode /
 encode / ratio are unchanged from the table above — the DP returns
-identical optima, only faster.  Route 3 (greedy-carry heuristic with
-the DP as offline referee) remains open if a further ~3-10x is ever
-needed; the sweeps are compute-bound at ~0.4 ns/cell NEON, so only
-fewer states — an inexact search — buys much more.
+identical optima, only faster.
+
+## Route 3 (heuristic) evaluation: deferred
+
+What any heuristic could still buy is bounded by the all-in ENCODE
+throughput (G / (encode + table build) per window; decode and ratio
+gain nothing).  At G = 64 K on M4, joint all-in currently runs at
+0.42-0.90x of baseline all-in; replacing the DP with a FREE solver of
+equal quality would reach 1.06-1.19x of baseline (joint lengths speed
+encoding up too), i.e. a ceiling of 1.2-3.0x over today — at which
+point the plain Huffman table build (8-55 us/window) is the equal
+bottleneck.  Against that ceiling a greedy-carry heuristic brings
+approximation risk exactly where the model is known to be thin
+(kappa/condition (M), the geometric case) and a second solver to
+maintain.  Deferred; better first moves if encode-side cost matters:
+shave the generic build_table (shared by baseline), or amortize the
+joint solve across windows by re-running it only on histogram drift.
+The sweeps themselves are compute-bound at ~0.4 ns/cell NEON with
+89 % state density, so only an inexact search could go much below
+the current cost.
+
+## PH vs PHA on this workload
+
+The per-window tables above are PHA (per-node FSE on).
+`bench_lits_windows --fse=0` benches PH: on skewed/low-entropy files
+FSE-decode of the bitmap regions is pure overhead, so PH is
+substantially faster — samba +45 %, nci +29 %, mr +18 %, xml +15 %
+decode at G = 64 K — for 0-0.4 pp of ratio; english-like files
+(dickens, webster) show parity.  Caveat on M4-mini batch numbers:
+files late in a hot batch throttle-drift by up to ~2x (dickens
+standalone: 6.2-6.4 GB/s; in-batch: 2.3-4.3 GB/s), so cross-file
+comparisons within one batch are indicative only — the M1 solve-time
+A/Bs and same-binary deltas are the load-bearing measurements.
