@@ -105,6 +105,39 @@ typedef enum {
     PIVCO_NODE_LEAF,               /* leaf — consumed by the parent merge, never dispatched */
 } pivco_node_type_t;
 
+/* ---------- Pre-order walk schedule ----------
+ *
+ * The execution form of the implicit rank-range tree (issue #7): one
+ * record per VISIBLE internal node of the codec walk, in pre-order.
+ * Leaves emit no record (parents consume their symbols via cst merges),
+ * and nodes buried inside flat subtrees don't exist.  The wire supplies
+ * all child sizes (K_right), so the walk needs no random access — a
+ * single cursor streams the program.  A child subtree that receives 0
+ * elements touches neither the wire nor its records; the caller jumps
+ * the cursor by that child's `skip`.
+ *
+ *   kd     kind in the low 2 bits; for FLAT, the subtree depth D in the
+ *          high bits (kd >> 2).
+ *   param  FULL: thr (max rank of the left subtree, the partition
+ *          threshold).  Otherwise rank_begin — the flat c2s slice base
+ *          for FLAT (symbols are rank_to_sym[param..]), the leaf
+ *          symbol(s) rank_to_sym[param] (+ [param+1] for PAIR), and
+ *          numerically == thr for PAIR / LEAF_LEFT.
+ *   skip   record count of this node's subtree including itself.
+ */
+typedef enum {
+    PIVCO_SCHED_FULL      = 0,  /* both children internal — K_right header */
+    PIVCO_SCHED_FLAT      = 1,  /* flat subtree, D = kd >> 2 — no header  */
+    PIVCO_SCHED_PAIR      = 2,  /* both children leaves — no K_right      */
+    PIVCO_SCHED_LEAF_LEFT = 3,  /* left child lone leaf — K_right header  */
+} pivco_sched_kind_t;
+
+typedef struct {
+    uint8_t kd;     /* kind | (flat D << 2) */
+    uint8_t param;  /* rank_begin or thr — see kind */
+    uint8_t skip;   /* subtree record count incl. self (<= 255) */
+} pivco_sched_rec_t;
+
 /* ---------- Huffman table ---------- */
 
 /* Arch-specific precomputed gather tables for prim_enc_init.  Every pointer is
@@ -127,6 +160,37 @@ typedef struct {
      * and a flat subtree's local code is `rank - flat_base_rank`.  Filled by
      * pivco_huffman_build_table; byte-identical wire output. */
     uint8_t  sym_to_rank[PIVCO_MAX_SYMBOLS];        /* in-order leaf rank per symbol */
+
+    /* Rank-range tree (issue #7, terrelln's implicit-tree construction).
+     * Ranks are leaves in MSB-aligned-codeword order, so every subtree is a
+     * contiguous rank range [rank_begin, rank_end) and the root is
+     * [0, num_ranks).  rank_to_sym carries all symbol content; the tree
+     * SHAPE exists in two renderings.  tree[]/node_type[]/flat_*[] below
+     * are kept for analysis tools and tests only.
+     *
+     * Execution form (what the codec streams, hot):
+     *   sched[]     pre-order walk program, one 3-byte record per visible
+     *               internal node — see pivco_sched_rec_t.  Built once per
+     *               table by the schedule walk in huffman_table.c.
+     *
+     * Canonical form (source of truth; build/verify time only):
+     *   leaf test   (1 << rank_to_flat_depth[rank_begin]) == rank_end - rank_begin
+     *               (flat depth 0 = single-symbol leaf, D >= 2 = flat subtree
+     *               whose 2^D symbols are rank_to_sym[rank_begin ..])
+     *   split       at tree level L the range's codewords read 0..0 1..1 at
+     *               bit L; a lazy linear scan of rank_to_codeword finds the
+     *               left/right boundary.  The schedule walk evaluates each
+     *               node's split exactly once, at build time.
+     *
+     * Degenerate single-symbol tables get TWO ranks of the same symbol
+     * (mirroring the fabricated root pair in tree[]), so num_ranks ==
+     * num_symbols except there, and the walk needs no special case. */
+    uint8_t  rank_to_sym[PIVCO_MAX_SYMBOLS];        /* rank -> symbol (in-order) */
+    pivco_sched_rec_t sched[PIVCO_MAX_SYMBOLS - 1]; /* pre-order walk program */
+    uint16_t sched_len;
+    uint16_t num_ranks;
+    uint8_t  rank_to_flat_depth[PIVCO_MAX_SYMBOLS]; /* leaf's flat depth at its first rank */
+    uint16_t rank_to_codeword[PIVCO_MAX_SYMBOLS];   /* MSB-aligned canonical-order codeword */
 #if defined(__x86_64__) || defined(__i386__)
     /* Backing storage for enc_init_aux — the x86 2tab merge hi table (sym_to_rank
      * << 8).  Other arches don't allocate it.  Filled by pivco_huffman_build_table. */
@@ -139,7 +203,9 @@ typedef struct {
     uint8_t  split_rank[PIVCO_MAX_TREE_NODES];      /* max rank in node's left subtree */
     uint8_t  flat_base_rank[PIVCO_MAX_TREE_NODES];  /* min rank in a flat subtree */
 
-    /* Tree for PIVCO tree-walk encode/decode */
+    /* Explicit tree.  No longer read by the production codec (which walks
+     * the rank-range arrays above); retained for analysis tools, tests and
+     * the retired SVE/extras decoders. */
     pivco_tree_node_t tree[PIVCO_MAX_TREE_NODES];
     int16_t tree_root;
     int16_t tree_node_count;

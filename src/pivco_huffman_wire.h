@@ -73,15 +73,26 @@ static inline int wire_read_block_n(const uint8_t **in_ptr)
  *
  * The encoder reserves the header slot(s) BEFORE knowing n_right, then
  * commits the value afterwards.  Returns pointer to where the K_right
- * uint16 should be written (NULL if no header was reserved). */
+ * uint16 should be written (NULL if no header was reserved).
+ *
+ * A K_right header exists iff the node recurses into at least one
+ * non-leaf child.  The rank-range walk knows that at dispatch time
+ * (internal node with range length > 2), so the production codec calls
+ * the unconditional wire_reserve_kr / wire_read_kr; the *_header
+ * variants keyed on the explicit tree remain for legacy decoders. */
+static inline uint8_t *wire_reserve_kr(uint8_t **out_ptr)
+{
+    uint8_t *slot = *out_ptr;
+    *out_ptr += KR_HEADER_BYTES;
+    return slot;
+}
+
 static inline uint8_t *wire_reserve_kr_header(const pivco_huffman_table_t *table,
                                                int16_t node_id,
                                                uint8_t **out_ptr)
 {
     if (!kr_header_needed(table, node_id)) return NULL;
-    uint8_t *slot = *out_ptr;
-    *out_ptr += KR_HEADER_BYTES;
-    return slot;
+    return wire_reserve_kr(out_ptr);
 }
 
 /* Write the K_right value into a previously-reserved slot.  No-op if
@@ -105,6 +116,18 @@ static inline void wire_commit_kr_header(uint8_t *slot, int n_right)
 
 /* ---------- Decode side ---------- */
 
+/* Read the K_right header (unconditional form; see the reserve-side
+ * note for when a header is present). */
+static inline int wire_read_kr(const uint8_t **in_ptr)
+{
+    PROF_TIC();
+    uint16_t v;
+    memcpy(&v, *in_ptr, 2);
+    *in_ptr += KR_HEADER_BYTES;
+    PROF_TOC(PROF_WIRE_KR, 1);
+    return (int)v;
+}
+
 /* Skip the K_right header bytes, returning the value as an int.  If no
  * header is present for this node, returns -1.  (Top-down decoders
  * don't use the value; bottom-up ones do.) */
@@ -113,12 +136,7 @@ static inline int wire_read_kr_header(const pivco_huffman_table_t *table,
                                        const uint8_t **in_ptr)
 {
     if (!kr_header_needed(table, node_id)) return -1;
-    PROF_TIC();
-    uint16_t v;
-    memcpy(&v, *in_ptr, 2);
-    *in_ptr += KR_HEADER_BYTES;
-    PROF_TOC(PROF_WIRE_KR, 1);
-    return (int)v;
+    return wire_read_kr(in_ptr);
 }
 
 /* Read the per-node bitmap body (marker + payload).  Returns a pointer

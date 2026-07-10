@@ -261,6 +261,19 @@ static void build_single_symbol_table(int sym, pivco_huffman_table_t *table)
     table->node_type[0] = PIVCO_NODE_BOTH_LEAVES;
     table->node_type[1] = PIVCO_NODE_LEAF;
     table->node_type[2] = PIVCO_NODE_LEAF;
+    /* Rank-range mirror of the fabricated pair: two ranks, same symbol,
+     * codewords 0/1 at length 1.  The rank walk then needs no degenerate
+     * special case (root range [0,2) is a plain both-leaves node). */
+    table->rank_to_sym[0] = (uint8_t)sym;
+    table->rank_to_sym[1] = (uint8_t)sym;
+    table->rank_to_codeword[0] = 0x0000;
+    table->rank_to_codeword[1] = 0x8000;
+    table->num_ranks = 2;
+    /* Walk schedule: a single PAIR record (thr == rank_begin == 0). */
+    table->sched[0].kd    = (uint8_t)PIVCO_SCHED_PAIR;
+    table->sched[0].param = 0;
+    table->sched[0].skip  = 1;
+    table->sched_len = 1;
     fill_enc_init_aux(table);   /* sym_to_rank is all-zero (rank 0) here; aux must not stay NULL */
 }
 
@@ -329,6 +342,68 @@ static uint16_t assign_inorder_ranks(pivco_huffman_table_t *table,
     rank = assign_inorder_ranks(table, n->left, rank);
     table->split_rank[id] = (uint8_t)(rank - 1); /* max rank of the left subtree */
     return assign_inorder_ranks(table, n->right, rank);
+}
+
+/* ---------- Pre-order walk schedule (issue #7 execution form) ----------
+ *
+ * Renders the implicit rank-range tree into sched[]: one 3-byte record
+ * per visible internal node in pre-order, which is all the codec walk
+ * reads at runtime (see pivco_sched_rec_t in pivco_huffman.h).  Built by
+ * one recursion over the rank ranges, evaluating each node's split
+ * exactly once — the splits are a pure function of the table, so
+ * computing them here (instead of lazily per block, as the canonical
+ * form allows) amortizes them across every block the table encodes or
+ * decodes.  Returns the record count of the subtree (== the root
+ * record's skip). */
+
+/* First rank of the right child: linear scan for the first codeword with
+ * bit `level` set.  Runs once per node per table build — total work is
+ * O(sum of leaf depths) <= 256 * PIVCO_MAX_CODE_LEN — so plain scalar. */
+static unsigned sched_split_rank(const pivco_huffman_table_t *table,
+                                 int level,
+                                 unsigned rank_begin, unsigned rank_end)
+{
+    const uint16_t mask = (uint16_t)(0x8000u >> level);
+    unsigned r = rank_begin + 1;
+    while (r < rank_end && (table->rank_to_codeword[r] & mask) == 0)
+        r++;
+    PIVCO_CHECK(r < rank_end);
+    return r;
+}
+
+static uint8_t build_walk_schedule(pivco_huffman_table_t *table,
+                                   unsigned rank_begin, unsigned rank_end,
+                                   int level)
+{
+    unsigned range_len = rank_end - rank_begin;
+    if (range_len == 1) return 0;               /* leaf — no record */
+
+    PIVCO_CHECK(table->sched_len < PIVCO_MAX_SYMBOLS - 1);
+    pivco_sched_rec_t *rec = &table->sched[table->sched_len++];
+    unsigned cnt = 1;
+
+    unsigned D = table->rank_to_flat_depth[rank_begin];
+    if ((1u << D) == range_len) {               /* flat subtree (D >= 2) */
+        rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (D << 2));
+        rec->param = (uint8_t)rank_begin;
+    } else if (range_len == 2) {                /* both children leaves */
+        rec->kd    = (uint8_t)PIVCO_SCHED_PAIR;
+        rec->param = (uint8_t)rank_begin;       /* == thr */
+    } else {
+        unsigned split = sched_split_rank(table, level, rank_begin, rank_end);
+        if (split == rank_begin + 1) {          /* lone left leaf */
+            rec->kd    = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
+            rec->param = (uint8_t)rank_begin;   /* == thr; sym = rank_to_sym[param] */
+            cnt += build_walk_schedule(table, split, rank_end, level + 1);
+        } else {                                /* both children internal */
+            rec->kd    = (uint8_t)PIVCO_SCHED_FULL;
+            rec->param = (uint8_t)(split - 1);  /* thr */
+            cnt += build_walk_schedule(table, rank_begin, split, level + 1);
+            cnt += build_walk_schedule(table, split, rank_end, level + 1);
+        }
+    }
+    rec->skip = (uint8_t)cnt;
+    return (uint8_t)cnt;
 }
 
 static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
@@ -540,21 +615,36 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
     }
 
 
+    /* The code-assignment loops below also fill the rank-range arrays
+       (rank_to_sym / rank_to_flat_depth / rank_to_codeword) that the
+       production codec walks: once chunks are in code-assignment order,
+       their MSB-aligned codewords are strictly increasing, so chunk
+       iteration order IS rank order -- the same in-order-leaf order
+       assign_inorder_ranks derives by recursing over the explicit tree. */
+
     /* For CANONICAL_FLAT, chunks already carry canonical root_codes; assign
        symbol codes directly from them and skip the depth-sort + sequential
        reassign step (sequential reassign would clobber the canonical
        prefixes when chunks span multiple depths).  All other modes use
        the standard pipeline. */
     if (tree_mode == PIVCO_TREE_MODE_CANONICAL_FLAT) {
+        unsigned rank = 0;
         for (int ci = 0; ci < n_chunks; ci++) {
             int bit = chunks[ci].bit;
             int n   = chunks[ci].n_syms;
+            int L   = chunks[ci].L;
             uint16_t root = chunks[ci].root_code;
             for (int i = 0; i < n; i++) {
                 uint8_t sym = flat_items[chunks[ci].sym_idx + i].sym;
-                table->code[sym] = (uint16_t)(((uint32_t)root << bit) | (uint32_t)i);
+                uint16_t c16 = (uint16_t)(((uint32_t)root << bit) | (uint32_t)i);
+                table->code[sym] = c16;
+                table->rank_to_sym[rank]        = sym;
+                table->rank_to_flat_depth[rank] = (uint8_t)(bit >= 2 ? bit : 0);
+                table->rank_to_codeword[rank]   = (uint16_t)(c16 << (16 - L));
+                rank++;
             }
         }
+        table->num_ranks = (uint16_t)rank;
     } else {
         /* Sort chunks by depth asc (stable; ties keep their natural order
            which is L asc by length, larger-bit-first within length). */
@@ -575,19 +665,27 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         {
             uint32_t code = 0;
             int prev_depth = 0;
+            unsigned rank = 0;
             for (int ci = 0; ci < n_chunks; ci++) {
                 int d = chunks[ci].depth;
                 if (d > prev_depth) code <<= (d - prev_depth);
                 chunks[ci].root_code = (uint16_t)code;
                 int bit = chunks[ci].bit;
                 int n   = chunks[ci].n_syms;
+                int L   = chunks[ci].L;
                 for (int i = 0; i < n; i++) {
                     uint8_t sym = flat_items[chunks[ci].sym_idx + i].sym;
-                    table->code[sym] = (uint16_t)((code << bit) | (uint32_t)i);
+                    uint16_t c16 = (uint16_t)((code << bit) | (uint32_t)i);
+                    table->code[sym] = c16;
+                    table->rank_to_sym[rank]        = sym;
+                    table->rank_to_flat_depth[rank] = (uint8_t)(bit >= 2 ? bit : 0);
+                    table->rank_to_codeword[rank]   = (uint16_t)(c16 << (16 - L));
+                    rank++;
                 }
                 code += 1;
                 prev_depth = d;
             }
+            table->num_ranks = (uint16_t)rank;
         }
 
     }
@@ -767,6 +865,16 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
     /* partbyrank: one in-order pass assigns every leaf its rank and every
      * internal node its split_rank / flat_base_rank (see assign_inorder_ranks). */
     assign_inorder_ranks(table, table->tree_root, 0);
+
+    /* The rank-range arrays were filled in chunk order during code
+     * assignment; the tree recursion above must agree on every rank. */
+    for (unsigned r = 0; r < table->num_ranks; r++)
+        PIVCO_CHECK_DEBUG(table->sym_to_rank[table->rank_to_sym[r]] == r);
+
+    /* Pre-order walk schedule: render the rank-range tree into the
+     * program the codec streams (see build_walk_schedule above). */
+    table->sched_len = 0;
+    build_walk_schedule(table, 0, table->num_ranks, 0);
 
     fill_enc_init_aux(table);   /* x86 2tab/4tab gather tables (or NULL elsewhere) */
 
