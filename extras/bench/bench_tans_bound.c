@@ -122,6 +122,7 @@ static void analyze_freq(const uint64_t freq[256],
         *flat_share = 0.0;
         return;
     }
+    pivco_huffman_build_explicit_tree(tbl);
 
     double huf_bits = 0.0;
     for (int s = 0; s < 256; s++)
@@ -400,6 +401,7 @@ static int run_exact_tier_mode(int main_only)
         if (n_syms < 2 || total_freq == 0) continue;
 
         if (pivco_huffman_build_table(freq, tbl) != PIVCO_OK) continue;
+        pivco_huffman_build_explicit_tree(tbl);
 
         /* Scale so one logical "block" is 8192 symbols. */
         double scale = (double)PIVCO_BLOCK_SIZE / (double)total_freq;
@@ -537,6 +539,7 @@ static int run_verify_dist_mode(int main_only)
         if (n_syms < 2) continue;
 
         if (pivco_huffman_build_table(freq_true, tbl) != PIVCO_OK) continue;
+        pivco_huffman_build_explicit_tree(tbl);
 
         depth_bucket_t depth_stats[MAX_DEPTH_BUCKETS] = {{0}};
         double flat_bits = 0.0;
@@ -680,6 +683,7 @@ int main(int argc, char **argv)
                         n_blocks, path);
                 break;
             }
+            pivco_huffman_build_explicit_tree(tbl);
 
             for (int s = 0; s < 256; s++)
                 if (freq[s]) total_huf_bits += (double)freq[s] * tbl->code_len[s];

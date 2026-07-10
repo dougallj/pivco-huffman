@@ -291,6 +291,7 @@ int main(int argc, char **argv)
             printf("  %-22s  build_table failed\n", name);
             continue;
         }
+        pivco_huffman_build_explicit_tree(&table_storage);
         const pivco_huffman_table_t *table = &table_storage;
 
         /* Weighted Huffman avg code length from leaf depths in the table.

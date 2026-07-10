@@ -158,6 +158,7 @@ static void analyze_dist(int dist_idx, int blocks)
     if (pivco_huffman_build_table(freq, &table) != PIVCO_OK) {
         printf("%-13s | build_table failed\n", name); return;
     }
+    pivco_huffman_build_explicit_tree(&table);
 
     stats_t s = {0};
     s.kr_slots    = count_kr_slots(&table, table.tree_root);

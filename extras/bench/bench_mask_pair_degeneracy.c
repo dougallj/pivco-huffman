@@ -142,6 +142,7 @@ static void run_dist(int idx, int n_blocks)
         printf("%-15s  build_table failed\n", name);
         return;
     }
+    pivco_huffman_build_explicit_tree(&t);
 
     /* Set up codes/lens lookup the encoder uses. */
     static uint16_t codes[PIVCO_MAX_SYMBOLS];

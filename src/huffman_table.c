@@ -211,10 +211,11 @@ static void limit_code_lengths(uint8_t *lengths, int n_symbols, int max_len)
 /* ---------- Canonical Huffman code assignment ---------- */
 
 /* Builds everything downstream of the code lengths (canonical assignment,
- * tree, flat-subtree detection, aux tables).  Shared by the encode path
- * (after the min-heap derives lengths from frequencies) and the decode path
- * (lengths come straight off the wire -- no heap needed).  Assumes `table` is
- * already zeroed and table->num_symbols is set; caller handles n_used <= 1. */
+ * rank arrays, walk schedule, aux tables).  Shared by the encode path
+ * (after the two-queue derives lengths from frequencies) and the decode path
+ * (lengths come straight off the wire).  The explicit tree is NOT built --
+ * see pivco_huffman_build_explicit_tree.  Assumes `table` is already zeroed
+ * and table->num_symbols is set; caller handles n_used <= 1. */
 static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                               pivco_huffman_table_t *table);
 
@@ -233,7 +234,9 @@ static void fill_enc_init_aux(pivco_huffman_table_t *table)
 #endif
 }
 
-/* Single-symbol degenerate tree: root -> two leaves of the same symbol.
+/* Single-symbol degenerate table: a fabricated pair of two ranks holding
+ * the same symbol (codewords 0/1 at length 1), so the walk needs no
+ * degenerate special case — root range [0,2) is a plain both-leaves node.
  * Assumes `table` is zeroed. */
 static void build_single_symbol_table(int sym, pivco_huffman_table_t *table)
 {
@@ -245,25 +248,6 @@ static void build_single_symbol_table(int sym, pivco_huffman_table_t *table)
     table->first_code[1] = 0;
     table->first_sym_idx[1] = 0;
     table->sorted_symbols[0] = (uint8_t)sym;
-    table->tree[0].symbol = -1;
-    table->tree[0].left = 1;
-    table->tree[0].right = 2;
-    table->tree[1].symbol = (int16_t)sym;
-    table->tree[1].left = -1;
-    table->tree[1].right = -1;
-    table->tree[2].symbol = (int16_t)sym; /* both children = same symbol */
-    table->tree[2].left = -1;
-    table->tree[2].right = -1;
-    table->tree_root = 0;
-    table->tree_node_count = 3;
-    /* node 0 (root): both children leaves -> BOTH_LEAVES (the decode
-     * entry's root fast path handles it); nodes 1, 2: LEAF. */
-    table->node_type[0] = PIVCO_NODE_BOTH_LEAVES;
-    table->node_type[1] = PIVCO_NODE_LEAF;
-    table->node_type[2] = PIVCO_NODE_LEAF;
-    /* Rank-range mirror of the fabricated pair: two ranks, same symbol,
-     * codewords 0/1 at length 1.  The rank walk then needs no degenerate
-     * special case (root range [0,2) is a plain both-leaves node). */
     table->rank_to_sym[0] = (uint8_t)sym;
     table->rank_to_sym[1] = (uint8_t)sym;
     table->rank_to_codeword[0] = 0x0000;
@@ -282,7 +266,9 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
 {
     if (!freq || !table) return PIVCO_ERR_NULL;
 
-    memset(table, 0, sizeof(*table));
+    /* Clear only the build-owned head; the on-demand tail (decode tables
+     * + explicit tree) is left undefined -- see the table struct doc. */
+    memset(table, 0, offsetof(pivco_huffman_table_t, decode_sym));
 
     /* Count symbols with nonzero frequency */
     int n_used = 0;
@@ -311,37 +297,6 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
     limit_code_lengths(lengths, PIVCO_MAX_SYMBOLS, PIVCO_MAX_CODE_LEN);
 
     return build_table_finish(lengths, table);
-}
-
-/* partbyrank: assign each leaf its in-order rank (left-to-right leaf
- * position) in a single in-order pass, returning the next free rank.  A
- * subtree's leaves are a contiguous rank range, so routing by code-bit is
- * equivalent to routing by `rank > split_rank`.  Per node, everything is known
- * once its left subtree has been visited:
- *   flat_base_rank[node] = rank on enter  (min rank of the subtree)
- *   split_rank[node]     = rank after left - 1  (max rank of the left subtree)
- * A flat subtree's leaves are enumerated in code order (== in-order) via
- * flat_code_to_sym, not the tree structure, so it does not recurse. */
-static uint16_t assign_inorder_ranks(pivco_huffman_table_t *table,
-                                     int16_t id, uint16_t rank)
-{
-    const pivco_tree_node_t *n = &table->tree[id];
-    if (n->symbol >= 0) {                       /* leaf */
-        table->sym_to_rank[n->symbol] = (uint8_t)rank;
-        return (uint16_t)(rank + 1);
-    }
-    if (table->flat_depth[id] >= 2) {           /* flat subtree */
-        table->flat_base_rank[id] = (uint8_t)rank;
-        int cnt = 1 << table->flat_depth[id];
-        for (int i = 0; i < cnt; i++) {
-            uint8_t sym = table->flat_code_to_sym[table->flat_offset[id] + i];
-            table->sym_to_rank[sym] = (uint8_t)(rank + i);
-        }
-        return (uint16_t)(rank + cnt);
-    }
-    rank = assign_inorder_ranks(table, n->left, rank);
-    table->split_rank[id] = (uint8_t)(rank - 1); /* max rank of the left subtree */
-    return assign_inorder_ranks(table, n->right, rank);
 }
 
 /* ---------- Pre-order walk schedule (issue #7 execution form) ----------
@@ -619,8 +574,8 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
        (rank_to_sym / rank_to_flat_depth / rank_to_codeword) that the
        production codec walks: once chunks are in code-assignment order,
        their MSB-aligned codewords are strictly increasing, so chunk
-       iteration order IS rank order -- the same in-order-leaf order
-       assign_inorder_ranks derives by recursing over the explicit tree. */
+       iteration order IS rank order -- the in-order leaf order of the
+       (implicit) tree. */
 
     /* For CANONICAL_FLAT, chunks already carry canonical root_codes; assign
        symbol codes directly from them and skip the depth-sort + sequential
@@ -638,6 +593,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 uint8_t sym = flat_items[chunks[ci].sym_idx + i].sym;
                 uint16_t c16 = (uint16_t)(((uint32_t)root << bit) | (uint32_t)i);
                 table->code[sym] = c16;
+                table->sym_to_rank[sym]         = (uint8_t)rank;
                 table->rank_to_sym[rank]        = sym;
                 table->rank_to_flat_depth[rank] = (uint8_t)(bit >= 2 ? bit : 0);
                 table->rank_to_codeword[rank]   = (uint16_t)(c16 << (16 - L));
@@ -677,6 +633,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                     uint8_t sym = flat_items[chunks[ci].sym_idx + i].sym;
                     uint16_t c16 = (uint16_t)((code << bit) | (uint32_t)i);
                     table->code[sym] = c16;
+                    table->sym_to_rank[sym]         = (uint8_t)rank;
                     table->rank_to_sym[rank]        = sym;
                     table->rank_to_flat_depth[rank] = (uint8_t)(bit >= 2 ? bit : 0);
                     table->rank_to_codeword[rank]   = (uint16_t)(c16 << (16 - L));
@@ -715,161 +672,13 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
      * decode-side rebuild from code lengths -- don't pay for the 2 KB fill. */
 
 
-    /* Build the PIVCO tree-walk tree, one node-creating walk per chunk.
-       A flat subtree (D>=2) stops at its root: the decoder reaches its 2^D
-       symbols via flat_code_to_sym (filled here), so we never materialize
-       the 2^D leaves nor the internal nodes below the root -- a large node
-       saving on full alphabets, which also shrinks the classify and
-       max_leaf_depth passes.  Singletons (D=0) and sibling pairs (D=1)
-       build their leaves. */
-    {
-        int16_t nc = 0; /* node count */
-        table->tree[0].symbol = -1;
-        table->tree[0].left   = -1;
-        table->tree[0].right  = -1;
-        nc++;
-        table->tree_root = 0;
-        uint16_t pool = 0;
-
-        for (int ci = 0; ci < n_chunks; ci++) {
-            int D = chunks[ci].bit;
-            int d = chunks[ci].depth;
-            uint16_t rc = chunks[ci].root_code;
-            int base = chunks[ci].sym_idx;
-
-            /* Walk rc's d bits MSB-first, creating spine nodes as needed. */
-            int16_t cur = 0;
-            for (int b = d - 1; b >= 0; b--) {
-                int16_t *child = ((rc >> b) & 1) ? &table->tree[cur].right
-                                                 : &table->tree[cur].left;
-                if (*child < 0) {
-                    *child = nc;
-                    table->tree[nc].symbol = -1;
-                    table->tree[nc].left   = -1;
-                    table->tree[nc].right  = -1;
-                    nc++;
-                }
-                cur = *child;
-            }
-
-            if (D >= 2) {
-                /* Flat root: mark + fill code_to_sym; no children built.
-                   Leaf i of the chunk has in-subtree code i (low D bits of
-                   its canonical code), so flat_code_to_sym[base+i] is its
-                   i-th symbol. */
-                PIVCO_CHECK(table->tree[cur].left == -1 &&
-                            table->tree[cur].right == -1);
-                table->flat_depth[cur]  = (uint8_t)D;
-                table->flat_offset[cur] = pool;
-                int n = 1 << D;
-                for (int i = 0; i < n; i++)
-                    table->flat_code_to_sym[pool + i] = flat_items[base + i].sym;
-                pool = (uint16_t)(pool + n);
-            } else if (D == 1) {
-                /* Sibling pair: two leaf children (suffix 0 -> left). */
-                table->tree[cur].left = nc;
-                table->tree[nc].symbol = (int16_t)flat_items[base].sym;
-                table->tree[nc].left = -1; table->tree[nc].right = -1; nc++;
-                table->tree[cur].right = nc;
-                table->tree[nc].symbol = (int16_t)flat_items[base + 1].sym;
-                table->tree[nc].left = -1; table->tree[nc].right = -1; nc++;
-            } else {
-                /* Singleton: cur is the leaf at depth d. */
-                table->tree[cur].symbol = (int16_t)flat_items[base].sym;
-            }
-        }
-        table->tree_node_count = nc;
-    }
-
-
-    /* Classify each node for decode-dispatch, by children's leafness:
-     *   FLAT (subtree, D>=2)  >  BOTH_LEAVES  >  LEAF_LEFT  >  FULL.
-     * Canonical code assignment always puts a lone leaf child on the
-     * 0/left side (shorter code = smaller left-aligned value), so a
-     * right-leaf-only node cannot occur — asserted. */
-    for (int16_t i = 0; i < table->tree_node_count; i++) {
-        const pivco_tree_node_t *node = &table->tree[i];
-
-        if (node->symbol >= 0) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_LEAF;
-            continue;
-        }
-
-        /* Internal node */
-        if (table->flat_depth[i] >= 2) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_INTERNAL_FLAT;
-            continue;
-        }
-
-        int left_leaf  = (table->tree[node->left].symbol  >= 0);
-        int right_leaf = (table->tree[node->right].symbol >= 0);
-
-        if (left_leaf && right_leaf) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_BOTH_LEAVES;
-        } else if (left_leaf) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_LEAF_LEFT;
-        } else {
-            PIVCO_CHECK(!right_leaf);
-            table->node_type[i] = (uint8_t)PIVCO_NODE_INTERNAL_FULL;
-        }
-    }
-
-
-    /* Populate max_leaf_depth[node] for every internal node.  Used by
-     * the encoder to detect when a subtree's remaining bits fit in a
-     * byte and can be processed with uint8-wide partitions.  Iterative
-     * post-order via tree_node_count traversal: tree nodes are
-     * allocated in order of construction (children before parents in
-     * our build), so a single pass from node 0 to tree_node_count
-     * fills max_leaf_depth bottom-up.
-     *
-     * BUT: that ordering is not guaranteed in general.  Use recursion
-     * for correctness; the depth is small (<= PIVCO_MAX_CODE_LEN). */
-    {
-        /* Iterative DFS via an explicit small stack.  Simpler than
-         * thinking about node-allocation order, and recursion-free. */
-        int stack[2 * PIVCO_MAX_TREE_NODES];
-        int top = 0;
-        stack[top++] = table->tree_root;
-        /* First pass: count children visited per node, leaf := 0. */
-        memset(table->max_leaf_depth, 0, sizeof(table->max_leaf_depth));
-        int order[PIVCO_MAX_TREE_NODES];
-        int order_n = 0;
-        while (top > 0) {
-            int16_t id = (int16_t)stack[--top];
-            order[order_n++] = id;
-            const pivco_tree_node_t *n = &table->tree[id];
-            /* Flat roots have no materialized children -- treat as terminal. */
-            if (n->symbol < 0 && table->flat_depth[id] < 2) {
-                stack[top++] = n->left;
-                stack[top++] = n->right;
-            }
-        }
-        /* Process in reverse (children before parents). */
-        for (int oi = order_n - 1; oi >= 0; oi--) {
-            int16_t id = (int16_t)order[oi];
-            const pivco_tree_node_t *n = &table->tree[id];
-            if (n->symbol >= 0) {
-                table->max_leaf_depth[id] = 0;
-            } else if (table->flat_depth[id] >= 2) {
-                /* All 2^D leaves sit D levels below this flat root. */
-                table->max_leaf_depth[id] = table->flat_depth[id];
-            } else {
-                uint8_t l = table->max_leaf_depth[n->left];
-                uint8_t r = table->max_leaf_depth[n->right];
-                table->max_leaf_depth[id] = (uint8_t)(1 + (l > r ? l : r));
-            }
-        }
-    }
-
-    /* partbyrank: one in-order pass assigns every leaf its rank and every
-     * internal node its split_rank / flat_base_rank (see assign_inorder_ranks). */
-    assign_inorder_ranks(table, table->tree_root, 0);
-
-    /* The rank-range arrays were filled in chunk order during code
-     * assignment; the tree recursion above must agree on every rank. */
-    for (unsigned r = 0; r < table->num_ranks; r++)
-        PIVCO_CHECK_DEBUG(table->sym_to_rank[table->rank_to_sym[r]] == r);
+    /* The explicit tree (tree[] / node_type[] / flat_*[] / split_rank[] /
+     * flat_base_rank[] / max_leaf_depth[]) is NOT built here: the codec
+     * walks the schedule below and never reads it.  Analysis tools that
+     * want it call pivco_huffman_build_explicit_tree() — its
+     * materialization (a spine walk per chunk plus classify,
+     * max_leaf_depth and in-order-rank passes over up-to-511-node
+     * arrays) was the bulk of small-input table-build time (issue #7). */
 
     /* Pre-order walk schedule: render the rank-range tree into the
      * program the codec streams (see build_walk_schedule above). */
@@ -891,15 +700,10 @@ int pivco_huffman_build_table_from_code_lens(
     pivco_huffman_table_t *table)
 {
     if (!code_lens || !table) return PIVCO_ERR_NULL;
-    /* Clear everything except the 4 KB decode_sym/decode_len pair: those are
-     * filled independently by pivco_huffman_build_traditional_table() and are
-     * never read by the bulk decoder, so zeroing them here is wasted work. */
-    {
-        size_t skip_end = offsetof(pivco_huffman_table_t, decode_len)
-                        + sizeof(table->decode_len);
-        memset(table, 0, offsetof(pivco_huffman_table_t, decode_sym));
-        memset((char *)table + skip_end, 0, sizeof(*table) - skip_end);
-    }
+    /* Clear only the build-owned head; the on-demand tail (decode tables
+     * + explicit tree, ~11 KB) is filled by its builders when a tool asks
+     * for it, so zeroing it here is wasted work -- see the struct doc. */
+    memset(table, 0, offsetof(pivco_huffman_table_t, decode_sym));
 
     int n_used = 0, last = 0;
     for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++)
@@ -934,4 +738,115 @@ void pivco_huffman_build_traditional_table(pivco_huffman_table_t *table)
         memset(&table->decode_sym[base], s, count);
         memset(&table->decode_len[base], len, count);
     }
+}
+
+/* ---------- On-demand explicit tree (analysis / debug) ----------
+ *
+ * The production codec streams sched[] and never reads tree[] /
+ * node_type[] / flat_*[] / split_rank[] / flat_base_rank[] /
+ * max_leaf_depth[], so the normal build no longer fills them.  Tools
+ * that inspect the tree (bench stats, viz, dumps) call
+ * pivco_huffman_build_explicit_tree() after building the table; it
+ * reconstructs the identical topology from the schedule + rank arrays.
+ * Nodes are numbered in pre-order (root = 0); the retired build
+ * numbered them in chunk-spine creation order, so raw indices differ
+ * while every structural property (node set, counts, types, ranks,
+ * depths) is unchanged. */
+
+typedef struct {
+    pivco_huffman_table_t *t;
+    unsigned cursor;      /* schedule cursor */
+    int16_t  node_count;
+    uint16_t pool;        /* flat_code_to_sym fill cursor */
+} etree_ctx_t;
+
+static int16_t etree_leaf(etree_ctx_t *c, unsigned rank)
+{
+    pivco_huffman_table_t *t = c->t;
+    int16_t id = c->node_count++;
+    t->tree[id].symbol = (int16_t)t->rank_to_sym[rank];
+    t->tree[id].left   = -1;
+    t->tree[id].right  = -1;
+    t->node_type[id] = (uint8_t)PIVCO_NODE_LEAF;
+    return id;
+}
+
+static int16_t etree_walk(etree_ctx_t *c, unsigned rank_begin, unsigned rank_end)
+{
+    pivco_huffman_table_t *t = c->t;
+    if (rank_end - rank_begin == 1) return etree_leaf(c, rank_begin);
+
+    const pivco_sched_rec_t *rec = &t->sched[c->cursor++];
+    const unsigned kind = rec->kd & 3u;
+    int16_t id = c->node_count++;
+    t->tree[id].symbol = -1;
+    t->tree[id].left   = -1;
+    t->tree[id].right  = -1;
+
+    switch (kind) {
+    case PIVCO_SCHED_FLAT: {
+        unsigned D = rec->kd >> 2;
+        t->flat_depth[id]     = (uint8_t)D;
+        t->flat_offset[id]    = c->pool;
+        t->flat_base_rank[id] = rec->param;
+        memcpy(&t->flat_code_to_sym[c->pool], &t->rank_to_sym[rec->param],
+               (size_t)1 << D);
+        c->pool = (uint16_t)(c->pool + (1u << D));
+        t->node_type[id] = (uint8_t)PIVCO_NODE_INTERNAL_FLAT;
+        t->max_leaf_depth[id] = (uint8_t)D;
+        break;
+    }
+    case PIVCO_SCHED_PAIR:
+        t->tree[id].left  = etree_leaf(c, rank_begin);
+        t->tree[id].right = etree_leaf(c, rank_begin + 1);
+        t->split_rank[id] = rec->param;
+        t->node_type[id] = (uint8_t)PIVCO_NODE_BOTH_LEAVES;
+        t->max_leaf_depth[id] = 1;
+        break;
+    case PIVCO_SCHED_LEAF_LEFT: {
+        t->tree[id].left = etree_leaf(c, rank_begin);
+        int16_t r = etree_walk(c, rank_begin + 1, rank_end);
+        t->tree[id].right = r;
+        t->split_rank[id] = rec->param;
+        t->node_type[id] = (uint8_t)PIVCO_NODE_LEAF_LEFT;
+        t->max_leaf_depth[id] = (uint8_t)(1 + t->max_leaf_depth[r]);
+        break;
+    }
+    default: {  /* PIVCO_SCHED_FULL */
+        unsigned split = (unsigned)rec->param + 1;
+        int16_t l = etree_walk(c, rank_begin, split);
+        int16_t r = etree_walk(c, split, rank_end);
+        t->tree[id].left  = l;
+        t->tree[id].right = r;
+        t->split_rank[id] = rec->param;
+        t->node_type[id] = (uint8_t)PIVCO_NODE_INTERNAL_FULL;
+        uint8_t lm = t->max_leaf_depth[l], rm = t->max_leaf_depth[r];
+        t->max_leaf_depth[id] = (uint8_t)(1 + (lm > rm ? lm : rm));
+        break;
+    }
+    }
+    return id;
+}
+
+void pivco_huffman_build_explicit_tree(pivco_huffman_table_t *table)
+{
+    if (!table || table->num_ranks < 2) return;
+    /* Zero the per-node arrays: the flat test (flat_depth >= 2), the
+     * flat-root split_rank convention (stays 0) and max_leaf_depth leaf
+     * entries all rely on zeros, and the table may have been built
+     * without the memset covering a previous explicit-tree fill. */
+    memset(table->tree,           0, sizeof(table->tree));
+    memset(table->node_type,      0, sizeof(table->node_type));
+    memset(table->flat_depth,     0, sizeof(table->flat_depth));
+    memset(table->flat_offset,    0, sizeof(table->flat_offset));
+    memset(table->flat_code_to_sym, 0, sizeof(table->flat_code_to_sym));
+    memset(table->split_rank,     0, sizeof(table->split_rank));
+    memset(table->flat_base_rank, 0, sizeof(table->flat_base_rank));
+    memset(table->max_leaf_depth, 0, sizeof(table->max_leaf_depth));
+
+    etree_ctx_t c = { table, 0, 0, 0 };
+    table->tree_root = etree_walk(&c, 0, table->num_ranks);
+    table->tree_node_count = c.node_count;
+    PIVCO_CHECK(table->tree_root == 0);
+    PIVCO_CHECK(c.cursor == table->sched_len);
 }

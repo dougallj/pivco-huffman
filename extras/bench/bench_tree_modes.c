@@ -65,6 +65,7 @@ static void measure_mode(pivco_tree_mode_t mode, const uint8_t *sym, size_t n,
     for (size_t i = 0; i < n; i++) freq[sym[i]]++;
     int rc = pivco_huffman_build_table(freq, table);
     if (rc != PIVCO_OK) { fprintf(stderr, "build_table failed: %d\n", rc); free(table); return; }
+    pivco_huffman_build_explicit_tree(table);
 
     /* Encode the whole buffer in 8K blocks, capture compressed bytes. */
     size_t cap = n + 65536;

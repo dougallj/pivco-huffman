@@ -189,6 +189,7 @@ int main(int argc, char **argv)
             printf("%-13s ERROR: build_table returned %d\n", name, rc);
             continue;
         }
+        pivco_huffman_build_explicit_tree(table); /* node-type stats read tree[] */
         /* trad_huffman_decode* read the 2^L flat table, no longer auto-built */
         pivco_huffman_build_traditional_table(table);
 

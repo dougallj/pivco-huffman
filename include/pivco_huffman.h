@@ -200,15 +200,6 @@ typedef struct {
      * NULL (other arches).  Self-referential — rebuild, don't bitwise-copy, a
      * table after pivco_huffman_build_table. */
     pivco_huffman_enc_init_aux_t enc_init_aux;
-    uint8_t  split_rank[PIVCO_MAX_TREE_NODES];      /* max rank in node's left subtree */
-    uint8_t  flat_base_rank[PIVCO_MAX_TREE_NODES];  /* min rank in a flat subtree */
-
-    /* Explicit tree.  No longer read by the production codec (which walks
-     * the rank-range arrays above); retained for analysis tools, tests and
-     * the retired SVE/extras decoders. */
-    pivco_tree_node_t tree[PIVCO_MAX_TREE_NODES];
-    int16_t tree_root;
-    int16_t tree_node_count;
 
     /* Canonical decode info (for traditional decoder) */
     uint16_t first_code[PIVCO_MAX_CODE_LEN + 1];
@@ -216,13 +207,34 @@ typedef struct {
     uint16_t sym_count[PIVCO_MAX_CODE_LEN + 1];
     uint8_t  sorted_symbols[PIVCO_MAX_SYMBOLS];
 
+    uint8_t  max_len;
+    uint8_t  min_len;
+    uint16_t num_symbols;
+
+    /* ================= ON-DEMAND TAIL =================
+     *
+     * Everything from decode_sym down is NOT touched by the normal build
+     * (not even zeroed — the build clears the struct only up to
+     * offsetof(decode_sym), which is most of its small-input cost).
+     * Contents are undefined until the matching on-demand builder runs:
+     *
+     *   decode_sym / decode_len       pivco_huffman_build_traditional_table
+     *   tree / node_type / flat_* /
+     *   split_rank / flat_base_rank /
+     *   max_leaf_depth                pivco_huffman_build_explicit_tree
+     *
+     * The production codec reads none of these. */
+
     /* Flat decode table: 2^MAX_CODE_LEN entries (for traditional decoder) */
     uint8_t  decode_sym[1 << PIVCO_MAX_CODE_LEN];
     uint8_t  decode_len[1 << PIVCO_MAX_CODE_LEN];
 
-    uint8_t  max_len;
-    uint8_t  min_len;
-    uint16_t num_symbols;
+    /* Explicit tree (analysis / debug; see pivco_huffman_build_explicit_tree) */
+    pivco_tree_node_t tree[PIVCO_MAX_TREE_NODES];
+    int16_t tree_root;
+    int16_t tree_node_count;
+    uint8_t  split_rank[PIVCO_MAX_TREE_NODES];      /* max rank in node's left subtree */
+    uint8_t  flat_base_rank[PIVCO_MAX_TREE_NODES];  /* min rank in a flat subtree */
 
     /* Flat-subtree fast path: per-node, if flat_depth[i] >= 2 then node i
        is the root of a MAXIMAL flat subtree of depth D = flat_depth[i]
@@ -235,15 +247,12 @@ typedef struct {
     uint8_t  flat_code_to_sym[PIVCO_MAX_SYMBOLS];
 
     /* Max leaf depth in the subtree rooted at this node, relative to
-     * the global tree.  At runtime, the encoder checks
-     * `max_leaf_depth[node] - depth <= 8` to decide whether to repack
-     * codes_la from uint16 to uint8 and run subsequent partitions on
-     * byte-wide SIMD. */
+     * the global tree.  Historically the encoder's u8-repack test;
+     * analysis-only now. */
     uint8_t  max_leaf_depth[PIVCO_MAX_TREE_NODES];
 
-    /* Decode dispatch type per node — see pivco_node_type_t.  Set by
-     * build_table after tree and flat_depth are finalized.  Decoders
-     * switch on this instead of running per-call conditional chains. */
+    /* Decode dispatch type per node — see pivco_node_type_t.
+     * Analysis-only now (the codec dispatches on sched[] kinds). */
     uint8_t  node_type[PIVCO_MAX_TREE_NODES];
 } pivco_huffman_table_t;
 
@@ -362,6 +371,16 @@ int pivco_huffman_build_table_from_code_lens(
  * building the table; pivco_huffman_build_table no longer fills it (the
  * production tree-walk decoder does not need it). */
 void pivco_huffman_build_traditional_table(pivco_huffman_table_t *table);
+
+/* Materialize the explicit tree (tree[] / node_type[] / flat_depth[] /
+ * flat_offset[] / flat_code_to_sym[] / split_rank[] / flat_base_rank[] /
+ * max_leaf_depth[]) for analysis / debug tools.  Call after building the
+ * table; the production codec streams sched[] and never reads these, so
+ * the normal build skips them (the bulk of small-input table-build time,
+ * issue #7).  Reconstructed from the schedule + rank arrays with nodes
+ * numbered in pre-order (root = 0) — same topology as the retired inline
+ * build, different raw node indices. */
+void pivco_huffman_build_explicit_tree(pivco_huffman_table_t *table);
 
 /* ---------- PIVCO Huffman encode/decode (variable-N blocks, N ≤ PIVCO_BLOCK_SIZE) ----------
  *

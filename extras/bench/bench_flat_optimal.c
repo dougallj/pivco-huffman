@@ -291,6 +291,7 @@ static void analyze(int d)
         free(t);
         return;
     }
+    pivco_huffman_build_explicit_tree(t);
 
     uint64_t total_freq = 0;
     int total_leaves = 0;

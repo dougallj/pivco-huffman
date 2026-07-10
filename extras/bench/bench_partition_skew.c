@@ -53,6 +53,7 @@ static void print_one(const char *name, const uint64_t *freq)
         printf("%-15s  build_table failed\n", name);
         return;
     }
+    pivco_huffman_build_explicit_tree(&t);
     double hist[NBINS] = {0};
     walk(&t, t.tree_root, freq, hist);
 

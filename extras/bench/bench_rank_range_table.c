@@ -22,7 +22,7 @@
  * ranges in lockstep with the production tree and checks:
  *
  *   - per-symbol code / code_len identical to the production build
- *   - rank order identical (sym_to_rank matches assign_inorder_ranks)
+ *   - rank order identical (sym_to_rank matches the production build)
  *   - every split matches split_rank[], every flat root matches
  *     flat_depth[] / flat_base_rank[] / flat_code_to_sym[]
  *   - node_type[] is recoverable from the range shape alone (the decode
@@ -86,8 +86,7 @@ static unsigned rr_split(const rr_table_t *rt, unsigned level,
  * bit-for-bit); the difference is what happens after: one flat pass over the
  * depth-sorted chunks fills codes AND all rank arrays -- chunks in canonical
  * depth order have strictly increasing MSB-aligned codes, so chunk iteration
- * order IS rank order, the same order assign_inorder_ranks produces by
- * recursing over the explicit tree. */
+ * order IS rank order, the in-order leaf order of the tree. */
 static int rr_build_from_code_lens(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                                    rr_table_t *rt)
 {
@@ -188,7 +187,7 @@ static int rr_build_from_code_lens(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 
     /* Canonical chunk-code assignment fused with rank filling.  This one
      * loop replaces the production build's tree construction, node
-     * classification, max_leaf_depth DFS and assign_inorder_ranks. */
+     * classification, max_leaf_depth DFS and in-order rank recursion. */
     {
         uint32_t code = 0;
         int prev_depth = 0;
@@ -331,6 +330,7 @@ static void verify_case(const char *name, const uint64_t freq[PIVCO_MAX_SYMBOLS]
         free(t);
         return;
     }
+    pivco_huffman_build_explicit_tree(t);  /* reference tree is on-demand now */
 
     rr_table_t rt;
     if (rr_build_from_code_lens(t->code_len, &rt) != PIVCO_OK) {

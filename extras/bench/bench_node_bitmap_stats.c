@@ -111,6 +111,7 @@ int main(int argc, char **argv)
             printf("%-14s (build_table failed)\n", bench_dist_name(d));
             free(sym); free(table); continue;
         }
+        pivco_huffman_build_explicit_tree(table);
 
         /* ranks buffer + right-half recursion scratch, like the encoder */
         uint8_t *ranks = malloc((size_t)PIVCO_BLOCK_SIZE + 64);

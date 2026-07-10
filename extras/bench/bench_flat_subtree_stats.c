@@ -72,6 +72,7 @@ static void analyze_distribution(int d)
         free(t);
         return;
     }
+    pivco_huffman_build_explicit_tree(t);
 
     int min_len = t->min_len;
     int max_len = t->max_len;

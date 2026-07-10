@@ -343,6 +343,7 @@ static double render_distribution(FILE *f, const char *name,
         *out_height = 0;
         return 0;
     }
+    pivco_huffman_build_explicit_tree(&t_opt);
     pivco_huffman_table_t t_canon;
     build_canonical(t_opt.code_len, &t_canon);
 
@@ -475,6 +476,7 @@ static void render_distribution_dot(FILE *f, const char *name,
 {
     pivco_huffman_table_t t_opt;
     if (pivco_huffman_build_table(freq, &t_opt) != PIVCO_OK) return;
+    pivco_huffman_build_explicit_tree(&t_opt);
     pivco_huffman_table_t t_canon;
     build_canonical(t_opt.code_len, &t_canon);
 
@@ -511,6 +513,7 @@ static void measure_distribution(const uint64_t *freq, double *out_w,
     if (pivco_huffman_build_table(freq, &t_opt) != PIVCO_OK) {
         *out_w = 0; *out_h = 0; return;
     }
+    pivco_huffman_build_explicit_tree(&t_opt);
     int n_leaves = subtree_leaves(t_opt.tree, t_opt.tree_root);
     int max_len  = t_opt.max_len;
     double w_panel = n_leaves * LEAF_W;

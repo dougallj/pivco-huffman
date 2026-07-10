@@ -81,6 +81,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "build_table failed\n");
         return 1;
     }
+    pivco_huffman_build_explicit_tree(T);
 
     int nsyms = 0;
     for (int s = 0; s < 256; s++) if (T->code_len[s]) nsyms++;

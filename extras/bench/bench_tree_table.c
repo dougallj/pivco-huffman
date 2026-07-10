@@ -116,6 +116,7 @@ static mode_stats_t build_and_measure(pivco_tree_mode_t mode,
         free(t);
         return st;
     }
+    pivco_huffman_build_explicit_tree(t);
 
     uint64_t tot_f = 0;
     double f_ops = 0.0, f_depth = 0.0;

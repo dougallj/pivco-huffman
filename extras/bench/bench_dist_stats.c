@@ -167,6 +167,7 @@ int main(int argc, char **argv)
         int min_len = 0, max_len = 0;
         double avg_len = 0.0, max_node_benefit = 0.0;
         if (pivco_huffman_build_table(f, &t) == PIVCO_OK) {
+            pivco_huffman_build_explicit_tree(&t);
             int mn = 255, mx = 0;
             double wsum = 0.0;
             for (int s = 0; s < 256; s++) {
