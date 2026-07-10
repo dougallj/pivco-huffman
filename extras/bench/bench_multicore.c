@@ -212,7 +212,7 @@ int main(int argc, char **argv)
     /* Per-thread output buffers, each cache-line-aligned and not adjacent. */
     uint8_t *out_bufs[64] = {0};
     for (int t = 0; t < max_threads; t++) {
-        if (posix_memalign((void **)&out_bufs[t], 4096, TOTAL_SYMBOLS) != 0) {
+        if (posix_memalign((void **)&out_bufs[t], 4096, TOTAL_SYMBOLS + PIVCO_DECODE_DST_PAD) != 0) {
             fprintf(stderr, "posix_memalign failed for thread %d\n", t);
             return 1;
         }

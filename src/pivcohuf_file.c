@@ -125,7 +125,8 @@ size_t pivcohuf_compress_bound_blk(size_t in_len, size_t block_size)
     size_t worst_per_block = 4 /* length prefix */ + 2 * B + 64;
     return PIVCOHUF_HEADER_SIZE      /* header */
          + 8 + 2 + 128                /* body header: usize + blk + code-len nibbles */
-         + nblocks * worst_per_block;
+         + nblocks * worst_per_block
+         + PIVCO_DECODE_SRC_PAD;      /* trailing stream pad (tail-free decode) */
 }
 
 size_t pivcohuf_compress_bound(size_t in_len)
@@ -271,6 +272,15 @@ static int pivcohuf_compress_impl(const uint8_t *in, size_t in_len,
 
     size_t body_len = (size_t)(p - body);
 
+    /* Trailing stream pad (tail-free decode): the block decoder may
+     * read up to PIVCO_DECODE_SRC_PAD bytes past the last block's
+     * consumed bytes.  Emitting the pad INSIDE the file means any
+     * buffer that holds the whole file automatically satisfies the
+     * src-pad contract.  Not counted in body_len, so the decode loop
+     * never parses it (old decoders ignore trailing bytes too). */
+    memset(p, 0, PIVCO_DECODE_SRC_PAD);
+    p += PIVCO_DECODE_SRC_PAD;
+
     /* Write HEADER (positions are fixed).  Checksums temporarily disabled
      * -- always zero (2026-05-12).  Format byte positions preserved so a
      * later commit can turn them back on without a wire-format break. */
@@ -368,7 +378,12 @@ static int pivcohuf_decompress_impl(const uint8_t *in, size_t in_len,
     uint64_t body_len_u64;
     int rc = parse_header(in, in_len, &body_len_u64);
     if (rc != PIVCOHUF_OK) return rc;
-    if (in_len < PIVCOHUF_HEADER_SIZE + body_len_u64)
+    /* Tail-free decode: the last block's SIMD loops read up to
+     * PIVCO_DECODE_SRC_PAD bytes past the body, so the buffer must
+     * contain the trailing pad that pivcohuf_compress emits after the
+     * body.  Files written by pre-pad encoders fail here loudly
+     * instead of overreading the caller's buffer. */
+    if (in_len < PIVCOHUF_HEADER_SIZE + body_len_u64 + PIVCO_DECODE_SRC_PAD)
         return PIVCOHUF_ERR_TOO_SHORT;
     size_t body_len = (size_t)body_len_u64;
     const uint8_t *body = in + PIVCOHUF_HEADER_SIZE;
@@ -408,9 +423,13 @@ static int pivcohuf_decompress_impl(const uint8_t *in, size_t in_len,
     }
 
     /* Decode blocks.  block_buf is on heap (avoids large stack frames; also
-     * sized B which is read from the file). */
+     * sized B which is read from the file).  Tail-free contract: the block
+     * decoder writes up to PIVCO_DECODE_DST_PAD garbage bytes past a block's
+     * N symbols, so a block is decoded straight into `out` only when the
+     * remaining output has that much slack; the final block(s) bounce
+     * through the padded block_buf, preserving the exact `out` contract. */
     double _tm = TIC(tm);
-    uint8_t *block_buf = (uint8_t *)malloc(B);
+    uint8_t *block_buf = (uint8_t *)malloc(B + PIVCO_DECODE_DST_PAD);
     TOC(tm, malloc_ns, _tm);
     if (!block_buf) return PIVCOHUF_ERR_INTERNAL;
     const uint8_t *p = body + 10 + 128;
@@ -427,7 +446,8 @@ static int pivcohuf_decompress_impl(const uint8_t *in, size_t in_len,
           blk_enc_len = get_u32(p); p += 4;
           if (p + blk_enc_len > body_end) { err = PIVCOHUF_ERR_TOO_SHORT; break; }
           blk_remaining = uncomp_size - written;
-          blk_out = (blk_remaining >= B) ? (out + written) : block_buf;
+          blk_out = (blk_remaining >= B + PIVCO_DECODE_DST_PAD)
+                    ? (out + written) : block_buf;
           PROF_TOC(PROF_FILE_BLOCK_PROLOGUE, (uint64_t)B); }
 
         { PROF_TIC();
@@ -437,9 +457,10 @@ static int pivcohuf_decompress_impl(const uint8_t *in, size_t in_len,
               err = PIVCOHUF_ERR_INTERNAL; break;
           }
           PROF_TOC(PROF_FILE_BLOCK_DECODE, (uint64_t)B); }
-        if (blk_remaining < B) {
-            memcpy(out + written, block_buf, blk_remaining);
-            written = uncomp_size;
+        if (blk_out == block_buf) {
+            size_t take = blk_remaining < B ? blk_remaining : B;
+            memcpy(out + written, block_buf, take);
+            written += take;
         } else {
             written += B;
         }

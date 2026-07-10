@@ -198,14 +198,20 @@ static int test_roundtrip_dist(const char *name, const uint64_t freq[PIVCO_MAX_S
     }
 
 #ifdef PIVCO_HAS_NEON
-    /* NEON encode + BU NEON decode roundtrip (the production path). */
-    uint8_t neon_enc[PIVCO_MAX_ENCODED_SIZE];
+    /* NEON encode + BU NEON decode roundtrip (the production path).
+     * Tail-free contract: the decode buffer carries DST_PAD writable
+     * slack plus a 32-byte 0xCB canary beyond it — the canary check
+     * enforces that the tail-free stores never spill past the
+     * documented PIVCO_DECODE_DST_PAD budget. */
+    uint8_t neon_enc[PIVCO_MAX_ENCODED_SIZE + PIVCO_DECODE_SRC_PAD];
     size_t neon_len;
     rc = pivco_huffman_encode_neon(symbols, PIVCO_BLOCK_SIZE, &table, neon_enc, &neon_len);
     if (rc != PIVCO_OK) FAIL("neon encode returned %d", rc);
 
     {
-        uint8_t bu_dec[PIVCO_BLOCK_SIZE];
+        enum { CANARY = 32 };
+        static uint8_t bu_dec[PIVCO_BLOCK_SIZE + PIVCO_DECODE_DST_PAD + CANARY];
+        memset(bu_dec, 0xCB, sizeof(bu_dec));
         size_t bu_consumed;
         rc = pivco_huffman_decode_bu_neon(neon_enc, neon_len, &table,
                                            bu_dec, &bu_consumed);
@@ -214,6 +220,11 @@ static int test_roundtrip_dist(const char *name, const uint64_t freq[PIVCO_MAX_S
             if (symbols[i] != bu_dec[i]) {
                 FAIL("bu_neon mismatch at position %d: expected %d, got %d",
                      i, symbols[i], bu_dec[i]);
+            }
+        }
+        for (int i = 0; i < CANARY; i++) {
+            if (bu_dec[PIVCO_BLOCK_SIZE + PIVCO_DECODE_DST_PAD + i] != 0xCB) {
+                FAIL("bu_neon overwrote beyond DST_PAD (canary byte %d)", i);
             }
         }
         if (bu_consumed != neon_len) {
@@ -336,6 +347,80 @@ static void make_two_symbol_skewed(uint64_t freq[PIVCO_MAX_SYMBOLS])
     freq[0] = 900; freq[1] = 100;
 }
 
+#ifdef PIVCO_HAS_NEON
+/* ---------- Tail-free stress: odd block sizes x tree shapes ----------
+ *
+ * The tail-free NEON decode runs full-width loops straight past every
+ * region end, so the interesting cases are all the K mod 64 / n mod 16
+ * residues at every node.  Encode+NEON-decode blocks of many odd sizes
+ * under five tree shapes, verify against the scalar decoder, and check
+ * that no store lands beyond the documented PIVCO_DECODE_DST_PAD. */
+static int test_tailfree_sizes(void)
+{
+    printf("[test_tailfree_sizes] ");
+    static const int sizes[] = { 1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 24, 31, 32,
+                                 33, 48, 63, 64, 65, 100, 127, 128, 129, 255,
+                                 257, 1000, 4095, 4096, 4097, 8191, 8192 };
+    enum { NSIZES = (int)(sizeof(sizes) / sizeof(sizes[0])), MAXN = 8192 };
+    static uint8_t sym[MAXN], ref[MAXN];
+    static uint8_t enc[PIVCO_MAX_ENCODED_SIZE + PIVCO_DECODE_SRC_PAD];
+    static uint8_t dec[MAXN + PIVCO_DECODE_DST_PAD + 32];
+    uint64_t freq[PIVCO_MAX_SYMBOLS];
+    uint64_t rng = 0x1234abcd5678ULL;
+
+    for (int d = 0; d < 5; d++) {
+        switch (d) {
+        case 0: make_english(freq);           break;
+        case 1: make_uniform(freq);           break;
+        case 2: make_two_symbol_skewed(freq); break;
+        case 3: make_sparse_16(freq);         break;
+        default: make_geometric(freq);        break;
+        }
+        pivco_huffman_table_t table;
+        if (pivco_huffman_build_table(freq, &table) != PIVCO_OK)
+            FAIL("build_table failed (dist %d)", d);
+        uint64_t total = 0;
+        for (int i = 0; i < PIVCO_MAX_SYMBOLS; i++) total += freq[i];
+
+        for (int s = 0; s < NSIZES; s++) {
+            int n = sizes[s];
+            for (int i = 0; i < n; i++) {
+                uint64_t r = xorshift64(&rng) % total;
+                uint64_t cum = 0;
+                int v;
+                for (v = 0; v < PIVCO_MAX_SYMBOLS; v++) {
+                    cum += freq[v];
+                    if (r < cum) break;
+                }
+                sym[i] = (uint8_t)v;
+            }
+            size_t enc_len, c1, c2;
+            if (pivco_huffman_encode_neon(sym, (size_t)n, &table,
+                                          enc, &enc_len) != PIVCO_OK)
+                FAIL("encode n=%d dist=%d", n, d);
+            if (pivco_huffman_decode_scalar(enc, enc_len, &table,
+                                            ref, &c1) != PIVCO_OK)
+                FAIL("scalar decode n=%d dist=%d", n, d);
+            memset(dec, 0xCB, sizeof(dec));
+            if (pivco_huffman_decode_bu_neon(enc, enc_len, &table,
+                                             dec, &c2) != PIVCO_OK)
+                FAIL("neon decode n=%d dist=%d", n, d);
+            if (memcmp(sym, ref, (size_t)n) != 0)
+                FAIL("scalar roundtrip mismatch n=%d dist=%d", n, d);
+            if (memcmp(dec, ref, (size_t)n) != 0)
+                FAIL("neon/scalar decode mismatch n=%d dist=%d", n, d);
+            for (int i = n + PIVCO_DECODE_DST_PAD; i < (int)sizeof(dec); i++) {
+                if (dec[i] != 0xCB)
+                    FAIL("DST_PAD budget violated: n=%d dist=%d byte %d",
+                         n, d, i - n);
+            }
+        }
+    }
+    printf("PASS\n");
+    return 0;
+}
+#endif  /* PIVCO_HAS_NEON */
+
 /* ---------- Main test runner ---------- */
 
 int test_roundtrip_all(void)
@@ -371,6 +456,10 @@ int test_roundtrip_all(void)
 
     make_two_symbol_skewed(freq);
     failures += test_roundtrip_dist("two_sym_skew", freq, seed++);
+
+#ifdef PIVCO_HAS_NEON
+    failures += test_tailfree_sizes();
+#endif
 
     /* Multiple blocks with different seeds */
     make_zipfian(freq);

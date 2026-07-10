@@ -247,7 +247,7 @@ static result_t measure_ph(const uint8_t *sym, size_t n, int fse_on,
     off = malloc((nblk + 1) * sizeof(size_t));   /* prebuilt stream offsets */
     offo= malloc((nblk + 1) * sizeof(size_t));   /* opaque   stream offsets */
     enco= malloc(n + n / 2 + 4096);
-    dec = malloc(n);
+    dec = malloc(n + PIVCO_DECODE_DST_PAD);
     if (!enc || !off || !offo || !enco || !dec) goto done_fail;
 
     /* pre-encode prebuilt stream (global table) */
@@ -343,7 +343,7 @@ static result_t measure_phtd(phtd_build_fn B, phtd_enc_fn E, phtd_dec_fn D,
     #define WSZ(w)  (((w) + 1 < nwin) ? G   : (n    - (w) * G))
     R.builds = (int)nwin;
     char *gt = malloc(tsz), *wt = malloc(tsz), *wts = malloc(nwin * tsz);
-    uint8_t *enc = malloc(n + n/2 + 4096), *eno = malloc(n + n/2 + 4096), *dec = malloc(n);
+    uint8_t *enc = malloc(n + n/2 + 4096), *eno = malloc(n + n/2 + 4096), *dec = malloc(n + PIVCO_DECODE_DST_PAD);
     size_t *off = malloc((nblk+1)*sizeof(size_t)), *ofo = malloc((nblk+1)*sizeof(size_t));
     if (!gt||!wt||!wts||!enc||!eno||!dec||!off||!ofo) goto done;
 #define WT(k) ((phtd_table_t*)(wts + (k)*tsz))
@@ -402,7 +402,7 @@ static result_t measure_huf0(const uint8_t *sym, size_t n) {
     uint8_t *encp= malloc(n + n/2 + 4096);        /* prebuilt stream (usingCTable body only) */
     size_t  *off = malloc((nch+1)*sizeof(size_t));
     size_t  *offp= malloc((nch+1)*sizeof(size_t));
-    uint8_t *dec = malloc(n);
+    uint8_t *dec = malloc(n + PIVCO_DECODE_DST_PAD);
     void    *wksp= malloc(1<<16);
     HUF_DTable *dt   = malloc(HUF_DTABLE_SIZE(HUFLOG) * sizeof(HUF_DTable)); /* opaque scratch */
     HUF_DTable *dtpb = malloc(HUF_DTABLE_SIZE(HUFLOG) * sizeof(HUF_DTable)); /* prebuilt, global */

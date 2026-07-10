@@ -69,7 +69,7 @@ static void measure_mode(pivco_tree_mode_t mode, const uint8_t *sym, size_t n,
     /* Encode the whole buffer in 8K blocks, capture compressed bytes. */
     size_t cap = n + 65536;
     uint8_t *enc = malloc(cap);
-    uint8_t *dec = malloc(n);
+    uint8_t *dec = malloc(n + PIVCO_DECODE_DST_PAD);
     assert(enc && dec);
 
     size_t total_enc = 0;
@@ -146,7 +146,7 @@ static double now_ns(void) {
 static double measure_huf0_stk(const uint8_t *sym, size_t n) {
     size_t nch = (n + HUF_CHUNK_TM - 1) / HUF_CHUNK_TM;
     uint8_t *enc = malloc(n + n / 2 + 4096);
-    uint8_t *dec = malloc(n);
+    uint8_t *dec = malloc(n + PIVCO_DECODE_DST_PAD);
     size_t  *off = malloc((nch + 1) * sizeof(size_t));
     double best = 0;
     if (!enc || !dec || !off) goto out;
@@ -178,7 +178,7 @@ out:
 static double measure_oodle_huff(const uint8_t *sym, size_t n) {
     size_t nch = (n + HUF_CHUNK_TM - 1) / HUF_CHUNK_TM;
     uint8_t *enc = malloc(n + n / 2 + 4096);
-    uint8_t *dec = malloc(n);
+    uint8_t *dec = malloc(n + PIVCO_DECODE_DST_PAD);
     size_t  *off = malloc((nch + 1) * sizeof(size_t));
     int     *ht  = malloc(nch * sizeof(int));
     double best = 0;

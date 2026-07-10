@@ -198,7 +198,7 @@ int main(int argc, char **argv)
 
         /* ---- Pre-encode: PIVCO (NBLOCKS × BLK) ---- */
         /* Each block's encoded data is variable-size; store offsets */
-        uint8_t *pivco_enc_buf = (uint8_t *)malloc((size_t)NBLOCKS * PIVCO_MAX_ENCODED_SIZE);
+        uint8_t *pivco_enc_buf = (uint8_t *)malloc((size_t)NBLOCKS * PIVCO_MAX_ENCODED_SIZE + PIVCO_DECODE_SRC_PAD);
         size_t  *pivco_enc_off = (size_t *)malloc((size_t)(NBLOCKS + 1) * sizeof(size_t));
         pivco_enc_off[0] = 0;
         for (int b = 0; b < NBLOCKS; b++) {
@@ -209,7 +209,7 @@ int main(int argc, char **argv)
         }
 
 #if defined(PIVCO_HAS_NEON) || defined(PIVCO_HAS_SSE4) || defined(PIVCO_HAS_AVX512) || defined(PIVCO_HAS_SVE)
-        uint8_t *neon_enc_buf = (uint8_t *)malloc((size_t)NBLOCKS * PIVCO_MAX_ENCODED_SIZE);
+        uint8_t *neon_enc_buf = (uint8_t *)malloc((size_t)NBLOCKS * PIVCO_MAX_ENCODED_SIZE + PIVCO_DECODE_SRC_PAD);
         size_t  *neon_enc_off = (size_t *)malloc((size_t)(NBLOCKS + 1) * sizeof(size_t));
         neon_enc_off[0] = 0;
         for (int b = 0; b < NBLOCKS; b++) {
@@ -282,7 +282,7 @@ int main(int argc, char **argv)
 
         /* ---- Verify correctness (first block / chunk only) ---- */
         {
-            uint8_t *dec = (uint8_t *)malloc(TOTAL_SYMBOLS);
+            uint8_t *dec = (uint8_t *)malloc(TOTAL_SYMBOLS + PIVCO_DECODE_DST_PAD);
             size_t consumed;
 
             /* PIVCO scalar — first block */
@@ -307,7 +307,8 @@ int main(int argc, char **argv)
         }
 
         /* ---- Benchmark ---- */
-        uint8_t *dec_buf = (uint8_t *)malloc(TOTAL_SYMBOLS);
+        /* +DST_PAD: tail-free decode spills <= 15 B past the last block. */
+        uint8_t *dec_buf = (uint8_t *)malloc(TOTAL_SYMBOLS + PIVCO_DECODE_DST_PAD);
         double runs_arr[RUNS];   /* RUNS is the max; we use `runs` of them */
         double t0, t1;
         char label[64];

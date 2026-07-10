@@ -477,6 +477,11 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
     }
 }
 
+/* Tail-free contract (see pivco_huffman.h): `symbols` must have
+ * N + PIVCO_DECODE_DST_PAD writable bytes and `in` must have
+ * consumed + PIVCO_DECODE_SRC_PAD readable bytes.  Neither is
+ * verifiable here (no capacity parameters) — enforced by documentation
+ * and the canary checks in the test suite. */
 int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
                        const pivco_huffman_table_t *table,
                        uint8_t *symbols, size_t *consumed)
@@ -527,9 +532,14 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
     /* Scratch arena.  Worst case at a heavily-skewed node, the
      * partition is one-sided so a single recursion can consume up to
      * N bytes.  Bounded by (MAX_CODE_LEN+2) * N.  Grown on demand from a
-     * thread-local heap buffer so block size is a runtime parameter. */
+     * thread-local heap buffer so block size is a runtime parameter.
+     *
+     * +128 slack: the tail-free NEON merges store 16-byte-wide past a
+     * child buffer's K and load merge sources up to 64+16 bytes past a
+     * list's live length; every child buffer is packed inside this
+     * arena, so slack at the top covers the worst (highest) one. */
     uint8_t *scratch =
-        decode_scratch_ensure((size_t)N * (PIVCO_MAX_CODE_LEN + 2));
+        decode_scratch_ensure((size_t)N * (PIVCO_MAX_CODE_LEN + 2) + 128);
     if (!scratch) return PIVCO_ERR_NULL;
 
     codec_decode_subtree(table, table->tree_root, N,
