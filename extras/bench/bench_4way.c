@@ -99,7 +99,7 @@ static codec_result_t bench_pivco(const uint8_t *symbols, int total,
     r.enc_mbs = (double)total / 1e6 / med3of5(enc_times);
 
     /* Decode all blocks */
-    uint8_t *dec = (uint8_t *)malloc((size_t)total + PIVCO_DECODE_DST_PAD);
+    uint8_t *dec = (uint8_t *)malloc((size_t)total);
     double dec_times[N_RUNS];
     for (int run = 0; run < N_RUNS; run++) {
         double t0 = now_sec();
@@ -151,7 +151,7 @@ static codec_result_t bench_huf0(const uint8_t *symbols, int total)
     }
     r.enc_mbs = (double)total / 1e6 / med3of5(enc_times);
 
-    uint8_t *dec = (uint8_t *)malloc((size_t)total + PIVCO_DECODE_DST_PAD);
+    uint8_t *dec = (uint8_t *)malloc((size_t)total);
     double dec_times[N_RUNS];
     for (int run = 0; run < N_RUNS; run++) {
         double t0 = now_sec();
@@ -211,7 +211,7 @@ static codec_result_t bench_fse(const uint8_t *symbols, int total)
     }
     r.enc_mbs = (double)total / 1e6 / med3of5(enc_times);
 
-    uint8_t *dec = (uint8_t *)malloc((size_t)total + PIVCO_DECODE_DST_PAD);
+    uint8_t *dec = (uint8_t *)malloc((size_t)total);
     double dec_times[N_RUNS];
     for (int run = 0; run < N_RUNS; run++) {
         double t0 = now_sec();

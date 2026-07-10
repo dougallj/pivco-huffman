@@ -214,4 +214,25 @@
 #  error "pivco_huffman_primitives.h requires PIVCO_BACKEND_{SCALAR,NEON,X86,AVX512} to be defined."
 #endif
 
+/* ---------- Tail-free decode geometry (per-backend, defaults exact) ----------
+ *
+ * PIVCO_PRIM_DEC_STORE_QUANTUM: every decode primitive writes output in
+ *   whole multiples of this many bytes — a K-symbol region receives
+ *   exactly ceil(K/Q)*Q bytes of stores (garbage beyond K).  1 means all
+ *   writes are exact.  codec.c uses it to decide when the root output
+ *   must bounce through scratch instead of writing the caller's
+ *   `symbols` directly (only when N % Q != 0).
+ *
+ * PIVCO_PRIM_DEC_SRC_SLACK: decode primitives may READ up to this many
+ *   bytes past the end of an input region (bitmap / packed-flat bits).
+ *   0 means all reads are exact.  codec.c uses it to bounce regions
+ *   that end within SRC_SLACK bytes of the input buffer's end into
+ *   padded scratch, so no read ever passes in + in_len. */
+#ifndef PIVCO_PRIM_DEC_STORE_QUANTUM
+#define PIVCO_PRIM_DEC_STORE_QUANTUM 1
+#endif
+#ifndef PIVCO_PRIM_DEC_SRC_SLACK
+#define PIVCO_PRIM_DEC_SRC_SLACK 0
+#endif
+
 #endif  /* PIVCO_HUFFMAN_PRIMITIVES_H */

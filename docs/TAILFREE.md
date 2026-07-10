@@ -1,8 +1,35 @@
-# Tail-free NEON decode (branch: tail-free)
+# Tail-free NEON decode
 
-Experiment: remove ALL tail handling from the NEON decompression
-primitives — every decode loop runs full-width straight past the end of
-its region instead of dropping to narrower / scalar mop-up ladders.
+Remove ALL tail handling from the NEON decompression primitives — every
+decode loop runs full-width straight past the end of its region instead
+of dropping to narrower / scalar mop-up ladders.
+
+## Branch lineage
+
+* `tail-free` — the experiment: kernels overshoot and the CALLER
+  provides ±16-byte pads (bench/test buffers padded, file codec pads
+  the stream).  Everything below the "Safety contract" section
+  describes this branch.
+* `tail-free-pr` (shippable) — same kernels, EXACT external contract
+  (identical to main: dst gets exactly N bytes, no read passes
+  in + in_len, wire format unchanged).  The codec confines the
+  overshoot to internal scratch:
+    - per-backend constants `PIVCO_PRIM_DEC_STORE_QUANTUM` (16 on NEON,
+      1 elsewhere) and `PIVCO_PRIM_DEC_SRC_SLACK` (16 / 0) describe the
+      kernels' geometry; exact backends compile the checks away.
+    - dst: kernels store in quantum units, so `symbols` is written
+      directly iff N % 16 == 0 (always true for production block
+      sizes); otherwise the root decodes into an arena slab and the
+      exact N bytes are memcpy'd out (only the final short block of a
+      stream).
+    - src: input regions ending within SRC_SLACK of in + in_len are
+      copied into padded scratch before the kernels read them (raw
+      bitmaps → the per-node bm_scratch, packed-flat regions → an
+      arena slab).  `in_len` must be accurate; interior regions are
+      covered by the stream bytes that follow them.
+  Verified by test_exact_contract_sizes (exact-size heap dst+src, 0xCB
+  canary directly at N, 30 sizes × 5 tree shapes) and a strict
+  GuardMalloc (MALLOC_STRICT_SIZE=1) run of the whole suite.
 
 ## What changed
 

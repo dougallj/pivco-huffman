@@ -95,7 +95,7 @@ int main(int argc, char **argv)
 
     /* Verify first block decodes correctly */
     {
-        uint8_t *test = malloc(N + PIVCO_DECODE_DST_PAD);
+        uint8_t *test = malloc(N);
         size_t consumed;
         int rc = pivco_huffman_decode(enc_buf + enc_off[0],
                                        enc_off[1] - enc_off[0],
@@ -106,7 +106,7 @@ int main(int argc, char **argv)
         free(test);
     }
 
-    uint8_t *out = malloc((size_t)NBLOCKS * N + PIVCO_DECODE_DST_PAD);
+    uint8_t *out = malloc((size_t)NBLOCKS * N);
     if (!out) { fprintf(stderr, "malloc out failed\n"); return 1; }
     printf("out=%p enc_buf=%p\n", (void*)out, (void*)enc_buf);
 

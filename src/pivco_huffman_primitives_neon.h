@@ -42,13 +42,16 @@ static inline void codec_init_neon(void)
 
 /* ---------- Decode primitives (bottom-up) ----------
  *
- * TAIL-FREE (this branch): every decode primitive runs its full-width
- * loop straight past the end of the region.  Final stores spill up to
- * PIVCO_DECODE_DST_PAD-1 bytes past the K/n valid output bytes; loads
- * read up to PIVCO_DECODE_SRC_PAD bytes past the region's last input
- * byte (and up to 64+16 B past a merge source list's live length —
- * absorbed by the decode scratch arena's slack, see codec.c).  No
- * narrower fallback loops, no scalar mop-up, no partial-tail branches. */
+ * TAIL-FREE: every decode primitive runs its full-width loop straight
+ * past the end of the region.  A K-symbol output receives exactly
+ * ceil(K/16)*16 bytes of stores (garbage beyond K); loads read up to
+ * 16 B past the region's last input byte (and up to 64+16 B past a
+ * merge source list's live length — absorbed by the decode scratch
+ * arena's slack, see codec.c).  No narrower fallback loops, no scalar
+ * mop-up, no partial-tail branches.  codec.c keeps the caller-facing
+ * contract exact via the STORE_QUANTUM / SRC_SLACK constants below. */
+#define PIVCO_PRIM_DEC_STORE_QUANTUM 16
+#define PIVCO_PRIM_DEC_SRC_SLACK 16
 
 /* ---- merge_vec_vec_neon: two-table SABD merge, 64 bytes/iter ----
  *

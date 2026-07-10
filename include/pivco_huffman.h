@@ -64,23 +64,6 @@ extern "C" {
    => N bytes. Plus rounding overhead per tree node. */
 #define PIVCO_MAX_ENCODED_SIZE (PIVCO_BLOCK_SIZE * 2)
 
-/* Tail-free decode contract (tail-free branch).  The SIMD decode
- * primitives run their full-width loops straight past the end of every
- * region instead of dropping to narrower / scalar tail ladders.  The
- * caller of pivco_huffman_decode* must therefore guarantee:
- *
- *   dst: `symbols` has >= N + PIVCO_DECODE_DST_PAD writable bytes.
- *        Bytes [N, N + DST_PAD) may receive garbage.
- *   src: `in` has >= consumed + PIVCO_DECODE_SRC_PAD readable bytes
- *        (the pad may hold anything; it is read, never interpreted).
- *
- * The file codec (pivcohuf_*) preserves its exact external contract:
- * it appends SRC_PAD bytes to the compressed stream and bounce-buffers
- * the final block internally, so only users of the raw block API need
- * to care about these. */
-#define PIVCO_DECODE_DST_PAD 16
-#define PIVCO_DECODE_SRC_PAD 16
-
 /* ---------- Error codes ---------- */
 
 #define PIVCO_OK            0
