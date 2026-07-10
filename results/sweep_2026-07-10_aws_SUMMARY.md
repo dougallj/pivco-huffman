@@ -48,11 +48,24 @@ build-time/decode, r2 = wire cross-check/table-lifetime/interleaved decode).
       jump table; codegen verified): -3.2% vs -3.0% — no effect.
       (Kept in-tree anyway as the better idiom, perf-neutral.)
     - cursor-by-value/return (earlier triage): no effect.
-  Remaining candidates: something per-symbol that static diffing hasn't
-  caught, or distributed frontend/BTB pressure not attributable to one
-  site.  The definitive next tool is a PMU profile (perf stat/record,
-  branch-misses + topdown, main vs tip on json_api) — needs a .metal
-  instance (~US$5/hr, small instances hide the PMU per ~/AWS.md).
+  ROOT CAUSE FOUND (uninline experiment, ..._c8i_noinline.txt): force
+  the primitives out-of-line in BOTH trees and the delta collapses,
+  -3.1% -> -1.3%.  Uninlining costs the OLD walk -2.4% (inlining the
+  merge kernels into it was profitable) but the NEW walk only -0.6%
+  (inlining buys it almost nothing).  I.e. REGISTER PRESSURE: the new
+  walk's extra live state (in_end, cursor, dt, error propagation)
+  exhausts x86-64's 16 GPRs, wrapping the identical inlined kernels in
+  spill traffic (+18 stack round-trips measured statically) that eats
+  back inlining's benefit.  Explains everything: per-symbol source is
+  byte-identical (git diff of the x86 primitives vs main is EMPTY);
+  gcc/clang differ (different register allocators); Intel == AMD (same
+  codegen); ARM immune (31 GPRs — pressure never bites); dispatch/
+  alignment/cursor fixes useless (pressure is the SUM of live values).
+  Residual -1.3% uninlined = true walk-logic overhead (checks etc).
+  Recovery direction if desired: shrink live state across the merge
+  calls — e.g. outline each switch case into a noinline helper taking
+  only the state that kind needs (the experiment shows calls here cost
+  far less than spills), or pack walk state into one context struct.
   Verdict: accepted meanwhile — the table-lifetime regime (the actual
   target) nets 1.45-1.63x on these same hosts INCLUDING this effect;
   the ~2-3% only bites unbounded-lifetime single-table x86 streams.
