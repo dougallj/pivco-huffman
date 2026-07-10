@@ -419,7 +419,7 @@ static int test_joint_lengths(void)
         /* Granularity variants: coarse solves must still produce valid
          * complete trees (incl. ghost-padded alphabets) that roundtrip
          * through the decode-side rebuild. */
-        static const int grans[] = { 0, 2, 4, 8 };
+        static const int grans[] = { 0, 2, 4, 8, -1 };
         pivco_huffman_set_joint_lambda(0.1);
         for (size_t gi = 0; gi < sizeof(grans)/sizeof(*grans); gi++) {
             pivco_huffman_set_joint_granularity(grans[gi]);

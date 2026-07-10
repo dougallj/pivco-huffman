@@ -361,6 +361,42 @@ gap at small G is mostly qsort + model + residual solve; the next
 lever there is amortizing the joint solve across windows (re-run on
 histogram drift), not a faster solver.
 
+## Granularity -1: the greedy boundary nudger (no DP at all)
+
+The dumbest thing that works: one shallow-to-deep walk with the slot
+ledger.  At each level, clamp the baseline class count into the
+feasibility window (capacity c <= (s*2^h - rest)/(2^h - 1) — note an
+UPPER bound, leaves taken now eat slots the remainder needs;
+completeness c >= 2s - rest; provably nonempty), then choose among
+five candidates — clamped baseline, its 1- and 2-bit down-roundings,
+the next power of two up, and 0 (kill the level) — scored by the
+exact chunk cost at this level plus a clamped-baseline ROLLOUT of
+the remainder (a one-level lookahead proxy was badly biased toward
+displacement: 9-14 % payoff; the rollout fixed it).  The scorer runs
+with lambda x1.5: greedy under-flattens relative to the DP, and the
+guard judges with the real lambda, so the bias raises adoption for
+free.  ~2 us per window, ~45x faster than the exact solve.
+
+vs exact on all lits windows: adopts 65-70 % (exact 87-92 %),
+mean J gap 0.32-0.35 % on co-adopted windows, and captures 43-50 %
+of the exact DP's deployed objective improvement.  M4 e2e sweep
+(gran = -1, PHA):
+
+| G     | enc-e2e (auto-DP was) | dec-e2e (auto-DP was) | ratio    |
+|-------|-----------------------|-----------------------|----------|
+| 4 K   | -35.7 % (-51.7 %)     | +23.9 % (+39.5 %)     | -0.26 pp |
+| 8 K   | -33.4 % (-47.5 %)     | +18.2 % (+30.8 %)     | -0.02 pp |
+| 16 K  | -26.4 % (-38.4 %)     | +16.6 % (+27.7 %)     | +0.09 pp |
+| 32 K  | -13.1 % (-24.8 %)     | +13.6 % (+26.4 %)     | +0.09 pp |
+| 64 K  | -4.3 %  (-9.6 %)      | +15.4 % (+32.5 %)     | +0.12 pp |
+| 128 K | +1.5 %  (+0.3 %)      | +16.0 % (+29.0 %)     | +0.12 pp |
+
+Roughly half the decode payoff at roughly half the encode cost of
+the auto DP — a clean third rung on the ladder (nudge 2 us / auto DP
+8-10 us / exact ~100 us).  The residual joint overhead at small G is
+now dominated by the shared plumbing (qsort of the alphabet, the
+guard model, the deal), not the solve.
+
 ## PH vs PHA on this workload
 
 The per-window tables above are PHA (per-node FSE on).
