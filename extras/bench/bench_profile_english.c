@@ -52,7 +52,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    const int N = PIVCO_BLOCK_SIZE;
+    /* Optional argv[2]: block size override (e.g. 16368 vs 16376 to
+     * profile both sides of the dna_fasta layout cliff). */
+    const int N = (argc > 2 && atoi(argv[2]) > 0) ? atoi(argv[2])
+                                                  : PIVCO_BLOCK_SIZE;
     const int NBLOCKS = 4 * 1024 * 1024 / N;
     const int REPS = 20000;
 

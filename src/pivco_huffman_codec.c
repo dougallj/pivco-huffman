@@ -39,15 +39,31 @@
 static __thread uint8_t *g_decode_scratch     = NULL;
 static __thread size_t   g_decode_scratch_cap = 0;
 
+/* DIAGNOSTIC (dna_fasta layout investigation): PIVCO_SCRATCH_OFF=<bytes>
+ * shifts the decode arena base to probe address-relative cache/alias
+ * effects.  Default 0 = production behavior. */
+static size_t decode_scratch_diag_off(void)
+{
+    static long off = -1;
+    if (off < 0) {
+        const char *e = getenv("PIVCO_SCRATCH_OFF");
+        off = e ? atol(e) : 0;
+        if (off < 0 || off > 16384) off = 0;
+    }
+    return (size_t)off;
+}
+
 static uint8_t *decode_scratch_ensure(size_t need)
 {
+    size_t off = decode_scratch_diag_off();
+    need += off + 64;
     if (need > g_decode_scratch_cap) {
         uint8_t *p = (uint8_t *)realloc(g_decode_scratch, need);
         if (!p) return NULL;
         g_decode_scratch     = p;
         g_decode_scratch_cap = need;
     }
-    return g_decode_scratch;
+    return g_decode_scratch + off;
 }
 
 /* MERGE_OVERREAD: the SIMD merges load their source buffers in
