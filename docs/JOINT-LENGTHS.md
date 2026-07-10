@@ -268,6 +268,25 @@ the joint DP (95 MB/s at 4 K, 956 at 128 K); with the original mass
 DP this column read ~1-10 MB/s, i.e. the sweep only became meaningful
 after the fast DP.
 
+Same sweep as PH (--fse=0):
+
+| G     | enc-e2e 0 -> J     | dec-e2e 0 -> J       | ratio avg |
+|-------|--------------------|----------------------|-----------|
+| 4 K   | 473 -> 95 (-80 %)  | 2114 -> 2932 (+39 %) | -0.41 pp  |
+| 8 K   | 745 -> 171 (-77 %) | 3526 -> 4743 (+35 %) | -0.05 pp  |
+| 16 K  | 1048 -> 300 (-71 %)| 5176 -> 6771 (+31 %) | +0.11 pp  |
+| 32 K  | 1242 -> 491 (-61 %)| 6602 -> 8724 (+32 %) | +0.13 pp  |
+| 64 K  | 1327 -> 731 (-45 %)| 7203 -> 9719 (+35 %) | +0.12 pp  |
+| 128 K | 1454 -> 993 (-32 %)| 7969 -> 10678 (+34 %)| +0.10 pp  |
+
+The joint deltas are the same story as PHA; PH's absolute decode is
+what grows — dec-e2e with joint reaches 9.7-10.7 GB/s at 64-128 K
+(+9 % / +21 % over PHA joint), because per-node FSE decode is pure
+overhead wherever it fired.  At G <= 16 K PH == PHA within noise:
+small windows rarely win an FSE node, and the decoder's table build
+dominates the difference.  FSE also stops mattering for ratio at
+this cadence (joint ratio delta stays within +-0.13 pp of PHA's).
+
 What any heuristic could still buy is bounded by the all-in ENCODE
 throughput (G / (encode + table build) per window; decode and ratio
 gain nothing).  At G = 64 K on M4, joint all-in currently runs at
