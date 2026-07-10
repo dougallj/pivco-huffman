@@ -135,6 +135,19 @@ target_include_directories(pivco_bench_tree_table PRIVATE
     ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR})
 
+# ryg-realism context bench: decode throughput of LZ literal streams when
+# the Huffman table is rebuilt every 5-100 KB.  Feed it .lits files from
+# pivco_lz4_lits (below) over e.g. the Silesia corpus.
+add_executable(pivco_bench_table_lifetime bench_table_lifetime.c)
+target_link_libraries(pivco_bench_table_lifetime pivco_huffman m)
+
+# LZ4HC literal-stream extractor for the above (needs system liblz4).
+if(LZ4_LIB AND LZ4_INC)
+    add_executable(pivco_lz4_lits ${CMAKE_SOURCE_DIR}/extras/lz4_lits.c)
+    target_link_libraries(pivco_lz4_lits "${LZ4_LIB}" m)
+    target_include_directories(pivco_lz4_lits PRIVATE "${LZ4_INC}")
+endif()
+
 # Issue-#7 prototype: terrelln's rank-range (implicit-tree) table build +
 # structural-equivalence verifier against the production build.  Correctness
 # only; not a benchmark.
