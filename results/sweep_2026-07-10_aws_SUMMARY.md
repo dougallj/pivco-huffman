@@ -31,8 +31,18 @@ build-time/decode, r2 = wire cross-check/table-lifetime/interleaved decode).
   c8g: +0.3% geomean (neutral, matches M4/clang +1.0%).
   c8i: -3.4% geomean, m7a: -3.8% — consistent across dists (english -4.1/-4.5%,
   json_api -5.8%, prose_pride -5.3/-6.7%).  OPEN ITEM: x86+gcc-13 only.
-  Candidates: gcc-13 hot-loop layout sensitivity (see ~/AWS.md caveat —
-  gcc-13 deltas of 6-12% measured elsewhere that vanish under gcc-15),
-  the schedule-walk restructure's codegen on the x86 backends, or the
-  bounds-check commit (c2f3455, never x86-perf-validated in isolation).
-  Needs a gcc-15/clang re-run and a per-commit bisect on one x86 host.
+  TRIAGED (c8i, sweep_..._c8i_triage.txt): NOT a gcc-13 artifact
+  (gcc-14 -3.6%, clang-18 -1.6%), and no single culprit — it accumulates
+  across the codec restructures (schedule walk -1.4%, decode-table split
+  another -0.9%, bounds checks ~0, tip -3.0% under gcc-13).  A cursor-
+  by-value/return experiment did not recover it (gcc -3.1%, clang -1.1%).
+  Per-dist shape: flat on narrow alphabets (dna 0%, proba80 -1%),
+  -5%ish on wide ones (json_api, prose_pride) — consistent with per-node
+  walk overhead being RELATIVELY costlier on x86, where AVX-512 merges
+  are much faster per symbol than NEON's (ARM hosts are neutral).
+  Verdict: accepted for now — the table-lifetime regime (the actual
+  target) nets 1.45-1.63x on these same hosts INCLUDING this effect;
+  the ~2-3% only bites unbounded-lifetime single-table streams.
+  Recovery ideas if it matters later: fuse the per-record kr/marker/
+  bitmap bounds checks into one span check, flatten dispatch on x86,
+  inline leaf-adjacent child handling into the parent node.
