@@ -387,6 +387,9 @@ endif()
 
 # -------- Standalone analysis / viz / multicore --------
 
+add_executable(pivco_bench_lits_windows bench_lits_windows.c)
+target_link_libraries(pivco_bench_lits_windows pivco_huffman)
+
 add_executable(pivco_bench_multicore
     bench_multicore.c
     ${BENCH_DIST}
