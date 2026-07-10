@@ -282,10 +282,29 @@ Same sweep as PH (--fse=0):
 The joint deltas are the same story as PHA; PH's absolute decode is
 what grows — dec-e2e with joint reaches 9.7-10.7 GB/s at 64-128 K
 (+9 % / +21 % over PHA joint), because per-node FSE decode is pure
-overhead wherever it fired.  At G <= 16 K PH == PHA within noise:
-small windows rarely win an FSE node, and the decoder's table build
-dominates the difference.  FSE also stops mattering for ratio at
-this cadence (joint ratio delta stays within +-0.13 pp of PHA's).
+overhead wherever it fired.
+
+FSE's ABSOLUTE ratio contribution at this cadence (PH minus PHA,
+same lambda, positive = FSE helps), from the paired sweeps:
+
+| G     | lam=0 avg (max)      | lam=0.1 avg (max)      |
+|-------|----------------------|------------------------|
+| 4 K   | +0.000 (all files 0) | +0.013 (+0.16 nci)     |
+| 8 K   | +0.000 (all files 0) | +0.026 (+0.30 nci)     |
+| 16 K  | +0.000 (all files 0) | +0.030 (+0.35 nci)     |
+| 32 K  | +0.051 (+0.17 samba) | +0.102 (+0.37 nci)     |
+| 64 K  | +0.166 (+0.52 samba) | +0.157 (+0.48 samba)   |
+| 128 K | +0.390 (+1.78 reymont)| +0.402 (+1.79 reymont)|
+
+So: at G <= 16 K baseline FSE literally never fires (no node bitmap
+is big enough to beat raw + marker) and PH strictly dominates —
+same ratio, faster decode.  It starts paying around 32-64 K and
+reaches ~0.4 pp average / 1.8 pp max at 128 K, converging toward the
+per-file regime where PHA earns its keep.  Curious side effect:
+under joint lengths FSE fires MORE at small G than baseline (nci
++0.35 pp at 16 K vs 0) — flats absorb the balanced structure, and
+the surviving merges pair very unequal subtrees, whose skewed
+bitmaps are exactly what FSE compresses.
 
 What any heuristic could still buy is bounded by the all-in ENCODE
 throughput (G / (encode + table build) per window; decode and ratio
