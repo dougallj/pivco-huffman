@@ -140,6 +140,7 @@ target_include_directories(pivco_bench_tree_table PRIVATE
 # only; not a benchmark.
 add_executable(pivco_rank_range_table
     bench_rank_range_table.c
+    ${CMAKE_SOURCE_DIR}/extras/pivco_decode_table_ref.c
     ${BENCH_DIST}
 )
 target_link_libraries(pivco_rank_range_table pivco_huffman m)

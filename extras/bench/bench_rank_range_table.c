@@ -37,6 +37,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Standalone specialized reference build (extras/pivco_decode_table_ref.c),
+ * cross-checked against the production decode table below. */
+extern int pivco_huffman_build_decode_table_ref(
+    const uint8_t code_lens[PIVCO_MAX_SYMBOLS],
+    pivco_huffman_decode_table_t *dt);
+
 extern void        bench_init(void);
 extern int         bench_num_distributions(void);
 extern const char *bench_dist_name(int idx);
@@ -373,6 +379,28 @@ static void verify_case(const char *name, const uint64_t freq[PIVCO_MAX_SYMBOLS]
             FAIL("%s: rank_to_codeword not strictly increasing at %u", name, r);
 
     verify_walk(t, &rt, t->tree_root, 0, rt.num_ranks, 0);
+
+    /* The standalone reference build must reproduce the production decode
+     * table byte-for-byte (valid only in OPTIMIZED mode, which is what
+     * this driver runs). */
+    {
+        pivco_huffman_decode_table_t a, b;
+        memset(&a, 0xAA, sizeof(a));
+        memset(&b, 0xAA, sizeof(b));
+        if (pivco_huffman_build_decode_table(t->code_len, &a) != PIVCO_OK)
+            FAIL("%s: production decode-table build failed", name);
+        else if (pivco_huffman_build_decode_table_ref(t->code_len, &b) != PIVCO_OK)
+            FAIL("%s: reference decode-table build failed", name);
+        else {
+            if (a.num_ranks != b.num_ranks || a.sched_len != b.sched_len)
+                FAIL("%s: ref decode table shape %u/%u != %u/%u", name,
+                     b.num_ranks, b.sched_len, a.num_ranks, a.sched_len);
+            else if (memcmp(a.rank_to_sym, b.rank_to_sym, a.num_ranks) ||
+                     memcmp(a.sched, b.sched,
+                            (size_t)a.sched_len * sizeof(a.sched[0])))
+                FAIL("%s: ref decode table contents differ", name);
+        }
+    }
 
 done:
     printf("  %-24s %s (%u ranks, max_len %u)\n", name,
