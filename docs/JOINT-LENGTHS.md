@@ -206,10 +206,40 @@ ratio INCLUDES the 128-byte lengths header per window, lambda = 0.1:
 | 64 K | +37.6 % gm  | +34.5 % gm  | +0.14 % (worst +0.54 %) | 79 % of windows |
 
 No real-data regressions (min −1.8 % at 16 K, +1.1 % at 64 K); some
-files get SMALLER (nci −0.67 %).  The blocker for this cadence is
-table-build cost: ~6 ms/window vs 15-26 us baseline (~230-2900x the
-window's own encode time).  Productization requires the fast DP
-(sparse states / feasibility bounds / drop the 16 B-per-state masks)
-or a heuristic with the DP as offline reference; until then the knob
-is data-bake-for-distribution grade, per the review's complexity
-caveat.
+files get SMALLER (nci −0.67 %).
+
+## Table-build cost history (the productization blocker)
+
+Original mass DP: ~6 ms/window (~230-2900x the window's own encode
+time) — data-bake grade only.  Two rewrites of the exact DP:
+
+1. **Slot-ledger DP** (state (k symbols, s open slots); Kraft equality
+   gives s <= sigma - k): ~10x, 0.02-0.9 ms.
+2. **Diagonal / parity / capacity-band form** (this document's routes
+   1+2, fused): takes preserve t = k + s, so levels decompose into
+   L1-resident diagonals swept in place; live cells have k == t
+   (mod 2) — compact stride-1 rows with b = 0 folded into the
+   inter-level doubling; and sigma - k <= (t - k)*2^(11-L) collapses
+   level 11 to one diagonal, level 10 to half.  Plus branch-free
+   sweeps/doubling (blend beats early-out once everything is L1).
+   Another ~6-9x on M1: sigma = 256 worst case 810 -> 127 us,
+   english 77 -> 8.4 us, proba80 17 -> 2.4 us.  Exactness re-verified
+   against the mass DP on 10k+ cases incl. structural (Kraft/count/
+   J-recompute) validation.  Density check: 89 % of swept cells are
+   live, so this is near the floor for the exact DP.
+
+M4 per-window cost on the Silesia-lits workload (build:enc = table
+build time / the window's own encode time):
+
+| G    | build us/w      | build:enc     | was (slot-ledger) |
+|------|-----------------|---------------|-------------------|
+| 16 K | 16-105          | 4.1-37x       | ~10-56x           |
+| 64 K | 38-179          | 2.4-12.1x     | 6-52x             |
+
+The joint DP's incremental cost over the plain Huffman build is now
+8-124 us/window on M4 (0.3-2.3x the baseline build itself).  Decode /
+encode / ratio are unchanged from the table above — the DP returns
+identical optima, only faster.  Route 3 (greedy-carry heuristic with
+the DP as offline referee) remains open if a further ~3-10x is ever
+needed; the sweeps are compute-bound at ~0.4 ns/cell NEON, so only
+fewer states — an inexact search — buys much more.

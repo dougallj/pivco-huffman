@@ -1,0 +1,66 @@
+# Joint DP: diagonal/parity/band rewrite — M4 Silesia-lits capture
+# branch joint-flat-lengths, 282106b+wip, 2026-07-10
+
+== G=64K lambda=0.1
+G=64K lambda=0.10 reps=6
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6575      5429      1881      123.1      3.58x     11/11
+mozilla.lits   0.9507     12016      4476      171.3     11.72x    139/173
+mr.lits        0.7976      7396      3282      112.3      5.85x     18/25
+nci.lits       0.5213     10017      4145       38.7      2.48x     13/13
+ooffice.lits   0.9261      9458      4704       87.9      6.38x     27/27
+osdb.lits      0.8962     12106      5250       84.7      6.92x     32/32
+reymont.lits   0.7047     14922      5739       55.0      5.08x      3/6
+samba.lits     0.8934     15652      6294       75.6      7.40x     32/37
+sao.lits       0.9762      8116      3513       84.8      4.56x     12/60
+webster.lits   0.6671     12519      4852       39.7      3.00x     45/45
+x-ray.lits     0.8498      9775      4368      108.6      7.24x     67/74
+xml.lits       0.7146     12331      4867       49.7      3.92x      3/3
+
+== G=64K lambda=0 (baseline)
+G=64K lambda=0.00 reps=6
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6572      3092      1288       63.4      1.26x      0/11
+mozilla.lits   0.9489      7427      2649       51.5      2.09x      0/173
+mr.lits        0.7980      6564      2773       40.8      1.80x      0/25
+nci.lits       0.5248      9349      3477       30.2      1.62x      0/13
+ooffice.lits   0.9223      7055      2956       23.8      1.08x      0/27
+osdb.lits      0.8914      8833      3611       20.3      1.14x      0/32
+reymont.lits   0.7023      9817      4606       23.3      1.73x      0/6
+samba.lits     0.8924      8204      3801       22.8      1.35x      0/37
+sao.lits       0.9761      7778      3439       18.9      0.99x      0/60
+webster.lits   0.6671      8632      3406       22.5      1.19x      0/45
+x-ray.lits     0.8475      8288      3891       41.9      2.49x      0/74
+xml.lits       0.7113      8407      3775       24.0      1.47x      0/3
+
+== G=16K lambda=0.1
+G=16K lambda=0.10 reps=6
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6618      4618      1726       62.1      6.63x     44/44
+mozilla.lits   0.9487     13804      5772      107.7     37.95x    663/691
+mr.lits        0.7990      9907      4400       80.5     21.80x     80/97
+nci.lits       0.5268     10017      4145       15.8      4.05x     49/52
+ooffice.lits   0.9242     10801      4915       75.7     22.74x    107/107
+osdb.lits      0.9006     11828      4831       73.2     21.66x    126/126
+reymont.lits   0.7058     14922      6017       29.8     11.06x     17/23
+samba.lits     0.8935     23792      7931       55.2     26.88x    136/146
+sao.lits       0.9730      8971      4460       73.8     20.16x    130/240
+webster.lits   0.6719     12796      4812       24.4      7.17x    177/177
+x-ray.lits     0.8544      9935      4444       79.9     21.68x    287/296
+xml.lits       0.6978     13211      5440       28.9     10.21x     10/12
+
+== G=16K lambda=0 (baseline)
+G=16K lambda=0.00 reps=6
+file             ratio  dec MB/s  enc MB/s build us/w  build:enc   adopted
+dickens.lits   0.6609      3026      1235       25.1      1.92x      0/44
+mozilla.lits   0.9471      7418      2669       22.0      3.59x      0/691
+mr.lits        0.7986      8900      3663       13.9      3.14x      0/97
+nci.lits       0.5292     10261      4085        8.7      2.18x      0/52
+ooffice.lits   0.9215      7777      3320       10.3      2.08x      0/107
+osdb.lits      0.8969      8721      3506        8.7      1.86x      0/126
+reymont.lits   0.7064     10972      4606        8.6      2.44x      0/23
+samba.lits     0.8925      9671      4287        8.1      2.12x      0/146
+sao.lits       0.9729      8597      4175        7.6      1.93x      0/240
+webster.lits   0.6718      8871      3359        8.3      1.71x      0/177
+x-ray.lits     0.8524      8054      3738       13.4      3.06x      0/296
+xml.lits       0.6973     10276      4204        8.7      2.36x      0/12

@@ -20,8 +20,10 @@
  * an optimal length-limited code (== the Huffman + limit baseline), so
  * the knob's off state simply skips this pass.
  *
- * DP size: <= ~70 items x 257 x 2049 states; ~10 MB transient scratch,
- * a few ms — runs once per table build.
+ * DP size: the production path (lambda <= 1/7) runs the slot-ledger DP
+ * below on a diagonal-major, parity-compact, capacity-banded lattice —
+ * ~1 MB transient scratch, tens of microseconds.  Larger lambda falls
+ * back to the original mass DP (~10 MB, a few ms).
  */
 
 #include "pivco_huffman.h"
@@ -78,8 +80,7 @@ static int jl_cmp_sf(const void *a, const void *b)
  * OPEN SLOTS at the current level, the ledger is tiny: a state is
  * (k symbols placed, s open slots), and Kraft EQUALITY forces
  * s <= sigma - k at every level (each remaining symbol fills at most
- * one current-level slot's worth of mass), so s <= 256 and the whole
- * plane is 257 x 257 -- cache resident.
+ * one current-level slot's worth of mass).
  *
  * Levels are processed ascending, bits within a level descending.
  * That order equals GLOBAL slot-cost order -- the requirement for the
@@ -90,156 +91,238 @@ static int jl_cmp_sf(const void *a, const void *b)
  * lam <= 1/7.  For larger lambda the caller falls back to the exact
  * mass DP.
  *
- * Transitions: at level L with plane cost[k][s], for b = min(8,L)..0,
- * optionally take chunk (L, b): (k, s) -> (k + 2^b, s - 2^b) adding
- * cost(L,b) * (P[k+2^b] - P[k]).  In-place 0/1 semantics hold with
- * k-descending / s-ascending iteration.  Between levels, s -> 2*s
- * with the s <= sigma - k feasibility prune.  Terminal: (sigma, 0)
- * after level 11.  Per-state u16 planes record B_L for backtracking.
+ * Three structural facts turn the plane walk into an L1-resident
+ * kernel:
+ *
+ * DIAGONALS.  A take (k, s) -> (k + 2^b, s - 2^b) preserves t = k + s,
+ * so within a level the DP decomposes into independent diagonals.
+ * Stored diagonal-major ([t] rows, k along the row), all take sweeps
+ * of a level run over one <~0.5 KB row that stays in L1; the plane is
+ * traversed once per level (the doubling), not once per sweep.
+ *
+ * PARITY.  Level-entry states have even s (they come from the
+ * doubling s' = 2s) and takes with b >= 1 preserve s-parity, so the
+ * live lattice is k == t (mod 2): compact index j = (k - (t&1))/2
+ * halves each row and makes it stride-1 dense.  b = 0 — the only
+ * parity flip, always last in the level's cost order — is folded into
+ * the doubling (an odd-s cell's unique source is its even-lattice
+ * predecessor plus one lone leaf) and reconstructed from s-parity at
+ * backtrack.  Level LMAX never takes b = 0: entry s is even and the
+ * terminal needs its takes to sum to s exactly, so bit 0 of c_LMAX
+ * is always clear (deepest-level leaf counts are even).
+ *
+ * CAPACITY BAND.  A state at level L can place at most s * 2^h more
+ * symbols (h = LMAX - L; push everything to depth LMAX), so
+ * sigma - k <= (t - k) << h is necessary — and met by every
+ * completing trajectory, making the prune exact.  In diagonal
+ * coordinates: rows t >= ceil(sigma / 2^h) with per-row cap
+ * k <= (t*2^h - sigma)/(2^h - 1).  Level 11 collapses to the single
+ * diagonal t = sigma, level 10 loses half its rows, level 9 three
+ * quarters.  Feasibility is preserved cell-to-cell by takes (same
+ * condition) and by the doubling (dest feasible at L+1 <=> even
+ * source feasible at L; the folded-b0 predecessor is implied with
+ * 2^h >= 2 slack), so pruned — hence stale — cells are never read.
+ *
+ * Terminal: (k = sigma, s = 0), i.e. cell k = sigma of diagonal
+ * t = sigma after level 11.  Per-level u16 pick rows (bits 1..8; bit
+ * 0 is implicit in parity) are archived per diagonal for backtrack.
  */
-#define JL_SCAP 256
+#define JL_WMAX 132     /* max compact row: j <= 128, padded to x4 */
+
+/* Largest compact index j on diagonal t whose k = 2j + (t&1) can still
+ * feed sigma - k leaves through (t - k) slots h levels above the
+ * bottom; -1 if the whole row is infeasible. */
+static inline int jl_row_jcap(int t, int h, int sigma)
+{
+    const int p = t & 1;
+    int kcap;
+    if (h == 0) {
+        kcap = t;                     /* t == sigma: all k feasible */
+    } else {
+        const int num = (t << h) - sigma;
+        if (num < 0) return -1;
+        kcap = num / ((1 << h) - 1);
+        if (kcap > t) kcap = t;
+    }
+    if (kcap < p) return -1;
+    return (kcap - p) >> 1;
+}
 
 static double jl_solve_slots(const double *P, int sigma, double lam,
                              uint16_t out_BL[JL_LMAX + 1])
 {
-    enum { W = JL_SCAP + 1 };
-    const size_t plane = (size_t)(sigma + 1) * W;
+    const int W = (((sigma >> 1) + 2) + 3) & ~3;   /* compact row width */
+    const size_t plane = (size_t)(sigma + 1) * (size_t)W;
     float    *cost = malloc(plane * sizeof(float));
-    uint16_t *pick = malloc(plane * sizeof(uint16_t));
-    uint16_t *arch = malloc((size_t)(JL_LMAX + 1) * plane * sizeof(uint16_t));
-    if (!cost || !pick || !arch) { free(cost); free(pick); free(arch); return -1.0; }
-    for (size_t i = 0; i < plane; i++) cost[i] = INFINITY;
-#define SIX(k, s) ((size_t)(k) * W + (size_t)(s))
-    cost[SIX(0, 2)] = 0.0f;               /* level 1 opens with 2 slots */
+    uint16_t *arch = malloc((size_t)JL_LMAX * plane * sizeof(uint16_t));
+    float     dPt[2][9][JL_WMAX];   /* [t&1][b][j]: P[k + 2^b] - P[k] */
+    float     dP0[PIVCO_MAX_SYMBOLS + 1];          /* P[k] - P[k-1]   */
+    if (!cost || !arch) { free(cost); free(arch); return -1.0; }
 
-    for (int L = 1; L <= JL_LMAX; L++) {
-        memset(pick, 0, plane * sizeof(uint16_t));
-        int bmax = L < 8 ? L : 8;
-        /* Reachability triangle: entering level L, the slot identity
-         * gives k + s <= 2^L, and Kraft-equality feasibility gives
-         * s <= sigma - k at entry (enforced by the doubling prune);
-         * takes preserve k + s, so the whole level lives inside
-         * k + s <= min(2^L, sigma) — early levels are tiny, late ones
-         * halve to the sigma-triangle. */
-        const int cap = (L >= 9 || (1 << L) > sigma) ? sigma : (1 << L);
-        for (int b = bmax; b >= 0; b--) {
+    for (int p = 0; p < 2; p++)
+        for (int b = 1; b <= 8; b++) {
             const int cnk = 1 << b;
-            if (cnk > sigma) continue;
-            const float a = (float)((double)L + lam * (double)(L - b));
-            int khi = sigma - cnk;
-            if (khi > cap - cnk) khi = cap - cnk;
-            for (int k = khi; k >= 0; k--) {
-                const float add = a * (float)(P[k + cnk] - P[k]);
-                float    *crow = cost + SIX(k, 0), *drow = cost + SIX(k + cnk, 0);
-                uint16_t *prow = pick + SIX(k, 0), *qrow = pick + SIX(k + cnk, 0);
-                int shi = cap - k;
-                if (shi > JL_SCAP) shi = JL_SCAP;
-                /* Parity: level-entry states live only at even s (they
-                 * come from the doubling), and takes with b >= 1 keep
-                 * s-parity, so odd cells can only appear after the
-                 * (last-processed) b == 0 sweep.  Bits b >= 1 therefore
-                 * step s by 2 — half the lattice for 8 of 9 sweeps. */
-                const int step = b >= 1 ? 2 : 1;
-#if defined(__aarch64__)
-                if (step == 1) {
-                    const float32x4_t vadd = vdupq_n_f32(add);
-                    const uint16x4_t  vbit = vdup_n_u16((uint16_t)(1u << b));
-                    int s = cnk;
-                    for (; s + 4 <= shi + 1; s += 4) {
-                        float32x4_t v    = vld1q_f32(crow + s);
-                        float32x4_t dstv = vld1q_f32(drow + s - cnk);
-                        float32x4_t cand = vaddq_f32(v, vadd);
-                        uint32x4_t  m    = vcltq_f32(cand, dstv);
-                        if (!vmaxvq_u32(m)) continue;
-                        vst1q_f32(drow + s - cnk, vbslq_f32(m, cand, dstv));
-                        uint16x4_t  pm   = vmovn_u32(m);
-                        uint16x4_t  pv   = vorr_u16(vld1_u16(prow + s), vbit);
-                        uint16x4_t  qv   = vld1_u16(qrow + s - cnk);
-                        vst1_u16(qrow + s - cnk, vbsl_u16(pm, pv, qv));
-                    }
-                    for (; s <= shi; s++) {
-                        const float v = crow[s];
-                        if (!(v < INFINITY)) continue;
-                        const float cand = v + add;
-                        if (cand < drow[s - cnk]) {
-                            drow[s - cnk] = cand;
-                            qrow[s - cnk] = (uint16_t)(prow[s] | (1u << b));
-                        }
-                    }
-                } else {
-                    /* even-s sub-lattice: gather stride-2 via vld2 */
-                    const float32x4_t vadd = vdupq_n_f32(add);
-                    const uint16x4_t  vbit = vdup_n_u16((uint16_t)(1u << b));
-                    int s = cnk;                    /* cnk even here */
-                    for (; s + 8 <= shi + 1; s += 8) {
-                        float32x4x2_t v2 = vld2q_f32(crow + s);
-                        float32x4x2_t d2 = vld2q_f32(drow + s - cnk);
-                        float32x4_t cand = vaddq_f32(v2.val[0], vadd);
-                        uint32x4_t  m    = vcltq_f32(cand, d2.val[0]);
-                        if (!vmaxvq_u32(m)) continue;
-                        d2.val[0] = vbslq_f32(m, cand, d2.val[0]);
-                        vst2q_f32(drow + s - cnk, d2);
-                        uint16x4x2_t p2 = vld2_u16(prow + s);
-                        uint16x4x2_t q2 = vld2_u16(qrow + s - cnk);
-                        uint16x4_t  pm  = vmovn_u32(m);
-                        q2.val[0] = vbsl_u16(pm, vorr_u16(p2.val[0], vbit), q2.val[0]);
-                        vst2_u16(qrow + s - cnk, q2);
-                    }
-                    for (; s <= shi; s += 2) {
-                        const float v = crow[s];
-                        if (!(v < INFINITY)) continue;
-                        const float cand = v + add;
-                        if (cand < drow[s - cnk]) {
-                            drow[s - cnk] = cand;
-                            qrow[s - cnk] = (uint16_t)(prow[s] | (1u << b));
-                        }
-                    }
-                }
-#else
-                for (int s = cnk; s <= shi; s += step) {
-                    const float v = crow[s];
-                    if (!(v < INFINITY)) continue;
-                    const float cand = v + add;
-                    if (cand < drow[s - cnk]) {
-                        drow[s - cnk] = cand;
-                        qrow[s - cnk] = (uint16_t)(prow[s] | (1u << b));
-                    }
-                }
-#endif
+            for (int j = 0; j < W; j++) {
+                const int k = 2 * j + p;
+                dPt[p][b][j] = k + cnk <= sigma
+                             ? (float)(P[k + cnk] - P[k]) : 0.0f;
             }
         }
-        memcpy(arch + (size_t)L * plane, pick, plane * sizeof(uint16_t));
+    dP0[0] = 0.0f;
+    for (int k = 1; k <= sigma; k++) dP0[k] = (float)(P[k] - P[k - 1]);
+
+    int tlo[JL_LMAX + 1], thi[JL_LMAX + 1];
+    for (int L = 1; L <= JL_LMAX; L++) {
+        const int h = JL_LMAX - L;
+        thi[L] = (1 << L) > sigma ? sigma : (1 << L);
+        tlo[L] = (sigma + (1 << h) - 1) >> h;
+        if (tlo[L] < 1) tlo[L] = 1;
+    }
+
+    /* Lazy init: every row is fully written by the doubling that
+     * produces its level (INF outside the feasible range), so only
+     * the level-1 band rows need priming. */
+    for (int t = tlo[1]; t <= thi[1]; t++)
+        for (int j = 0; j < W; j++) cost[(size_t)t * W + j] = INFINITY;
+    cost[2 * W + 0] = 0.0f;      /* level-1 entry: k = 0, s = 2, t = 2 */
+
+    for (int L = 1; L <= JL_LMAX; L++) {
+        const int h = JL_LMAX - L;
+        const int bmax = L < 8 ? L : 8;
+        uint16_t *archL = arch + (size_t)(L - 1) * plane;
+        for (int t = tlo[L]; t <= thi[L]; t++) {
+            const int p = t & 1;
+            const int jcap = jl_row_jcap(t, h, sigma);
+            if (jcap < 0) continue;
+            float *row = cost + (size_t)t * W;
+            uint16_t *prow = archL + (size_t)t * W;   /* pick, archived
+                                                       * in place      */
+            memset(prow, 0, (size_t)(jcap + 1) * sizeof(uint16_t));
+            for (int b = bmax; b >= 1; b--) {
+                const int jstep = 1 << (b - 1);       /* = 2^b slots / 2 */
+                const int jhi = jcap - jstep;         /* dest j <= jcap  */
+                if (jhi < 0) continue;
+                const float a = (float)((double)L + lam * (double)(L - b));
+                const float *dpb = dPt[p][b];
+                int j = jhi;
+                /* 0/1 in-place: dest j + jstep > src j, so iterate j
+                 * descending — a written dest is never re-read as a
+                 * source for the same chunk (within a 4-block, loads
+                 * precede stores, which is the same pre-update read).
+                 * Stores are unconditional: everything is L1-resident,
+                 * so blending beats the data-dependent branch of a
+                 * "did anything improve" early-out. */
+#if defined(__aarch64__)
+                const float32x4_t va = vdupq_n_f32(a);
+                const uint16x4_t vbit = vdup_n_u16((uint16_t)(1u << b));
+                for (; j >= 3; j -= 4) {
+                    const int base = j - 3;
+                    float32x4_t src = vld1q_f32(row + base);
+                    float32x4_t cand = vfmaq_f32(src, vld1q_f32(dpb + base), va);
+                    float32x4_t dst = vld1q_f32(row + base + jstep);
+                    uint32x4_t m = vcltq_f32(cand, dst);
+                    vst1q_f32(row + base + jstep, vbslq_f32(m, cand, dst));
+                    uint16x4_t pm = vmovn_u32(m);
+                    uint16x4_t pv = vorr_u16(vld1_u16(prow + base), vbit);
+                    uint16x4_t qv = vld1_u16(prow + base + jstep);
+                    vst1_u16(prow + base + jstep, vbsl_u16(pm, pv, qv));
+                }
+#endif
+                for (; j >= 0; j--) {
+                    const float v = row[j];
+                    if (!(v < INFINITY)) continue;
+                    const float cand = v + a * dpb[j];
+                    if (cand < row[j + jstep]) {
+                        row[j + jstep] = cand;
+                        prow[j + jstep] = (uint16_t)(prow[j] | (1u << b));
+                    }
+                }
+            }
+        }
         if (L == JL_LMAX) break;
-        /* Between levels: s' = 2*s, pruned by s' <= sigma - k (Kraft
-         * equality feasibility).  In place, s' descending: every read
-         * (at s'/2 < s') hits a not-yet-written slot. */
-        for (int k = 0; k <= sigma; k++) {
-            float *row = cost + SIX(k, 0);
-            const int spmax = sigma - k;        /* max legal s' */
-            for (int t = JL_SCAP; t >= 1; t--)
-                row[t] = ((t & 1) == 0 && t <= spmax) ? row[t / 2]
-                                                      : INFINITY;
-            /* t == 0: s'=0 from s=0 — row[0] unchanged. */
+        /* Doubling s' = 2s with the b = 0 take folded in.  Dest cell
+         * (t', k) has the unique source (t = (t'+k)/2, k): even-lattice
+         * there if k == t (mod 2), else the odd-s product of a lone
+         * leaf taken at level L from (t, k-1).  In place, t' and j'
+         * descending: sources live on rows <= t', and the single
+         * same-row read (t = t', only at k = t') happens before its
+         * cell is overwritten.
+         *
+         * Branchless: on dest row t' the source diagonal is
+         * t = t0 + j' (t0 = (t'+p')/2), so the level-L band check
+         * hoists to a j'-range, and the source parity d = (t^k)&1
+         * alternates with j' — two constant-stride subloops with the
+         * unified source index (k - d - (t&1))/2.  The subloop that
+         * contains the top cell runs first (it holds the only
+         * same-row read). */
+        const float a0 = (float)((double)L * (1.0 + lam));
+        for (int tp = thi[L + 1]; tp >= tlo[L + 1]; tp--) {
+            const int pp = tp & 1;
+            const int jcap2 = jl_row_jcap(tp, h - 1, sigma);
+            if (jcap2 < 0) continue;
+            float *nrow = cost + (size_t)tp * W;
+            const int t0 = (tp + pp) >> 1;
+            int jlo = tlo[L] - t0; if (jlo < 0) jlo = 0;
+            int jhi2 = thi[L] - t0; if (jhi2 > jcap2) jhi2 = jcap2;
+            for (int jp = jcap2; jp > jhi2; jp--) nrow[jp] = INFINITY;
+            for (int jp = jlo - 1; jp >= 0; jp--) nrow[jp] = INFINITY;
+            for (int half = 0; half < 2; half++) {
+                int jp = jhi2 - half;
+                if (jp < jlo) continue;
+                const int k1 = 2 * jp + pp;
+                const int t1 = t0 + jp;
+                const int d = (t1 ^ k1) & 1;
+                const float *src = cost + (size_t)t1 * W
+                                 + (size_t)((k1 - d - (t1 & 1)) >> 1);
+                if (d == 0) {
+                    for (; jp >= jlo; jp -= 2, src -= 2 * W + 2)
+                        nrow[jp] = *src;
+                } else {
+                    /* k = 0 has no lone-leaf predecessor: if this
+                     * chain reaches cell (jp = 0, k = 0), stop above
+                     * it and mark it unreachable. */
+                    int floor2 = jlo, patch0 = 0;
+                    if (pp == 0 && (jp & 1) == 0 && jlo == 0) {
+                        floor2 = 2;
+                        patch0 = 1;
+                    }
+                    const float *dp0 = dP0 + k1;
+                    for (; jp >= floor2; jp -= 2, src -= 2 * W + 2, dp0 -= 4)
+                        nrow[jp] = *src + a0 * *dp0;
+                    if (patch0)
+                        nrow[0] = INFINITY;
+                }
+            }
         }
     }
 
-    double J = cost[SIX(sigma, 0)];
+    double J = cost[(size_t)sigma * W + (size_t)((sigma - (sigma & 1)) >> 1)];
     if (J < INFINITY) {
-        /* Backtrack: invert each level's transition. */
-        int k = sigma, sleft = 0;
+        /* Backtrack: invert each level's transition; odd end-of-level
+         * s means the folded b0 was taken there — recover its bits
+         * from the even-lattice predecessor and set bit 0. */
+        int k = sigma, s = 0;
         for (int L = JL_LMAX; L >= 1; L--) {
-            uint16_t BL = arch[(size_t)L * plane + SIX(k, sleft)];
+            const int t = k + s;
+            const int p = t & 1;
+            const uint16_t *arow = arch + (size_t)(L - 1) * plane
+                                        + (size_t)t * W;
+            uint16_t BL;
+            if ((k ^ t) & 1)
+                BL = (uint16_t)(arow[(k - 1 - p) >> 1] | 1u);
+            else
+                BL = arow[(k - p) >> 1];
             out_BL[L] = BL;
             int cL = 0;
             for (int b = 0; b <= 8; b++) if (BL & (1 << b)) cL += 1 << b;
             k -= cL;
-            int s_entry = sleft + cL;         /* slots at level L entry  */
-            sleft = s_entry / 2;              /* pre-doubling slots left */
+            s += cL;                  /* slots at level L entry (even) */
+            if (L > 1) s >>= 1;       /* pre-doubling slots left       */
         }
     } else {
         J = -1.0;
     }
-    free(cost); free(pick); free(arch);
+    free(cost); free(arch);
     return J;
 }
 
