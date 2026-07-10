@@ -341,9 +341,7 @@ int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
 
 /* Decode-walk I/O context: constant for a whole block's walk.
  *   in_end     — one past the last readable input byte (in + in_len).
- *   in_bounce  — N+16-byte arena slab; packed-flat regions that end
- *                within SRC_SLACK of in_end are copied here so the
- *                tail-free unpack kernels never read past in_end.
+ *   in_bounce  — N+16-byte arena slab for end-of-input flat tails.
  * (Raw bitmaps bounce into each call's bm_scratch instead — see
  * wire_read_bitmap.)  Compiled with SRC_SLACK == 0 (exact backends),
  * every check folds away. */
@@ -351,6 +349,41 @@ typedef struct {
     const uint8_t *in_end;
     uint8_t       *in_bounce;
 } codec_dec_io_t;
+
+/* Flat region decode with end-of-input protection.  The packed-flat
+ * kernels read up to SRC_SLACK bytes past the region (except D == 8,
+ * which is an exact memcpy).  When a region ends within SRC_SLACK of
+ * in_end — in practice the block's final region against a tight
+ * buffer — decode the longest 16-code-aligned prefix straight from
+ * the stream (16 codes = 2*D bytes, so the split is byte-aligned, and
+ * the prefix call's reads stay at or under in_end) and only the
+ * remaining tail codes from a copy in `slab`: a <= 48-byte memcpy
+ * instead of bouncing the whole region. */
+static inline void codec_flat_region(uint8_t *out, int K,
+                                     const uint8_t *bm, int D,
+                                     const uint8_t *c2s,
+                                     const uint8_t *in_end,
+                                     uint8_t *slab)
+{
+    int total_bytes = (K * D + 7) >> 3;
+    if (PIVCO_PRIM_DEC_SRC_SLACK == 0 || D == 8
+        || bm + total_bytes + PIVCO_PRIM_DEC_SRC_SLACK <= in_end) {
+        prim_merge_flat(out, K, bm, D, c2s);
+        return;
+    }
+    size_t avail = (size_t)(in_end - bm);
+    size_t safe  = avail > (size_t)PIVCO_PRIM_DEC_SRC_SLACK
+                 ? avail - (size_t)PIVCO_PRIM_DEC_SRC_SLACK : 0;
+    int n1 = (int)((safe * 8 / (size_t)D) & ~(size_t)15);
+    if (n1 > K) n1 = K & ~15;
+    if (n1 > 0) prim_merge_flat(out, n1, bm, D, c2s);
+    int n2 = K - n1;
+    if (n2 > 0) {
+        size_t b1 = (size_t)n1 * (size_t)D / 8;
+        memcpy(slab, bm + b1, (size_t)total_bytes - b1);
+        prim_merge_flat(out + n1, n2, slab, D, c2s);
+    }
+}
 
 static void codec_decode_subtree(const pivco_huffman_table_t *table,
                                    int16_t node_id, int K,
@@ -378,14 +411,10 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
         int total_bytes = (K * D + 7) >> 3;
         const uint8_t *bm = *in_ptr;
         *in_ptr += total_bytes;
-        if (PIVCO_PRIM_DEC_SRC_SLACK > 0
-            && bm + total_bytes + PIVCO_PRIM_DEC_SRC_SLACK > io->in_end) {
-            memcpy(io->in_bounce, bm, (size_t)total_bytes);
-            bm = io->in_bounce;
-        }
         const uint8_t *c2s =
             &table->flat_code_to_sym[table->flat_offset[node_id]];
-        prim_merge_flat(out_buf, K, bm, D, c2s);
+        codec_flat_region(out_buf, K, bm, D, c2s,
+                          io->in_end, io->in_bounce);
         return;
     }
 
