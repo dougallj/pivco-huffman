@@ -399,6 +399,22 @@ Already shipped: *leaf-child* fusion (half-partition + scatter when one side is 
 ### Relaxed / near-flat subtree detection, 2026-05-09
 Two flavours, both bad: (A) force non-Huffman code lengths to create more flat subtrees — directly hurts compression; (B) almost-flat detection with per-element outlier handling — requires per-code outlier-marker bit (compression loss) AND per-element conditional in the scatter-bound hot loop (kills throughput).  Existing recursive path handles non-flat subtrees fine.  **UPDATE 2026-07-11: flavour (A)'s dismissal was quantitatively wrong** — priced with a lambda objective and solved exactly, the first ~40% of merge passes cost only ~+0.4% bits (and at G <= 8K windows the joint lengths COMPRESS BETTER than the limit heuristic).  Shipped on joint-flat-lengths* branches: exact DP + coarse/nudge ladder + adoption guard, +25..+95% e2e decode vs upstream at the 5-100KB table cadence.  See docs/JOINT-LENGTHS.md and docs/FLAT-ROUTING-ENTROPY.md (under entropy-coded routing the 'hurts compression' premise dissolves entirely).
 
+### Fused pair+stream merge (two bitmaps, one byte stream), 2026-07-11
+Merge whose one child is a PAIR node, with the pair side generated in-register
+(bit-cursor into the pair bitmap; dup16+tbl+tst+bsl replaces the R-side load)
+instead of materialized by merge_cst_cst first.  Measured (M1,
+extras/bench/bench_pair_fuse.c, production-idiom kernels as baseline): the
+generation cost is per-CHUNK, density-independent (+0.019 ns/output), while the
+standalone pair pass costs only 0.034 ns per actual pair element with an
+L1-resident scratch round-trip — so fused loses below pair-share q ~ 0.55 of
+the parent merge (-25% at q=0.125) and wins only +6% at q=0.75.  x86 pdep
+(deposit pair bits directly into output positions) is the elegant formulation
+but only moves the crossover to q ~ 0.4.  Joint trees carry ~3% of weight in
+pairs (the DP avoids them), so the whole-decode ceiling is <<1% on lits.
+Salvageable niche: shape-dispatched variant (fused iff K_right/K > 0.6, known
+per block at decode) for skewed-head PH trees where ~40% of weight flows
+through a q~0.75 parent — worth ~5% of those merges.  Not shipped.
+
 ### Iterative DFS instead of recursion
 Tested.  Essentially noise on M4.
 
