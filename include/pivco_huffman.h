@@ -429,6 +429,17 @@ void pivco_huffman_set_joint_kappa(const double kappa[9]);
  * reproduce the kind-blind pass model exactly. */
 void pivco_huffman_set_joint_merge_costs(double mu_cst, double prefill);
 
+/* FSE decode tax for the guard's time model (PHA only; inert under
+ * PH or tau = 0, the default): a merge bitmap the per-node coder is
+ * predicted to commit (>= wmin elements/block and skew clearing the
+ * eta-efficiency + marker threshold) costs tau extra full-merge
+ * passes per element to decode.  Default tau = 4.0 (measured Apple
+ * M-class); pass 0 to disable.  This term is what the geometric -28%
+ * was: the joint tree concentrates routing into fewer, more skewed
+ * bitmaps, the coder commits on them, and the decode tax swamps the
+ * pass savings. */
+void pivco_huffman_set_joint_fse_tax(double tau, double eta, double wmin);
+
 /* ---------- Table construction ---------- */
 
 int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],

@@ -104,6 +104,32 @@ void pivco_huffman_set_joint_merge_costs(double mu_cst, double prefill)
     g_joint_prefill = (prefill >= 0 && prefill <= 1) ? prefill : 0.0;
 }
 
+/* FSE decode tax (PHA only): a merge whose bitmap the per-node FSE
+ * coder commits decodes ~tau full-merge passes SLOWER per element
+ * (measured ~3-5x a raw merge).  The commit predictor mirrors the
+ * coder's bytes-shrink rule to first order: commit iff the node sees
+ * >= wmin elements per block and its bitmap skew clears the coder's
+ * efficiency eta plus marker overhead:
+ *     1 - H2(q)  >  (1 - eta) + 16/W_block.
+ * tau = 0 (default) disables the term; it is also inert whenever
+ * pivco_huffman_set_fse_enabled(0) (PH) is in effect.  This term is
+ * what the geometric -28% was: the joint tree concentrates routing
+ * into fewer, more skewed bitmaps, FSE commits on them for a real
+ * ratio win, and the decode tax swamps the merge-pass savings —
+ * kind-blind AND kind-aware pass models both miss it. */
+static double g_joint_fse_tau  = 4.0;   /* measured M-class: FSE'd
+                                         * bitmap ~4 raw-merge passes
+                                         * per element */
+static double g_joint_fse_eta  = 0.85;
+static double g_joint_fse_wmin = 64.0;
+
+void pivco_huffman_set_joint_fse_tax(double tau, double eta, double wmin)
+{
+    g_joint_fse_tau  = (tau >= 0 && tau < 1000) ? tau : 0.0;
+    g_joint_fse_eta  = (eta > 0 && eta <= 1) ? eta : 0.85;
+    g_joint_fse_wmin = wmin > 0 ? wmin : 64.0;
+}
+
 /* Per-flat-depth kernel costs kappa[b], b = 0..8, in merge-pass units
  * (kappa_b = measured flat-kernel ns/sym at depth b divided by merge
  * ns/sym).  Default all-zero = the historical model.  Real tables are
@@ -162,7 +188,8 @@ static int jl_cmp_ch(const void *a, const void *b)
  * the parent sees (0 = lone leaf, 1 = internal).  pre marks the chunk
  * index holding the prefilled top symbol (-1 = none). */
 static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
-                     const double *kap, double *Wout, int *kind)
+                     const double *kap, double scale,
+                     double *Wout, int *kind)
 {
     if (*i < n && ch[*i].r == d) {
         const jl_ch_t *c = &ch[(*i)++];
@@ -174,8 +201,8 @@ static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
     double Wl = 0, Wr = 0, tl, tr;
     int kl, kr;
     const int il = *i;
-    tl = jl_sim(ch, n, i, d + 1, pre, kap, &Wl, &kl);
-    tr = jl_sim(ch, n, i, d + 1, pre, kap, &Wr, &kr);
+    tl = jl_sim(ch, n, i, d + 1, pre, kap, scale, &Wl, &kl);
+    tr = jl_sim(ch, n, i, d + 1, pre, kap, scale, &Wr, &kr);
     double W = Wl + Wr;
     double t;
     if (kl == 0 || kr == 0) {
@@ -187,6 +214,18 @@ static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
             t -= (kl == 0 ? Wl : Wr) * g_joint_prefill * g_joint_mu_cst;
     } else
         t = W;                                /* full partition */
+    /* FSE decode tax on predicted-committed bitmaps (PHA only) */
+    if (g_joint_fse_tau > 0 && W > 0 && pivco_huffman_get_fse_enabled()) {
+        const double Wb = W * scale;          /* elements per block */
+        if (Wb >= g_joint_fse_wmin) {
+            double q = Wl / W;
+            if (q > 0 && q < 1) {
+                const double h2 = -(q * log2(q) + (1 - q) * log2(1 - q));
+                if (1.0 - h2 > (1.0 - g_joint_fse_eta) + 16.0 / Wb)
+                    t += g_joint_fse_tau * W;
+            }
+        }
+    }
     *Wout = W;
     *kind = 1;
     return t + tl + tr;
@@ -198,8 +237,11 @@ static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
  * approximate "the most frequent symbol is a lone leaf" by "the
  * heaviest D0 chunk outweighs (per symbol) every other chunk", which
  * is exact under the deal's sorted order. */
-static double jl_time_kinds(jl_ch_t *ch, int n, const double *kap)
+static double jl_time_kinds(jl_ch_t *ch, int n, const double *kap,
+                            double total_weight)
 {
+    const double scale = total_weight > 0
+                       ? (double)PIVCO_BLOCK_SIZE / total_weight : 0.0;
     qsort(ch, (size_t)n, sizeof(jl_ch_t), jl_cmp_ch);
     /* prefill: the decoder prefills the most frequent SYMBOL; that
      * symbol lives in the first-dealt (cheapest) chunk.  Discount
@@ -212,7 +254,7 @@ static double jl_time_kinds(jl_ch_t *ch, int n, const double *kap)
     }
     int i = 0, kind;
     double W;
-    double t = jl_sim(ch, n, &i, 0, pre, kap, &W, &kind);
+    double t = jl_sim(ch, n, &i, 0, pre, kap, scale, &W, &kind);
     return i == n ? t : -1.0;   /* -1: malformed multiset (cannot happen) */
 }
 
@@ -801,7 +843,7 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
                     npc++;
                 }
         }
-        prod_time = jl_time_kinds(pch, npc, kap);
+        prod_time = jl_time_kinds(pch, npc, kap, P[sigma]);
         if (prod_time < 0) return -1;
     }
 
@@ -901,7 +943,7 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
             cur += chunks[i].size;
         }
         if (cur != sigma_pad) return -1;
-        dp_time = jl_time_kinds(dch, nchunks, kap);
+        dp_time = jl_time_kinds(dch, nchunks, kap, P[sigma]);
         if (dp_time < 0) return -1;
     }
     if (!(dp_time <= g_joint_guard_pass * prod_time

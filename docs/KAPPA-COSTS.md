@@ -143,3 +143,48 @@ tree"; (iii) re-run the lits ladder to check the kappa-aware optimum
 doesn't give back the measured wins (expected: mild D-mix shifts
 toward 4/8-depth flats, slightly fewer deep flats); (iv) fold the
 same table into the guard's robust form once §4.3 has an answer.
+
+---
+
+## Post-measurement addendum (2026-07-11): the witness confessed to a
+## different crime
+
+Controlled-tree measurement (scratch fit_kinds/geo_ab2: trees built
+via build_codec_table_from_code_lens, exact per-block counts, fresh
+data per block, streamed output) overturned the kappa hypothesis:
+
+* Merge kinds are NOT the story on M-class: mu_cst ~= mu_full
+  (~0.05 ns/sym), flats 0.01-0.07 ns/sym as documented.  The
+  kind-aware simulator stays (honest infrastructure, neutral
+  defaults).
+* Two measurement traps worth recording: repeating ONE block lets the
+  branch predictor memorize the walk (the same tree pair measured
+  +6% under single-block repetition and -27% in the real bench), and
+  an L1-resident output buffer hides streaming-store effects.
+* The real cause of geometric's -28%: THE FSE DECODE TAX.  With FSE
+  off the joint tree is strictly better (+6.6% decode, -14% size).
+  With FSE on, the coder commits on the joint tree's few, large,
+  skewed bitmaps (RESPONSE2's selection effect made flesh) and FSE'd
+  bitmap decode costs ~4 raw-merge passes per element — swamping the
+  pass savings while genuinely shrinking the wire.  In J terms the
+  trade is arguably favorable (-10.6% size); against the knob's
+  decode-speed CONTRACT it is a violation the kappa-blind AND
+  kind-aware pass models both miss.
+
+Fix (implemented): the guard's time model adds an FSE tax on
+predicted-committed merges — commit predictor mirrors the coder's
+bytes-shrink rule (>= wmin elements/block, skew clearing eta +
+marker), tau = 4.0 default (measured M-class), inert under PH.
+Validated M1 + M4: geometric flips to REJECTED (-0.2% vs the shipped
+-28%), bell_s10 likewise; every legitimate win keeps its adoption
+(jpeg +920%, bell_s80 +716%, chinese +45%), and PHA lits at G = 64K
+is unchanged (+35.6% dec-e2e, +0.13 pp).
+
+Follow-on question for the reviewers (supersedes the tone of §4.4):
+the encoder controls BOTH the tree and the commit decisions.  A
+lambda-aware commit rule (commit iff bits saved >= lambda * tau * W)
+plus tax-aware tree choice turns the PHA regression into a knob:
+where on the (ratio, decode) frontier do jointly-optimized
+tree+commit decisions land, and is the joint problem still tractable
+(commits are per-node independent given the tree — the coupling is
+through tree choice)?
