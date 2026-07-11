@@ -188,3 +188,31 @@ where on the (ratio, decode) frontier do jointly-optimized
 tree+commit decisions land, and is the joint problem still tractable
 (commits are per-node independent given the tree — the coupling is
 through tree choice)?
+
+## gamma addendum (2026-07-11): the per-record fixed cost, measured and shipped
+
+Least-squares fit over 20 controlled trees (pure flats, cst ladders,
+FULL cascades, pair-record sweeps; residuals <= 0.002 ns/sym, M1):
+mu_full ~= mu_cst (0.046/0.043 ns per element-pass), prefill ~= 0.11,
+kappa_hat = {b1 .83, b2 .61, b3 .71, b4 .59, b5 .83, b6 1.05,
+b7 1.88, b8 .49}, and GAMMA ~= 7.75 ns per schedule record per block
+= ~170 element-passes.  (Measurement notes: multi-block fresh-data
+runs quantize at ~256 us timer granularity — size timed regions
+>= 10 ms; short ssh-spawned processes on the mini land on E-cores,
+so per-arch fits belong on a pinned/local host.)
+
+gamma enters the solvers as a per-take constant (1 record for D0
+takes, 2 for deeper — multiset-additive, so every exactness argument
+is untouched; slot == mass re-verified under random constants) and
+the guard via exact record counts from the skeleton simulator,
+scaled by blocks/window.  Default 170; knob
+pivco_huffman_set_joint_gamma.
+
+Needle check (M4 ladder, PH, gamma 0 vs 170, same-run deltas vs off):
+dec-e2e +38->+48 % (nudge), +58->+65 % (exact) at G = 4 K with ratio
+IMPROVING too (-0.41 -> -0.47 pp exact) — fewer records is a cost the
+wire also charges for, so the DP's new preference is win-win;
++5 pp at 8 K, +1-2 pp at 16 K, nil beyond (blocks amortize).  Encode
+kernels also gain at 4 K (fewer records to emit).  The measured
+kappa_hat table validates the slot DP's spread bound at lambda = 0.1
+but ships default-zero pending a per-arch defaults strategy.

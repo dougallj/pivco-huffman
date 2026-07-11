@@ -117,6 +117,21 @@ void pivco_huffman_set_joint_merge_costs(double mu_cst, double prefill)
  * into fewer, more skewed bitmaps, FSE commits on them for a real
  * ratio win, and the decode tax swamps the merge-pass savings —
  * kind-blind AND kind-aware pass models both miss it. */
+/* Per-record fixed decode cost gamma, in full-merge element-pass
+ * units: every schedule record (skeleton merge node, pair node, flat
+ * node — lone leaves have none) costs ~gamma passes of fixed work
+ * per BLOCK (parse + dispatch + kernel setup).  Measured ~170 on
+ * Apple M-class (7.75 ns/record vs 0.045 ns/element-pass).  Enters
+ * the DP as a per-take constant (multiset-additive, so exactness
+ * arguments are untouched) and the guard via exact record counts.
+ * Matters only for small windows (cost scales with blocks/window). */
+static double g_joint_gamma = 170.0;
+
+void pivco_huffman_set_joint_gamma(double gamma_hat)
+{
+    g_joint_gamma = (gamma_hat >= 0 && gamma_hat < 1e6) ? gamma_hat : 0.0;
+}
+
 static double g_joint_fse_tau  = 4.0;   /* measured M-class: FSE'd
                                          * bitmap ~4 raw-merge passes
                                          * per element */
@@ -188,7 +203,7 @@ static int jl_cmp_ch(const void *a, const void *b)
  * the parent sees (0 = lone leaf, 1 = internal).  pre marks the chunk
  * index holding the prefilled top symbol (-1 = none). */
 static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
-                     const double *kap, double scale,
+                     const double *kap, double scale, int *recs,
                      double *Wout, int *kind)
 {
     if (*i < n && ch[*i].r == d) {
@@ -196,13 +211,15 @@ static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
         *Wout = c->W;
         if (c->D == 0) { *kind = 0; return 0.0; }
         *kind = 1;
+        (*recs)++;                                 /* pair/flat record */
         return c->W * kap[c->D <= 8 ? c->D : 8];   /* D=1 pair: kap[1] */
     }
     double Wl = 0, Wr = 0, tl, tr;
     int kl, kr;
     const int il = *i;
-    tl = jl_sim(ch, n, i, d + 1, pre, kap, scale, &Wl, &kl);
-    tr = jl_sim(ch, n, i, d + 1, pre, kap, scale, &Wr, &kr);
+    (*recs)++;                                     /* merge record */
+    tl = jl_sim(ch, n, i, d + 1, pre, kap, scale, recs, &Wl, &kl);
+    tr = jl_sim(ch, n, i, d + 1, pre, kap, scale, recs, &Wr, &kr);
     double W = Wl + Wr;
     double t;
     if (kl == 0 || kr == 0) {
@@ -252,10 +269,17 @@ static double jl_time_kinds(jl_ch_t *ch, int n, const double *kap,
         double per = ch[i].W / (double)(1 << ch[i].D);
         if (per > best) { best = per; pre = ch[i].D == 0 ? i : -1; }
     }
-    int i = 0, kind;
+    int i = 0, kind, recs = 0;
     double W;
-    double t = jl_sim(ch, n, &i, 0, pre, kap, scale, &W, &kind);
-    return i == n ? t : -1.0;   /* -1: malformed multiset (cannot happen) */
+    double t = jl_sim(ch, n, &i, 0, pre, kap, scale, &recs, &W, &kind);
+    if (i != n) return -1.0;    /* malformed multiset (cannot happen) */
+    /* per-record fixed cost, scaled to blocks per window */
+    if (g_joint_gamma > 0) {
+        double blocks = ceil(total_weight / (double)PIVCO_BLOCK_SIZE);
+        if (blocks < 1) blocks = 1;
+        t += g_joint_gamma * (double)recs * blocks;
+    }
+    return t;
 }
 
 typedef struct { uint64_t freq; uint8_t sym; } jl_sf_t;
@@ -386,8 +410,12 @@ static int jl_slot_order(double lam, const double *kap, int bcap,
  * depth-2 flat, so the coarse problem is this problem at L' = L - 2,
  * b' = b - 2 with an identical cost form (the +2 bits per symbol is a
  * constant offset). */
+/* tc0/tc1: per-take J constants (lambda * gamma * blocks * records
+ * added) for b = 0 takes and b >= 1 takes respectively — a D0 chunk
+ * adds ~1 schedule record (its skeleton merge), deeper chunks ~2. */
 static double jl_solve_slots(const double *P, int sigma, double lam,
                              int lmax, int bcap, const double *kap,
+                             double tc0, double tc1,
                              uint16_t out_BL[JL_LMAX + 1])
 {
     int border[8], nb;
@@ -448,6 +476,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
                 if (jhi < 0) continue;
                 const float a = (float)((double)L
                                          + lam * ((double)(L - b) + kap[b]));
+                const float tc = (float)tc1;
                 const float *dpb = dPt[p][b];
                 int j = jhi;
                 /* 0/1 in-place: dest j + jstep > src j, so iterate j
@@ -463,7 +492,9 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
                 for (; j >= 3; j -= 4) {
                     const int base = j - 3;
                     float32x4_t src = vld1q_f32(row + base);
-                    float32x4_t cand = vfmaq_f32(src, vld1q_f32(dpb + base), va);
+                    float32x4_t cand = vaddq_f32(
+                        vfmaq_f32(src, vld1q_f32(dpb + base), va),
+                        vdupq_n_f32(tc));
                     float32x4_t dst = vld1q_f32(row + base + jstep);
                     uint32x4_t m = vcltq_f32(cand, dst);
                     vst1q_f32(row + base + jstep, vbslq_f32(m, cand, dst));
@@ -476,7 +507,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
                 for (; j >= 0; j--) {
                     const float v = row[j];
                     if (!(v < INFINITY)) continue;
-                    const float cand = v + a * dpb[j];
+                    const float cand = v + a * dpb[j] + tc;
                     if (cand < row[j + jstep]) {
                         row[j + jstep] = cand;
                         prow[j + jstep] = (uint16_t)(prow[j] | (1u << b));
@@ -501,6 +532,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
          * contains the top cell runs first (it holds the only
          * same-row read). */
         const float a0 = (float)((double)L * (1.0 + lam) + lam * kap[0]);
+        const float tcz = (float)tc0;
         for (int tp = thi[L + 1]; tp >= tlo[L + 1]; tp--) {
             const int pp = tp & 1;
             const int jcap2 = jl_row_jcap(tp, h - 1, sigma);
@@ -580,7 +612,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
  * order (lam > 1/7), where the slot-ledger DP's exactness argument
  * does not apply. */
 static double jl_solve_mass(const double *P, int sigma, double lam,
-                            const double *kap,
+                            const double *kap, double tc0, double tc1,
                             uint16_t out_BL[JL_LMAX + 1])
 {
     jl_item_t items[JL_MAXITEMS];
@@ -614,8 +646,9 @@ static double jl_solve_mass(const double *P, int sigma, double lam,
         const int size = items[it].size, mass = items[it].mass;
         const uint64_t bit_lo = it < 64 ? (1ull << it) : 0;
         const uint64_t bit_hi = it >= 64 ? (1ull << (it - 64)) : 0;
+        const float tci = (float)(items[it].b == 0 ? tc0 : tc1);
         for (int k = sigma - size; k >= 0; k--) {
-            const float add = (float)(items[it].cost * (P[k + size] - P[k]));
+            const float add = (float)(items[it].cost * (P[k + size] - P[k])) + tci;
             const size_t src_row = JL_IX(k, 0), dst_row = JL_IX(k + size, mass);
             for (int m = JL_MASS - mass; m >= 0; m--) {
                 const float v = dp[src_row + (size_t)m];
@@ -685,6 +718,9 @@ static inline int jl_nudge_clamp(int c, int s, int rest, int h)
 
 /* Exact chunk cost of placing count c at level L on prefix [k, k+c);
  * bits are dealt in the within-level cost order ord[0..nord). */
+static double g_jl_tc0, g_jl_tc1;   /* per-take J constants for the
+                                     * nudge scorer (set by the core) */
+
 static inline double jl_nudge_chunkcost(const double *P, int k, int c,
                                         int L, double lam,
                                         const double *kap,
@@ -696,7 +732,8 @@ static inline double jl_nudge_chunkcost(const double *P, int k, int c,
         const int b = ord[oi];
         if (c & (1 << b)) {
             sc += (P[k + off + (1 << b)] - P[k + off])
-                * ((double)L + lam * ((double)(L - b) + kap[b]));
+                * ((double)L + lam * ((double)(L - b) + kap[b]))
+                + (b == 0 ? g_jl_tc0 : g_jl_tc1);
             off += 1 << b;
         }
     }
@@ -862,6 +899,14 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
      * sigma is ghost-padded to a multiple of g with zero-frequency
      * unused byte values — real leaves the encoder never emits; there
      * are always enough since sigma % g != 0 implies sigma < 256. */
+    /* per-take fixed-cost constants: lambda * gamma * blocks, one
+     * record for D0 takes, two for deeper chunks */
+    double blocks = ceil(P[sigma] / (double)PIVCO_BLOCK_SIZE);
+    if (blocks < 1) blocks = 1;
+    const double tc0 = lam * g_joint_gamma * blocks;
+    const double tc1 = 2.0 * tc0;
+    g_jl_tc0 = tc0; g_jl_tc1 = tc1;
+
     int gran = g_joint_gran;
     if (gran == 0)   /* auto: keep the solve ~<= 10 us at every sigma */
         gran = sigma <= 64 ? 1 : sigma <= 128 ? 2 : 4;
@@ -896,14 +941,15 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
         uint16_t BLc[JL_LMAX + 1] = {0};
         /* kap + glog: local b' prices the real depth b' + glog */
         if (jl_solve_slots(Pg, sp, lam, JL_LMAX - glog, 8 - glog,
-                           kap + glog, BLc) < 0)
+                           kap + glog, tc1, tc1, BLc) < 0)
             return -1;
         for (int L = 1; L <= JL_LMAX - glog; L++)
             BL[L + glog] = (uint16_t)(BLc[L] << glog);
-    } else if (jl_solve_slots(P, sigma, lam, JL_LMAX, 8, kap, BL) >= 0) {
+    } else if (jl_solve_slots(P, sigma, lam, JL_LMAX, 8, kap,
+                              tc0, tc1, BL) >= 0) {
         /* slot DP valid (jl_slot_order held) and solved */
     } else {
-        if (jl_solve_mass(P, sigma, lam, kap, BL) < 0) return -1;
+        if (jl_solve_mass(P, sigma, lam, kap, tc0, tc1, BL) < 0) return -1;
     }
 
     /* Collect the chosen chunks and sort them by GLOBAL per-occurrence

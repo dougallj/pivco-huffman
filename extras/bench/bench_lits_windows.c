@@ -191,6 +191,8 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[argi], "--reps=", 7)) reps = atoi(argv[argi] + 7);
         else if (!strncmp(argv[argi], "--fse=", 6)) fse = atoi(argv[argi] + 6);
         else if (!strncmp(argv[argi], "--gran=", 7)) gran = atoi(argv[argi] + 7);
+        else if (!strncmp(argv[argi], "--gamma=", 8))
+            pivco_huffman_set_joint_gamma(atof(argv[argi] + 8));
         else if (!strcmp(argv[argi], "--ladder")) ladder = 1;
     }
     pivco_huffman_set_fse_enabled(fse);

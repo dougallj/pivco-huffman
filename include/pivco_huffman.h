@@ -440,6 +440,14 @@ void pivco_huffman_set_joint_merge_costs(double mu_cst, double prefill);
  * pass savings. */
 void pivco_huffman_set_joint_fse_tax(double tau, double eta, double wmin);
 
+/* Per-schedule-record fixed decode cost, in full-merge element-pass
+ * units (parse + dispatch + kernel setup, paid per record per block).
+ * Default 170 (measured Apple M-class: ~7.75 ns/record vs ~45 ps per
+ * merge element-pass).  Enters the solvers as per-chunk constants and
+ * the guard via exact record counts; only material for windows of a
+ * few KB, where fixed costs rival volume costs.  0 disables. */
+void pivco_huffman_set_joint_gamma(double gamma_hat);
+
 /* ---------- Table construction ---------- */
 
 int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
