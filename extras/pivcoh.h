@@ -1,4 +1,4 @@
-/* pivcoh.h - v1.1 - minimal single-file PIVCO-Huffman block codec
+/* pivcoh.h - v1.2 - minimal single-file PIVCO-Huffman block codec
  *
  * A tiny, scalar, allocation-free-capable implementation of the
  * PIVCO-Huffman wire format (https://github.com/MarcinZukowski/pivco-huffman).
@@ -29,8 +29,9 @@
  * concatenated; pivcoh_decode reports the consumed byte count.
  *
  * The trailing `scratch` parameter of encode/decode may be NULL (malloc
- * is used internally) or a caller buffer of PIVCOH_SCRATCH_SIZE(max_n)
- * bytes for allocation-free operation.  Tables and scratch are plain
+ * is used internally) or a caller buffer for allocation-free operation:
+ * PIVCOH_SCRATCH_SIZE(max_n) bytes covers either call, and a pure
+ * decoder needs only PIVCOH_DECODE_SCRATCH_SIZE(max_n).  Tables and scratch are plain
  * memory: no cleanup calls, safe to copy, const tables are shareable
  * across threads (encode/decode themselves touch only their arguments).
  *
@@ -57,12 +58,15 @@
  * bits/symbol plus per-node headers and byte rounding). */
 #define PIVCOH_ENCODE_BOUND(n)  ((11 * (size_t)(n) + 7) / 8 + 1024)
 
-/* Scratch bytes for encode or decode of blocks up to n symbols (2n: the
- * walk places each node's larger child in place, so a K-element subtree
- * touches at most K scratch bytes — n for the decoder's partner buffer
- * or the encoder's partition pool, plus n for the encoder's rank
- * buffer; decode uses only the first n). */
+/* Scratch bytes for encode (or either call) on blocks up to n symbols:
+ * the encoder's rank buffer plus its partition pool (each at most n —
+ * the walk keeps each node's larger side in place). */
 #define PIVCOH_SCRATCH_SIZE(n)  (2 * (size_t)(n))
+
+/* Decode-only scratch: the decoder skips ahead in the (in-memory) wire
+ * to decode each node's larger child first, in place in out's tail, so
+ * its partner buffer needs only floor(n/2) bytes. */
+#define PIVCOH_DECODE_SCRATCH_SIZE(n)  ((size_t)(n) / 2 + 1)
 
 typedef struct { uint8_t kd, param, right; } pivcoh__rec;
 
@@ -371,9 +375,39 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
 
 /* ---- decode ---- */
 
+/* Advance past a K-element subtree's wire bytes without decoding it —
+ * the wire layout is fully determined by the schedule plus the K_right
+ * headers, so this reads ~3 header bytes per node.  Used to reach a
+ * larger right child so it can decode first; the real decode of the
+ * skipped bytes follows and re-validates them. */
+static const uint8_t *pivcoh__skip(const pivcoh_table *t, int idx, int K,
+                                   const uint8_t *p, const uint8_t *end)
+{
+    const pivcoh__rec *rec = &t->sched[idx];
+    int kind = rec->kd & 3;
+    if (kind == PIVCOH__FLAT) {
+        size_t nb = ((size_t)K * (size_t)(rec->kd >> 2) + 7) >> 3;
+        return (size_t)(end - p) < nb ? NULL : p + nb;
+    }
+    int KR = 0;
+    if (kind != PIVCOH__PAIR) {
+        if (end - p < 2) return NULL;
+        KR = p[0] | p[1] << 8;
+        p += 2;
+        if (KR > K) return NULL;
+    }
+    size_t nb = 1 + (size_t)((K + 7) >> 3);    /* marker + bitmap */
+    if ((size_t)(end - p) < nb || *p != 0) return NULL;
+    p += nb;
+    if (kind == PIVCOH__FULL && K - KR > 0 &&
+        !(p = pivcoh__skip(t, idx + 1, K - KR, p, end))) return NULL;
+    return (kind != PIVCOH__PAIR && KR > 0)
+               ? pivcoh__skip(t, idx + rec->right, KR, p, end) : p;
+}
+
 /* Returns the advanced input pointer, or NULL on malformed input.  out
- * receives exactly K symbols; partner must have capacity K (see the
- * placement note at the merge below). */
+ * receives exactly K symbols; partner must have capacity floor(K/2)
+ * (see the placement note at the merge below). */
 static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t *out,
                                   const uint8_t *p, const uint8_t *end, uint8_t *partner)
 {
@@ -411,13 +445,15 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         for (j = 0; j < K; j++) out[j] = t->rank_to_sym[rec->param + PIVCOH__BIT(j)];
         return p;
     }
-    /* The larger child decodes IN PLACE into out's tail; the smaller into
-     * partner[0..KS), its own recursion ping-ponging into out's still-empty
-     * prefix (right-larger children take partner+KL, capacity K-KL = KR).
-     * So a K-subtree touches at most K partner bytes — exact by induction,
-     * no allocator — and the forward merge is safe because its write cursor
-     * can never pass its tail-side read cursor (j = li+ri <= tail0+ti, with
-     * equality a self-copy; the li/ri guards keep hostile bitmaps inside). */
+    /* The larger child always decodes FIRST, IN PLACE into out's tail —
+     * when that child is the right one, pivcoh__skip jumps the wire cursor
+     * over the left subtree's bytes and the left decodes second.  The
+     * smaller child goes to partner[0..KS), its own recursion ping-ponging
+     * into out's still-empty prefix.  Every child's partner need is thus
+     * <= floor(K/2) (exact by induction, no allocator), and the forward
+     * merge is safe because its write cursor can never pass its tail-side
+     * read cursor (j = li+ri <= tail read index, equality a self-copy; the
+     * li/ri guards keep hostile bitmaps inside). */
     int KL = K - KR;
     if (kind == PIVCOH__LEAFL) {               /* left = KL copies of one leaf */
         if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, p, end, partner)))
@@ -438,9 +474,12 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
             return NULL;
         L = out + KR; R = partner;
     } else {
-        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, partner, p, end, out)))
+        const uint8_t *pl = p;
+        if (KL > 0 && !(p = pivcoh__skip(t, idx + 1, KL, p, end))) return NULL;
+        const uint8_t *pr = p;
+        if (!(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, p, end, partner)))
             return NULL;
-        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, p, end, partner + KL)))
+        if (KL > 0 && !pivcoh__dec(t, idx + 1, KL, partner, pl, pr, out))
             return NULL;
         L = partner; R = out + KL;
     }
@@ -461,7 +500,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
     if (!t || !in || !out || !t->num_ranks || in_len < 2) return -1;
     int N = in[0] | in[1] << 8;
     if (N < 1 || (size_t)N > out_cap) return -1;
-    uint8_t *sc = scratch ? (uint8_t *)scratch : (uint8_t *)malloc((size_t)N);
+    uint8_t *sc = scratch ? (uint8_t *)scratch : (uint8_t *)malloc(PIVCOH_DECODE_SCRATCH_SIZE(N));
     if (!sc) return -1;
     const uint8_t *p = pivcoh__dec(t, 0, N, out, in + 2, in + in_len, sc);
     if (!scratch) free(sc);
