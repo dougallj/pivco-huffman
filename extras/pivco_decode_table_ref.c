@@ -31,11 +31,8 @@
  *      reads each internal node's partition threshold off the running
  *      rank cursor.  Incomplete or over-full codes fail here.
  *
- * Build knobs (mirroring src/huffman_table.c):
+ * Build knob (mirroring src/huffman_table.c):
  *   PIVCO_HISTO_PORTABLE   force the portable histogram + counting sort
- *   PIVCO_REF_SCHED_ITER   explicit-stack schedule generation instead of
- *                          the recursive form (measured equivalent; the
- *                          recursion is the readable default)
  */
 #include "pivco_huffman.h"
 #include <string.h>
@@ -164,29 +161,31 @@ static int ref_histo_sort(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 
 /* ---- 4. schedule generation ---- */
 
-#ifndef PIVCO_REF_SCHED_ITER
 typedef struct {
     pivco_huffman_decode_table_t *dt;
-    const ref_chunk_t *chunks;
+    const ref_chunk_t *next;
+    const ref_chunk_t *end;
     const uint8_t *items;
-    int      n_chunks;
-    int      ci;
+    uint16_t sched_len;
     unsigned rank;
-    int      err;
 } ref_gen_t;
 
-/* Recursive form: returns the record count of the subtree at `depth`. */
-static uint8_t ref_sched_gen(ref_gen_t *g, int depth)
+/* Reconstruct one subtree rooted at `depth`, pre-order.  A subtree is a
+ * bare leaf iff it emits no schedule record and advances the rank
+ * cursor by exactly one. */
+static int ref_sched_gen(ref_gen_t *g, unsigned depth)
 {
-    if (g->err) return 0;
-    if (g->ci >= g->n_chunks || depth > PIVCO_MAX_CODE_LEN) {
-        g->err = 1;
-        return 0;
-    }
+    if (g->next == g->end || depth > PIVCO_MAX_CODE_LEN)
+        return -1;
 
-    const ref_chunk_t *c = &g->chunks[g->ci];
-    if ((int)c->depth == depth) {
-        g->ci++;
+    const ref_chunk_t *c = g->next;
+    /* Once the walk has reached this depth, a shallower unconsumed
+     * chunk cannot belong anywhere in the remaining subtree. */
+    if (c->depth < depth)
+        return -1;
+
+    if (c->depth == depth) {
+        g->next++;
         unsigned b = c->bit;
         unsigned rank0 = g->rank;
         uint8_t *dst = &g->dt->rank_to_sym[rank0];
@@ -195,132 +194,65 @@ static uint8_t ref_sched_gen(ref_gen_t *g, int depth)
         else if (b == 1) { dst[0] = s[0]; dst[1] = s[1]; }
         else             memcpy(dst, s, (size_t)1 << b);
         g->rank += 1u << b;
-        if (b == 0) return 0;
-        pivco_sched_rec_t *rec = &g->dt->sched[g->dt->sched_len++];
+        if (b == 0) return 0;               /* a bare leaf needs no record */
+        pivco_sched_rec_t *rec = &g->dt->sched[g->sched_len++];
         rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
                               : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
         rec->param = (uint8_t)rank0;
         rec->right = 0;                     /* no child records */
-        return 1;
+        return 0;
     }
 
-    uint16_t my = g->dt->sched_len++;
-    unsigned rank0 = g->rank;
-    uint8_t nl = ref_sched_gen(g, depth + 1);
-    unsigned thr = g->rank - 1;
-    int left_lone = (nl == 0 && g->rank == rank0 + 1);
-    uint8_t nr = ref_sched_gen(g, depth + 1);
-    if (g->err) return 0;
-    int right_lone = (nr == 0 && g->rank == thr + 2);
+    /* Internal node: reserve its pre-order record, then capture the
+     * schedule/rank cursors at each child boundary. */
+    uint16_t node = g->sched_len++;
+    uint16_t left_sched = g->sched_len;
+    unsigned left_rank  = g->rank;
+    if (ref_sched_gen(g, depth + 1) != 0)
+        return -1;
+    uint16_t right_sched = g->sched_len;
+    unsigned right_rank  = g->rank;
+    if (ref_sched_gen(g, depth + 1) != 0)
+        return -1;
 
-    pivco_sched_rec_t *rec = &g->dt->sched[my];
-    if (left_lone && right_lone)  rec->kd = (uint8_t)PIVCO_SCHED_PAIR;
-    else if (left_lone)           rec->kd = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
-    else if (right_lone)          { g->err = 1; return 0; }
+    int left_leaf  = right_sched == left_sched && right_rank == left_rank + 1;
+    int right_leaf = g->sched_len == right_sched && g->rank == right_rank + 1;
+    /* There is no LEAF_RIGHT: with depth-sorted chunks, a lone right
+     * leaf after a non-leaf left subtree is non-canonical. */
+    if (right_leaf && !left_leaf)
+        return -1;
+
+    pivco_sched_rec_t *rec = &g->dt->sched[node];
+    if (left_leaf && right_leaf)  rec->kd = (uint8_t)PIVCO_SCHED_PAIR;
+    else if (left_leaf)           rec->kd = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
     else                          rec->kd = (uint8_t)PIVCO_SCHED_FULL;
-    rec->param = (uint8_t)thr;
-    /* right child record = 1 + left subtree's record count (1 for
-     * LEAF_LEFT: nl == 0); unused for PAIR */
-    rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR) ? 0 : (uint8_t)(1 + nl);
-    return (uint8_t)(1 + nl + nr);
+    rec->param = (uint8_t)(right_rank - 1);
+    /* right child's record offset from this node (1 for LEAF_LEFT);
+     * unused for PAIR */
+    rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR)
+                     ? 0 : (uint8_t)(right_sched - node);
+    return 0;
 }
 
 static int ref_run_sched(pivco_huffman_decode_table_t *dt,
                          const ref_chunk_t *chunks, int n_chunks,
                          const uint8_t *items)
 {
-    ref_gen_t g = { dt, chunks, items, n_chunks, 0, 0, 0 };
-    ref_sched_gen(&g, 0);
-    if (g.err || g.ci != n_chunks) return -1;
+    ref_gen_t g = {
+        .dt        = dt,
+        .next      = chunks,
+        .end       = chunks + n_chunks,
+        .items     = items,
+        .sched_len = 0,
+        .rank      = 0,
+    };
+    if (ref_sched_gen(&g, 0) != 0 || g.next != g.end)
+        return -1;
+    /* Commit metadata only after successful reconstruction. */
+    dt->sched_len = g.sched_len;
     dt->num_ranks = (uint16_t)g.rank;
     return 0;
 }
-#else
-/* Explicit-stack form.  The stack depth IS the node depth, and a
- * subtree's records are contiguous (pre-order), so a node's skip is
- * just sched_len - my at completion. */
-typedef struct {
-    uint16_t my;         /* this node's record index */
-    uint16_t mid_sched;  /* sched_len when the right child started */
-    uint8_t  rank0;      /* rank on entry */
-    uint8_t  mid_rank;   /* rank when the right child started */
-    uint8_t  state;      /* 0 = doing left child, 1 = doing right */
-} ref_frame_t;
-
-static int ref_run_sched(pivco_huffman_decode_table_t *dt,
-                         const ref_chunk_t *chunks, int n_chunks,
-                         const uint8_t *items)
-{
-    ref_frame_t stk[PIVCO_MAX_CODE_LEN + 1];
-    int sp = 0;
-    int ci = 0;
-    unsigned rank = 0;
-
-    for (;;) {
-        if (ci >= n_chunks) return -1;      /* under-subscribed lengths */
-
-        /* Descend the left spine until a chunk sits at this depth. */
-        while ((int)chunks[ci].depth != sp) {
-            if (sp > PIVCO_MAX_CODE_LEN) return -1;
-            ref_frame_t *f = &stk[sp++];
-            f->my    = dt->sched_len++;
-            f->rank0 = (uint8_t)rank;
-            f->state = 0;
-        }
-
-        /* Consume the chunk-leaf. */
-        {
-            const ref_chunk_t *c = &chunks[ci++];
-            unsigned b = c->bit;
-            unsigned rank0 = rank;
-            uint8_t *dst = &dt->rank_to_sym[rank0];
-            const uint8_t *s = &items[c->sym_idx];
-            if (b == 0)      dst[0] = s[0];
-            else if (b == 1) { dst[0] = s[0]; dst[1] = s[1]; }
-            else             memcpy(dst, s, (size_t)1 << b);
-            rank += 1u << b;
-            if (b != 0) {
-                pivco_sched_rec_t *rec = &dt->sched[dt->sched_len++];
-                rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
-                                      : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
-                rec->param = (uint8_t)rank0;
-                rec->right = 0;             /* no child records */
-            }
-        }
-
-        /* Ascend, completing parents whose right child just finished. */
-        for (;;) {
-            if (sp == 0) {                  /* root subtree complete */
-                if (ci != n_chunks) return -1;
-                dt->num_ranks = (uint16_t)rank;
-                return 0;
-            }
-            ref_frame_t *f = &stk[sp - 1];
-            if (f->state == 0) {            /* left done; do the right child */
-                f->state     = 1;
-                f->mid_sched = dt->sched_len;
-                f->mid_rank  = (uint8_t)rank;
-                break;
-            }
-            /* Right done: finalize this internal node's record. */
-            int left_lone  = (f->mid_sched == f->my + 1) &&
-                             (f->mid_rank == (uint8_t)(f->rank0 + 1));
-            int right_lone = (dt->sched_len == f->mid_sched) &&
-                             (rank == (unsigned)f->mid_rank + 1);
-            pivco_sched_rec_t *rec = &dt->sched[f->my];
-            if (left_lone && right_lone)  rec->kd = (uint8_t)PIVCO_SCHED_PAIR;
-            else if (left_lone)           rec->kd = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
-            else if (right_lone)          return -1;
-            else                          rec->kd = (uint8_t)PIVCO_SCHED_FULL;
-            rec->param = (uint8_t)(f->mid_rank - 1);
-            rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR)
-                             ? 0
-                             : (uint8_t)(f->mid_sched - f->my);
-            sp--;
-        }
-    }
-}
-#endif
 
 /* ---- entry point ---- */
 
@@ -388,7 +320,6 @@ int pivco_huffman_build_decode_table_ref(
     }
 
     /* 4. schedule + ranks from the chunk list */
-    dt->sched_len = 0;
     if (ref_run_sched(dt, chunks, n_chunks, items) != 0)
         return PIVCO_ERR_CORRUPT;
     return PIVCO_OK;
