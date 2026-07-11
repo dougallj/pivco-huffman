@@ -84,7 +84,7 @@ static void walk_flat_carve(const pivco_huffman_table_t *t,
     uint64_t sf = subtree_freq[node];
     if (sf == 0) return;
     int D = t->flat_depth[node];
-    if (D >= 2) {
+    if (D >= 1) {
         *bits      += (double)sf * (double)D;
         *flat_bits += (double)sf * (double)D;
         return;
@@ -225,7 +225,7 @@ static void simulate_partition(const pivco_huffman_table_t *t,
     if (node->symbol >= 0) return; /* leaf */
 
     int D = t->flat_depth[node_id];
-    if (D >= 2) {
+    if (D >= 1) {
         *flat_bits += (double)n * (double)D;
         return;
     }
@@ -352,7 +352,7 @@ static void walk_exact(const pivco_huffman_table_t *t,
     if (sf == 0) return;
 
     int D = t->flat_depth[node_id];
-    if (D >= 2) {
+    if (D >= 1) {
         *flat_bits += (double)sf * scale * (double)D;
         return;
     }

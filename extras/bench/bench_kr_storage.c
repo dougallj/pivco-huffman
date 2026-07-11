@@ -33,12 +33,20 @@ extern void           bench_generate_symbols(int dist_idx, uint8_t *symbols,
 #define TOTAL_SYMBOLS (4 * 1024 * 1024)
 #define ENC_SLOT (2 * PIVCO_BLOCK_SIZE)
 
-/* Sum histogram values for all leaves in the subtree rooted at node_id. */
+/* Sum histogram values for all leaves in the subtree rooted at node_id.
+ * Flat roots (D >= 1) have no materialized children — enumerate their
+ * leaves via flat_code_to_sym instead. */
 static int subtree_hist_sum(const pivco_huffman_table_t *t, int16_t node_id,
                              const int *hist)
 {
     const pivco_tree_node_t *n = &t->tree[node_id];
     if (n->symbol >= 0) return hist[n->symbol];
+    if (t->flat_depth[node_id] >= 1) {
+        int sum = 0, cnt = 1 << t->flat_depth[node_id];
+        for (int i = 0; i < cnt; i++)
+            sum += hist[t->flat_code_to_sym[t->flat_offset[node_id] + i]];
+        return sum;
+    }
     return subtree_hist_sum(t, n->left, hist)
          + subtree_hist_sum(t, n->right, hist);
 }
@@ -67,8 +75,7 @@ static void walk_kr(const pivco_huffman_table_t *t, int16_t node_id, int K,
     pivco_node_type_t type = (pivco_node_type_t)t->node_type[node_id];
     switch (type) {
     case PIVCO_NODE_LEAF:
-    case PIVCO_NODE_INTERNAL_FLAT:
-    case PIVCO_NODE_BOTH_LEAVES:
+    case PIVCO_NODE_INTERNAL_FLAT:   /* includes former BOTH_LEAVES (D=1) */
         return;  /* no K_right write site */
     case PIVCO_NODE_LEAF_LEFT: {
         int K_right = subtree_hist_sum(t, n->right, hist);
@@ -110,7 +117,6 @@ static void walk_kleaf(const pivco_huffman_table_t *t, int16_t node_id,
         s->kleaf_bytes_varint += (K < 128) ? 1 : 2;
         return;
     }
-    case PIVCO_NODE_BOTH_LEAVES:
     case PIVCO_NODE_LEAF_LEFT:
     case PIVCO_NODE_INTERNAL_FULL:
     default:
@@ -127,8 +133,7 @@ static int count_kr_slots(const pivco_huffman_table_t *t, int16_t node_id)
     pivco_node_type_t type = (pivco_node_type_t)t->node_type[node_id];
     switch (type) {
     case PIVCO_NODE_LEAF:
-    case PIVCO_NODE_INTERNAL_FLAT:
-    case PIVCO_NODE_BOTH_LEAVES: return 0;
+    case PIVCO_NODE_INTERNAL_FLAT: return 0;  /* includes former BOTH_LEAVES */
     case PIVCO_NODE_LEAF_LEFT:
         return 1 + count_kr_slots(t, n->right);
     case PIVCO_NODE_INTERNAL_FULL:

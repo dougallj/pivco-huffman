@@ -66,7 +66,7 @@ static void leaf_stats_walk(const pivco_huffman_table_t *t,
         *out_freq_depth += (double)fw * (double)depth;
         return;
     }
-    if (t->flat_depth[node] >= 2) {
+    if (t->flat_depth[node] >= 1) {
         int D = t->flat_depth[node];
         int off = t->flat_offset[node];
         int n = 1 << D;
@@ -92,7 +92,7 @@ static void leaf_stats_walk(const pivco_huffman_table_t *t,
  * (its children are absorbed and not materialized in tree[]). */
 static int count_op_nodes(const pivco_huffman_table_t *t, int16_t node) {
     if (t->tree[node].symbol >= 0) return 0;        /* leaf */
-    if (t->flat_depth[node] >= 2)  return 1;        /* flat root: 1 merge */
+    if (t->flat_depth[node] >= 1)  return 1;        /* flat root: 1 merge */
     int c = 1;
     c += count_op_nodes(t, t->tree[node].left);
     c += count_op_nodes(t, t->tree[node].right);

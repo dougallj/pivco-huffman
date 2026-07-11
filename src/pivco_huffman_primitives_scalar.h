@@ -80,23 +80,9 @@ static inline uint32_t extract_D_bits_scalar(const uint8_t *in,
     return (val >> bit_off) & ((1u << D) - 1);
 }
 
-/* Unpack n D-bit codes, look up in c2s, write to out[0..n). */
-static inline void merge_flat_scalar(uint8_t *out, int n,
-                                                  const uint8_t *bm, int D,
-                                                  const uint8_t *c2s)
-{
-    if (D == 8) {           /* full-alphabet flat: c2s is the identity, codes
-                             * ARE the symbols (see merge_flat_d8_neon) */
-        memcpy(out, bm, (size_t)n);
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        uint32_t code = extract_D_bits_scalar(bm, i * D, D);
-        out[i] = c2s[code];
-    }
-}
-
-/* Both-leaves merge: per bit, pick left_sym or right_sym. */
+/* Two-constant merge: per bit, pick left_sym or right_sym.  This IS the
+ * D=1 flat decode (c2s = {left, right}); merge_flat_scalar routes D=1
+ * here. */
 static inline void merge_cst_cst_scalar(const uint8_t *bm, int K,
                                              uint8_t left_sym,
                                              uint8_t right_sym,
@@ -105,6 +91,26 @@ static inline void merge_cst_cst_scalar(const uint8_t *bm, int K,
     for (int j = 0; j < K; j++) {
         int bit = (bm[j >> 3] >> (j & 7)) & 1;
         out[j] = bit ? right_sym : left_sym;
+    }
+}
+
+/* Unpack n D-bit codes, look up in c2s, write to out[0..n). */
+static inline void merge_flat_scalar(uint8_t *out, int n,
+                                                  const uint8_t *bm, int D,
+                                                  const uint8_t *c2s)
+{
+    if (D == 1) {           /* former BOTH_LEAVES pair: bit-blend kernel */
+        merge_cst_cst_scalar(bm, n, c2s[0], c2s[1], out);
+        return;
+    }
+    if (D == 8) {           /* full-alphabet flat: c2s is the identity, codes
+                             * ARE the symbols (see merge_flat_d8_neon) */
+        memcpy(out, bm, (size_t)n);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        uint32_t code = extract_D_bits_scalar(bm, i * D, D);
+        out[i] = c2s[code];
     }
 }
 

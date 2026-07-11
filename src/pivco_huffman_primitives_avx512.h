@@ -541,6 +541,8 @@ static inline void merge_flat_avx512(uint8_t *out, int n,
 {
     PROF_TIC();
     switch (D) {
+    case 1: /* former BOTH_LEAVES pair: cst_cst IS the D=1 flat decode */
+            merge_cst_cst_avx512(bm, n, c2s[0], c2s[1], out); break;
     case 2: merge_flat_d2_avx512(out, n, bm, c2s); break;
     case 3: merge_flat_d3_avx512(out, n, bm, c2s); break;
     case 4: merge_flat_d4_avx512(out, n, bm, c2s); break;
@@ -644,7 +646,7 @@ static inline int part_right_avx512(uint8_t *ranks, int n, uint8_t thr,
     return n_right;
 }
 
-/* none (BOTH_LEAVES): bitmap + right count only, no compaction. */
+/* none (D=1 flat pack / bench): bitmap + right count only, no compaction. */
 static inline int part_none_avx512(uint8_t *ranks, int n, uint8_t thr, uint8_t *bm)
 {
     int n_right = 0, j = 0;
@@ -674,6 +676,12 @@ static inline void pack_dN_avx512(uint8_t *out, const uint8_t *ranks,
 
     int i = 0;
     switch (D) {
+    case 1: /* former BOTH_LEAVES pair.  bit = (rank > base) == the D=1
+             * local code, LSB-first — exactly the partition bitmap, so
+             * reuse the pure-bitmap-build partition (never writes ranks;
+             * the const cast is sound). */
+            (void)part_none_avx512((uint8_t *)(uintptr_t)ranks, n, base, out);
+            return;
     case 2: i = pack_d2_avx512(out, ranks, n, base); break;
     case 3: i = pack_d3_avx512(out, ranks, n, base); break;
     case 4: i = pack_d4_avx512(out, ranks, n, base); break;

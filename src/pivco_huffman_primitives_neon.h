@@ -626,6 +626,8 @@ static inline void merge_flat_neon(uint8_t *out, int n,
 {
     PROF_TIC();
     switch (D) {
+    case 1: /* former BOTH_LEAVES pair: cst_cst IS the D=1 flat decode */
+            merge_cst_cst_neon(bm, n, c2s[0], c2s[1], out); break;
     case 2: merge_flat_d2_neon(out, n, bm, c2s); break;
     case 3: merge_flat_d3_neon(out, n, bm, c2s); break;
     case 4: merge_flat_d4_neon(out, n, bm, c2s); break;
@@ -1003,6 +1005,13 @@ static inline void pack_dN_neon(uint8_t *out, const uint8_t *ranks,
 
     int i = 0;
     switch (D) {
+    case 1: /* former BOTH_LEAVES pair.  bit = (rank > base) == the D=1
+             * local code, LSB-first — exactly the partition bitmap, so
+             * reuse part_core's pure-bitmap-build form (EMIT_RIGHT=0
+             * never writes ranks; the const cast is sound). */
+            (void)part_core_neon((uint8_t *)(uintptr_t)ranks, n, base,
+                                 out, NULL, 0);
+            return;
     case 2: i = pack_d2_neon(out, ranks, n, base); break;
     case 3: i = pack_d3_neon(out, ranks, n, base); break;
     case 4: i = pack_d4_neon(out, ranks, n, base); break;

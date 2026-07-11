@@ -256,9 +256,15 @@ static void build_single_symbol_table(int sym, pivco_huffman_table_t *table)
     table->tree[2].right = -1;
     table->tree_root = 0;
     table->tree_node_count = 3;
-    /* node 0 (root): both children leaves -> BOTH_LEAVES (the decode
-     * entry's root fast path handles it); nodes 1, 2: LEAF. */
-    table->node_type[0] = PIVCO_NODE_BOTH_LEAVES;
+    /* node 0 (root): flat D=1 over two copies of the same symbol (the
+     * decode entry's flat-root fast path handles it); nodes 1, 2: LEAF.
+     * flat_base_rank[0] = 0 and sym_to_rank[sym] = 0 hold from the
+     * zeroed table, so the encoder packs all-zero bits. */
+    table->flat_depth[0]  = 1;
+    table->flat_offset[0] = 0;
+    table->flat_code_to_sym[0] = (uint8_t)sym;
+    table->flat_code_to_sym[1] = (uint8_t)sym;
+    table->node_type[0] = PIVCO_NODE_INTERNAL_FLAT;
     table->node_type[1] = PIVCO_NODE_LEAF;
     table->node_type[2] = PIVCO_NODE_LEAF;
     fill_enc_init_aux(table);   /* sym_to_rank is all-zero (rank 0) here; aux must not stay NULL */
@@ -317,7 +323,7 @@ static uint16_t assign_inorder_ranks(pivco_huffman_table_t *table,
         table->sym_to_rank[n->symbol] = (uint8_t)rank;
         return (uint16_t)(rank + 1);
     }
-    if (table->flat_depth[id] >= 2) {           /* flat subtree */
+    if (table->flat_depth[id] >= 1) {           /* flat subtree (D=1 = pair) */
         table->flat_base_rank[id] = (uint8_t)rank;
         int cnt = 1 << table->flat_depth[id];
         for (int i = 0; i < cnt; i++) {
@@ -368,9 +374,9 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
      * Compression is unaffected — code lengths match the Huffman result.
      *
      * Algorithm: per length L, decompose c_L by its binary representation
-     * into "chunks": bits >= 2 form D>=2 flat subtrees of size 2^D rooted
-     * at depth L-D; bit 1 forms a D=1 sibling pair (handled by stage
-     * fusion at decode); bit 0 is a singleton.  Sort chunks by their
+     * into "chunks": bits >= 1 form D>=1 flat subtrees of size 2^D rooted
+     * at depth L-D (D=1 is the former sibling pair, now the smallest flat
+     * region); bit 0 is a singleton.  Sort chunks by their
      * tree-depth asc (depth = L-D for D>=2 chunks, L-1 for D=1, L for
      * singletons), then canonical-assign codes to chunks.  Within each
      * chunk, top-freq-first symbols of length L are assigned to its
@@ -618,12 +624,14 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 
 
     /* Build the PIVCO tree-walk tree, one node-creating walk per chunk.
-       A flat subtree (D>=2) stops at its root: the decoder reaches its 2^D
+       A flat subtree (D>=1) stops at its root: the decoder reaches its 2^D
        symbols via flat_code_to_sym (filled here), so we never materialize
        the 2^D leaves nor the internal nodes below the root -- a large node
        saving on full alphabets, which also shrinks the classify and
-       max_leaf_depth passes.  Singletons (D=0) and sibling pairs (D=1)
-       build their leaves. */
+       max_leaf_depth passes.  D=1 (the former sibling-pair node) is just
+       the smallest flat subtree.  Only singletons (D=0) build a leaf. */
+    uint16_t pool = 0;   /* flat_code_to_sym cursor; classify below may
+                          * append D=1 conversions (NAIVE-mode siblings) */
     {
         int16_t nc = 0; /* node count */
         table->tree[0].symbol = -1;
@@ -631,7 +639,6 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         table->tree[0].right  = -1;
         nc++;
         table->tree_root = 0;
-        uint16_t pool = 0;
 
         for (int ci = 0; ci < n_chunks; ci++) {
             int D = chunks[ci].bit;
@@ -654,11 +661,12 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 cur = *child;
             }
 
-            if (D >= 2) {
+            if (D >= 1) {
                 /* Flat root: mark + fill code_to_sym; no children built.
                    Leaf i of the chunk has in-subtree code i (low D bits of
                    its canonical code), so flat_code_to_sym[base+i] is its
-                   i-th symbol. */
+                   i-th symbol.  D=1: the former sibling-pair node, now a
+                   2-leaf flat region (suffix 0 -> code_to_sym[pool]). */
                 PIVCO_CHECK(table->tree[cur].left == -1 &&
                             table->tree[cur].right == -1);
                 table->flat_depth[cur]  = (uint8_t)D;
@@ -667,14 +675,6 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 for (int i = 0; i < n; i++)
                     table->flat_code_to_sym[pool + i] = flat_items[base + i].sym;
                 pool = (uint16_t)(pool + n);
-            } else if (D == 1) {
-                /* Sibling pair: two leaf children (suffix 0 -> left). */
-                table->tree[cur].left = nc;
-                table->tree[nc].symbol = (int16_t)flat_items[base].sym;
-                table->tree[nc].left = -1; table->tree[nc].right = -1; nc++;
-                table->tree[cur].right = nc;
-                table->tree[nc].symbol = (int16_t)flat_items[base + 1].sym;
-                table->tree[nc].left = -1; table->tree[nc].right = -1; nc++;
             } else {
                 /* Singleton: cur is the leaf at depth d. */
                 table->tree[cur].symbol = (int16_t)flat_items[base].sym;
@@ -685,7 +685,12 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 
 
     /* Classify each node for decode-dispatch, by children's leafness:
-     *   FLAT (subtree, D>=2)  >  BOTH_LEAVES  >  LEAF_LEFT  >  FULL.
+     *   FLAT (subtree, D>=1)  >  LEAF_LEFT  >  FULL.
+     * A both-leaves node is CONVERTED to a flat D=1 root here (no-pair):
+     * OPTIMIZED/FUSED/CANONICAL_FLAT never build one (their pairs are D=1
+     * chunks, already flat above), but NAIVE mode materializes sibling
+     * singleton leaves that land here.  The two leaf children stay in the
+     * tree array (harmless: nothing dispatches or walks below a flat root).
      * Canonical code assignment always puts a lone leaf child on the
      * 0/left side (shorter code = smaller left-aligned value), so a
      * right-leaf-only node cannot occur — asserted. */
@@ -698,7 +703,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         }
 
         /* Internal node */
-        if (table->flat_depth[i] >= 2) {
+        if (table->flat_depth[i] >= 1) {
             table->node_type[i] = (uint8_t)PIVCO_NODE_INTERNAL_FLAT;
             continue;
         }
@@ -707,7 +712,12 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         int right_leaf = (table->tree[node->right].symbol >= 0);
 
         if (left_leaf && right_leaf) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_BOTH_LEAVES;
+            table->flat_depth[i]  = 1;
+            table->flat_offset[i] = pool;
+            table->flat_code_to_sym[pool    ] = (uint8_t)table->tree[node->left].symbol;
+            table->flat_code_to_sym[pool + 1] = (uint8_t)table->tree[node->right].symbol;
+            pool = (uint16_t)(pool + 2);
+            table->node_type[i] = (uint8_t)PIVCO_NODE_INTERNAL_FLAT;
         } else if (left_leaf) {
             table->node_type[i] = (uint8_t)PIVCO_NODE_LEAF_LEFT;
         } else {
@@ -741,8 +751,10 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             int16_t id = (int16_t)stack[--top];
             order[order_n++] = id;
             const pivco_tree_node_t *n = &table->tree[id];
-            /* Flat roots have no materialized children -- treat as terminal. */
-            if (n->symbol < 0 && table->flat_depth[id] < 2) {
+            /* Flat roots have no materialized children -- treat as terminal.
+             * (NAIVE-mode converted D=1 pairs do have leaf children, but
+             * they're equally terminal: max_leaf_depth == flat_depth.) */
+            if (n->symbol < 0 && table->flat_depth[id] < 1) {
                 stack[top++] = n->left;
                 stack[top++] = n->right;
             }
@@ -753,7 +765,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             const pivco_tree_node_t *n = &table->tree[id];
             if (n->symbol >= 0) {
                 table->max_leaf_depth[id] = 0;
-            } else if (table->flat_depth[id] >= 2) {
+            } else if (table->flat_depth[id] >= 1) {
                 /* All 2^D leaves sit D levels below this flat root. */
                 table->max_leaf_depth[id] = table->flat_depth[id];
             } else {

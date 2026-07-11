@@ -46,7 +46,7 @@ static void collect_flat(const pivco_huffman_table_t *t,
     if (n->symbol >= 0) return;   /* single leaf: no subtree */
 
     int D = t->flat_depth[node_id];
-    if (D >= 2) {
+    if (D >= 1) {
         int d = D > 15 ? 15 : D;
         count_by_depth[d] += 1;
         uint64_t w = 0;

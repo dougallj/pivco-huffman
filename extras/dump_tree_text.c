@@ -42,7 +42,7 @@ static void emit_path(const char *buf, int depth)
 static void walk(const pivco_huffman_table_t *T, int16_t node,
                  char *buf, int depth)
 {
-    if (T->flat_depth[node] >= 2) {
+    if (T->flat_depth[node] >= 1) {
         int D = T->flat_depth[node];
         uint16_t off = T->flat_offset[node];
         emit_path(buf, depth);

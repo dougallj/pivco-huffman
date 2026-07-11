@@ -323,8 +323,10 @@ static void codec_encode_node(const pivco_huffman_table_t *table,
     const pivco_tree_node_t *node = &table->tree[node_id];
     if (node->symbol >= 0) return;  /* leaf — nothing to emit */
 
-    /* Flat-subtree fast path: pack n*D bits, no marker, no K_right. */
-    if (table->flat_depth[node_id] >= 2) {
+    /* Flat-subtree fast path: pack n*D bits, no marker, no K_right.
+     * D=1 (former BOTH_LEAVES pair) packs the same bits the old pair
+     * bitmap held, minus the marker byte and the FSE option. */
+    if (table->flat_depth[node_id] >= 1) {
         int D = table->flat_depth[node_id];
         int total_bytes = (n * D + 7) >> 3;
         PROF_TIC();
@@ -354,14 +356,13 @@ static void codec_encode_node(const pivco_huffman_table_t *table,
      * dispatch.  The bitmap (and thus the wire bytes) is identical across
      * variants; only the encode-internal scatter work differs — a leaf child
      * never reads its scattered side, so that side's scatter is skipped:
-     * BOTH_LEAVES stores nothing, LEAF_LEFT only the right (compacted into
-     * tmp), FULL both. */
+     * LEAF_LEFT only stores the right (compacted into tmp), FULL both.
+     * (The former BOTH_LEAVES/partition_none case is now the flat D=1
+     * path above.) */
     uint8_t thr = table->split_rank[node_id];
     int n_right;
     PROF_TIC();
     switch ((pivco_node_type_t)table->node_type[node_id]) {
-    case PIVCO_NODE_BOTH_LEAVES:
-        n_right = prim_enc_partition_none(ranks, n, thr, bm);        break;
     case PIVCO_NODE_LEAF_LEFT:
         n_right = prim_enc_partition_right(ranks, n, thr, bm, tmp);  break;
     default:
@@ -434,8 +435,9 @@ int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
  * leafness — a leaf child's symbol goes straight into the parent's
  * merge, so the walk never recurses into a leaf):
  *
- *   INTERNAL_FLAT   — packed-bits flat decode into out_buf
- *   BOTH_LEAVES     — both children leaves, merge_cst_cst directly
+ *   INTERNAL_FLAT   — packed-bits flat decode into out_buf (D=1 is the
+ *                     former BOTH_LEAVES pair; merge_flat routes it to
+ *                     the cst_cst kernel)
  *   LEAF_LEFT       — left child leaf, recurse right, merge_cst_vec
  *   INTERNAL_FULL   — both children internal: recurse both, merge_vec_vec
  *
@@ -475,17 +477,6 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
         const uint8_t *c2s =
             &table->flat_code_to_sym[table->flat_offset[node_id]];
         prim_merge_flat(out_buf, K, bm, D, c2s);
-        return;
-    }
-
-    case PIVCO_NODE_BOTH_LEAVES: {
-        /* No K_right header (kr_header_needed returns false). */
-        uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
-        const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch);
-        prim_merge_cst_cst(bm, K,
-                           (uint8_t)table->tree[node->left].symbol,
-                           (uint8_t)table->tree[node->right].symbol,
-                           out_buf);
         return;
     }
 
@@ -561,24 +552,20 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
         return PIVCO_OK;
     }
 
-    /* Fast path: BOTH_LEAVES at root — a 2-symbol (or single-symbol)
-     * tree, where the whole block collapses to "read the K-bit
-     * partition, blend two symbols".  Skips the recursive
-     * codec_decode_subtree machinery (switch dispatch + bm_scratch
-     * stack frame + scratch TLS reference / arena ensure).  Worth −26%
-     * on two_sym decode on older narrow x86 (IvyBridge), noise on
-     * modern hosts.  TODO: consider removing this extreme-case
-     * optimization. */
+    /* Fast path: flat root — the whole block is one packed n·D-bit
+     * region decoded straight into the output buffer; no recursion, no
+     * scratch.  Skips the codec_decode_subtree machinery (switch
+     * dispatch + scratch TLS reference / arena ensure).  D=1 is the
+     * former BOTH_LEAVES two-symbol fast path (worth −26% on two_sym
+     * decode on older narrow x86); D>=2 covers e.g. the uniform-dist
+     * full-alphabet flat tree, which never needed the arena either. */
     if ((pivco_node_type_t)table->node_type[table->tree_root]
-        == PIVCO_NODE_BOTH_LEAVES) {
-        uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
-        const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch);
-        const pivco_tree_node_t *left_child  = &table->tree[root->left];
-        const pivco_tree_node_t *right_child = &table->tree[root->right];
-        prim_merge_cst_cst(bm, N,
-                               (uint8_t)left_child->symbol,
-                               (uint8_t)right_child->symbol,
-                               symbols);
+        == PIVCO_NODE_INTERNAL_FLAT) {
+        int D = table->flat_depth[table->tree_root];
+        const uint8_t *c2s =
+            &table->flat_code_to_sym[table->flat_offset[table->tree_root]];
+        prim_merge_flat(symbols, N, ptr, D, c2s);
+        ptr += (N * D + 7) >> 3;
         *consumed = (size_t)(ptr - in);
         return PIVCO_OK;
     }

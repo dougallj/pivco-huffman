@@ -99,8 +99,11 @@ typedef struct {
  */
 typedef enum {
     PIVCO_NODE_INTERNAL_FULL = 0,  /* both children internal — general partition/merge */
-    PIVCO_NODE_INTERNAL_FLAT,      /* flat_depth[i] >= 2 — flat-subtree fast path */
-    PIVCO_NODE_BOTH_LEAVES,        /* both children leaves — merge_cst_cst, partition_none */
+    PIVCO_NODE_INTERNAL_FLAT,      /* flat_depth[i] >= 1 — flat-subtree fast path.
+                                    * D=1 covers what used to be a dedicated
+                                    * BOTH_LEAVES ("pair") type: a sibling leaf
+                                    * pair is just a flat subtree of depth 1
+                                    * (no-pair branch, 2026-07). */
     PIVCO_NODE_LEAF_LEFT,          /* left child leaf, right internal — merge_cst_vec, partition_right */
     PIVCO_NODE_LEAF,               /* leaf — consumed by the parent merge, never dispatched */
 } pivco_node_type_t;
@@ -158,12 +161,16 @@ typedef struct {
     uint8_t  min_len;
     uint16_t num_symbols;
 
-    /* Flat-subtree fast path: per-node, if flat_depth[i] >= 2 then node i
+    /* Flat-subtree fast path: per-node, if flat_depth[i] >= 1 then node i
        is the root of a MAXIMAL flat subtree of depth D = flat_depth[i]
        (all 2^D leaves at the same relative depth).  Encoder emits N*D
        packed bits at this node instead of D levels of bitmaps; decoder
        reads N*D bits and uses flat_code_to_sym[flat_offset[i] + code]
-       per element.  Pool sum of 2^D across flat subtrees <= num_symbols. */
+       per element.  D=1 is the former BOTH_LEAVES sibling-pair node
+       (no-pair branch): same packed bits as the old pair bitmap, minus
+       the FSE-marker wire record.  Pool sum of 2^D across flat
+       subtrees <= num_symbols (except the degenerate single-symbol
+       table, which pools 2 entries of the same symbol). */
     uint8_t  flat_depth[PIVCO_MAX_TREE_NODES];
     uint16_t flat_offset[PIVCO_MAX_TREE_NODES];
     uint8_t  flat_code_to_sym[PIVCO_MAX_SYMBOLS];
@@ -218,9 +225,8 @@ int  pivco_huffman_get_fse_enabled(void);
  *                  pure canonical Huffman; no leaf fusion, no flat
  *                  subtrees.  Slowest decode; best baseline for "ph
  *                  without any tree optimizations vs Huff0".
- *   FUSED          allow D=1 sibling pairs but no D>=2 flats.  Tree
- *                  shape == canonical with `scatter_two` / `merge_two`
- *                  leaf fusion only.
+ *   FUSED          allow D=1 flats (sibling pairs) but no D>=2 flats.
+ *                  Tree shape == canonical with pair fusion only.
  *   CANONICAL_FLAT chunks are derived from canonical code positions:
  *                  greedy peel the largest 2^k chunk such that the
  *                  canonical start code is 2^k-aligned and 2^k <=

@@ -710,6 +710,8 @@ static inline void merge_flat_x86(uint8_t *out, int n,
 {
     PROF_TIC();
     switch (D) {
+    case 1: /* former BOTH_LEAVES pair: cst_cst IS the D=1 flat decode */
+            merge_cst_cst_x86(bm, n, c2s[0], c2s[1], out); break;
     case 2: merge_flat_d2_x86(out, n, bm, c2s); break;
     case 3: merge_flat_d3_x86(out, n, bm, c2s); break;
     case 4: merge_flat_d4_x86(out, n, bm, c2s); break;
@@ -718,7 +720,7 @@ static inline void merge_flat_x86(uint8_t *out, int n,
     case 7: merge_flat_d7_x86(out, n, bm, c2s); break;
     case 8: merge_flat_d8_x86(out, n, bm, c2s); break;
     default:
-        pivco_check_fail("merge_flat_x86: D out of range (flat_depth is 2..8)",
+        pivco_check_fail("merge_flat_x86: D out of range (flat_depth is 1..8)",
                          __FILE__, __LINE__);
         break;
     }
@@ -1043,6 +1045,13 @@ static inline void pack_dN_x86(uint8_t *out, const uint8_t *ranks,
 
     int i = 0;
     switch (D) {
+    case 1: /* former BOTH_LEAVES pair.  bit = (rank > base) == the D=1
+             * local code, LSB-first — exactly the partition bitmap, so
+             * reuse part_core's pure-bitmap-build form (EMIT_RIGHT=0
+             * never writes ranks; the const cast is sound). */
+            (void)part_core_x86((uint8_t *)(uintptr_t)ranks, n, base,
+                                out, NULL, 0);
+            return;
     case 4: i = pack_d4_sse_x86(out, ranks, n, base); break;
     case 8: i = pack_d8_sse_x86(out, ranks, n, base); break;
 #ifdef PIVCO_HAS_AVX2

@@ -86,7 +86,7 @@ static void measure_mode(pivco_tree_mode_t mode, const uint8_t *sym, size_t n,
        "how much of the decode work is fast-pathed" than the bare node count. */
     int flat_syms_total = 0;
     for (int i = 0; i < table->tree_node_count; i++) {
-        if (table->flat_depth[i] >= 2)
+        if (table->flat_depth[i] >= 1)
             flat_syms_total += (1 << table->flat_depth[i]);
     }
     *flat_internal_nodes_out = flat_syms_total;

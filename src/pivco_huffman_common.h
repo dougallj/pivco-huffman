@@ -89,9 +89,8 @@ static inline int bitmap_bytes(int n)
  * decoder skips it (still computes splits inline per stride).
  *
  * Condition: node has at least one child that's NOT a leaf.  Encodes the
- * exact set of popcount call sites in the BU decoder.  Both-leaf cases
- * and HALF_*-with-leaf cases get no header (decoder uses merge_cst_cst
- * directly).
+ * exact set of popcount call sites in the BU decoder.  Flat roots (any
+ * D >= 1, including the former both-leaf pair case) get no header.
  *
  * The "needs header" decision is a pure function of the tree topology and
  * matches across encoder and decoder via this shared helper. */
@@ -100,7 +99,9 @@ static inline int kr_header_needed(const pivco_huffman_table_t *table,
 {
     const pivco_tree_node_t *n = &table->tree[node_id];
     if (n->symbol >= 0) return 0;                /* leaf */
-    if (table->flat_depth[node_id] >= 2) return 0; /* flat path */
+    /* Flat path.  Must be checked BEFORE touching children: a D=1 flat
+     * root built from a chunk has no materialized children (left == -1). */
+    if (table->flat_depth[node_id] >= 1) return 0;
     return (table->tree[n->left].symbol < 0)
         || (table->tree[n->right].symbol < 0);
 }
