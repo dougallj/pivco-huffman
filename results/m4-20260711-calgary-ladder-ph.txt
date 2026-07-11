@@ -1,0 +1,404 @@
+# Out-of-sample ladder: Calgary corpus (18 files), LZ4HC-9 literals, PH, M4, reps=7
+# 372KB total lits; files 2.9-66KB; extractor identical to the Silesia pipeline.
+# Nudge/auto/exact design frozen from Silesia tuning — nothing adjusted for Calgary.
+# (bench gained inner-loop timing so tiny files span >= ~8MB per timed region)
+
+LADDER G=4K reps=7 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+bib.lits        off   0.7572       145      4400      1683      5211      24.7         -
+bib.lits      nudge   0.7558       412      5957      3444      8851       8.3       1/3
+bib.lits       auto   0.7560       256      7420      4297     11245      14.3       3/3
+bib.lits      exact   0.7561       132      7453      4377     11475      28.7       3/3
+book1.lits      off   0.6995       738      4873      2990      6840       4.0         -
+book1.lits    nudge   0.6971       596      5355      3205      7672       5.4      8/17
+book1.lits     auto   0.6927       454      6947      4294     10702       7.7     17/17
+book1.lits    exact   0.6933       235      6857      4227     10529      15.7     17/17
+book2.lits      off   0.7370       730      5031      3189      7190       4.3         -
+book2.lits    nudge   0.7334       578      6013      3417      8353       5.8      7/11
+book2.lits     auto   0.7354       296      6906      4283     10634      12.7     10/11
+book2.lits    exact   0.7347       188      6822      4221     10541      20.5     10/11
+geo.lits        off   0.8077       347      3966      2795      6073       9.7         -
+geo.lits      nudge   0.8028       319      5222      3686      8162      11.0     15/16
+geo.lits       auto   0.8075       231      3968      2776      6198      15.2      1/16
+geo.lits      exact   0.7996        54      5403      3769      8406      69.7     16/16
+news.lits       off   0.7835       702      4997      2958      6765       4.3         -
+news.lits     nudge   0.7807       583      5758      3609      8328       5.7     10/13
+news.lits      auto   0.7799       356      6864      4054     10403      10.2     13/13
+news.lits     exact   0.7799       166      6716      4057     10275      22.8     13/13
+obj1.lits       off   0.9512       303      3689      2440      5885       8.0         -
+obj1.lits     nudge   0.9463       304      4728      3610      8085       8.3       3/3
+obj1.lits      auto   0.9470       162      4908      3762      8469      16.3       2/3
+obj1.lits     exact   0.9418        39      4766      3492      7985      70.3       3/3
+obj2.lits       off   0.9189       381      3927      2777      6073       9.0         -
+obj2.lits     nudge   0.9135       302      5410      3685      8587      12.1     10/10
+obj2.lits      auto   0.9161       217      5428      3583      8526      17.2      8/10
+obj2.lits     exact   0.9118        55      5878      3970      9638      71.5     10/10
+paper1.lits     off   0.7489       598      4847      3118      7092       4.5         -
+paper1.lits   nudge   0.7489       549      4805      3112      6900       5.0       0/2
+paper1.lits    auto   0.7455       241      6756      4193     10397      13.0       2/2
+paper1.lits   exact   0.7452       143      6686      4187     10371      22.5       2/2
+paper2.lits     off   0.7127       606      4938      3092      7419       3.7         -
+paper2.lits   nudge   0.7107       533      4971      3227      7705       4.3       1/3
+paper2.lits    auto   0.7064       266      6617      3816     10541       9.7       3/3
+paper2.lits   exact   0.7074       176      6425      3737     10109      15.0       3/3
+paper3.lits     off   0.7107       651      4894      3067      7164       4.0         -
+paper3.lits   nudge   0.7031       561      6679      3702      9975       5.0       2/2
+paper3.lits    auto   0.7028       353      6832      3811     10023       8.5       2/2
+paper3.lits   exact   0.7031       128      6483      3769     10107      25.0       2/2
+paper4.lits     off   0.7135       644      5678      3445      8375       4.0         -
+paper4.lits   nudge   0.7135       535      5685      3429      8350       5.0       0/1
+paper4.lits    auto   0.7100       292      6450      3720      9978      10.0       1/1
+paper4.lits   exact   0.7100       133      6314      3685      9758      23.0       1/1
+paper5.lits     off   0.7579       709      4153      2600      6168       3.0         -
+paper5.lits   nudge   0.7503       506      5559      3743      8381       5.0       1/1
+paper5.lits    auto   0.7459       273      6564      4180     10741      10.0       1/1
+paper5.lits   exact   0.7456       129      6706      4780     10867      22.0       1/1
+paper6.lits     off   0.7599       566      4442      3053      6783       4.0         -
+paper6.lits   nudge   0.7574       477      5027      3367      7776       5.0       1/2
+paper6.lits    auto   0.7547       288      6111      4231     10146       9.0       2/2
+paper6.lits   exact   0.7544       145      6133      4359     10109      18.5       2/2
+pic.lits        off   0.7378       542      4546      2936      6711       6.0         -
+pic.lits      nudge   0.7336       487      5593      3708      8646       7.1       7/8
+pic.lits       auto   0.7309       303      7061      4334     11564      12.3       8/8
+pic.lits      exact   0.7308       138      7085      4680     11580      28.1       8/8
+progc.lits      off   0.7831       645      4728      3311      7355       3.5         -
+progc.lits    nudge   0.7797       589      5262      3691      8172       4.0       1/2
+progc.lits     auto   0.7813       290      6263      4196     10051       9.0       2/2
+progc.lits    exact   0.7818       136      6121      4169     10087      20.0       2/2
+progl.lits      off   0.7479       600      4657      3181      7393       3.5         -
+progl.lits    nudge   0.7419       458      5449      3960      8994       5.0       2/2
+progl.lits     auto   0.7429       285      6276      4364     10450       8.5       2/2
+progl.lits    exact   0.7423       151      6295      4319     10772      16.5       2/2
+progp.lits      off   0.8000       502      3729      2735      6040       3.5         -
+progp.lits    nudge   0.7942       458      4291      3105      6766       4.0       1/2
+progp.lits     auto   0.7879       225      5834      3784      9881       9.0       2/2
+progp.lits    exact   0.7879       148      5810      3789     10035      14.0       2/2
+trans.lits      off   0.7826       654      4717      2884      6843       4.5         -
+trans.lits    nudge   0.7779       544      6524      3844      9176       6.0       2/2
+trans.lits     auto   0.7763       333      7091      4156     10709      10.5       2/2
+trans.lits    exact   0.7762       147      7145      4230     10932      25.0       2/2
+== geomean over 18 files (G=4K)
+   off: enc-e2e    525 ( +0.0%)  dec-e2e   4539 ( +0.0%)  enc-k   2873  dec-k   6705  ratio +0.000pp
+ nudge: enc-e2e    478 ( -9.0%)  dec-e2e   5429 (+19.6%)  enc-k   3522  dec-k   8237  ratio -0.386pp
+  auto: enc-e2e    278 (-47.1%)  dec-e2e   6285 (+38.5%)  enc-k   3970  dec-k   9951  ratio -0.505pp
+ exact: enc-e2e    125 (-76.2%)  dec-e2e   6361 (+40.1%)  enc-k   4087  dec-k  10159  ratio -0.602pp
+
+LADDER G=8K reps=7 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+bib.lits        off   0.7441       308      5841      2349      6306      16.5         -
+bib.lits      nudge   0.7426       556      7407      3851      9801       9.0       1/2
+bib.lits       auto   0.7443       314      8974      5051     12556      17.5       2/2
+bib.lits      exact   0.7445       160      9170      5201     12670      35.5       2/2
+book1.lits      off   0.6776      1043      6434      3536      8029       5.0         -
+book1.lits    nudge   0.6771       817      6652      3596      8338       7.0       1/9
+book1.lits     auto   0.6754       610      9091      4708     12148      10.6       9/9
+book1.lits    exact   0.6754       384      8975      4687     12289      17.7       9/9
+book2.lits      off   0.7200       958      6353      3567      8073       5.7         -
+book2.lits    nudge   0.7183       772      7973      4166     10221       7.8       6/6
+book2.lits     auto   0.7201       529      9441      4896     12707      12.5       6/6
+book2.lits    exact   0.7200       323      9691      4960     12593      21.5       6/6
+geo.lits        off   0.7868       579      5578      3566      7369      11.1         -
+geo.lits      nudge   0.7865       482      7037      4201      9256      14.1       8/8
+geo.lits       auto   0.7868       375      5531      3400      7268      18.2       0/8
+geo.lits      exact   0.7843        86      7318      4360      9726      88.0       8/8
+news.lits       off   0.7649       955      6009      3446      7667       5.6         -
+news.lits     nudge   0.7650       865      7590      4111      9750       6.7       5/7
+news.lits      auto   0.7642       536      8978      4682     11958      12.1       7/7
+news.lits     exact   0.7640       301      8846      4638     11824      22.9       7/7
+obj1.lits       off   0.9395       537      5133      3383      7298       6.5         -
+obj1.lits     nudge   0.9383       390      5973      3641      8520       9.5       2/2
+obj1.lits      auto   0.9459       208      6511      4505      9366      19.0       1/2
+obj1.lits     exact   0.9422        58      6466      4351      9172      70.0       2/2
+obj2.lits       off   0.9053       627      5699      3490      7610      10.4         -
+obj2.lits     nudge   0.9042       508      6643      3869      8747      13.6       4/5
+obj2.lits      auto   0.9092       366      7851      4613     10464      20.0       5/5
+obj2.lits     exact   0.9075        95      7970      4886     10663      81.8       5/5
+paper1.lits     off   0.7292       840      6627      3449      7827       6.0         -
+paper1.lits   nudge   0.7265       577      7719      4303     10109      10.0       1/1
+paper1.lits    auto   0.7282       286      8659      5036     11541      22.0       1/1
+paper1.lits   exact   0.7274       157      8722      4881     11686      41.0       1/1
+paper2.lits     off   0.6958       789      5989      3314      8091       4.0         -
+paper2.lits   nudge   0.6938       728      6290      3461      8441       4.5       1/2
+paper2.lits    auto   0.6917       348      8242      4499     11653      11.0       2/2
+paper2.lits   exact   0.6922       203      7953      4449     11323      19.5       2/2
+paper3.lits     off   0.6847       839      7038      3514      9138       6.0         -
+paper3.lits   nudge   0.6847       840      6832      3531      8877       6.0       0/1
+paper3.lits    auto   0.6811       405      9643      4886     12711      15.0       1/1
+paper3.lits   exact   0.6811       225      9621      4830     12692      28.0       1/1
+paper4.lits     off   0.7135       644      5681      3438      8434       4.0         -
+paper4.lits   nudge   0.7135       535      5724      3435      8434       5.0       0/1
+paper4.lits    auto   0.7100       292      6475      3730      9758      10.0       1/1
+paper4.lits   exact   0.7100       168      6505      3713      9978      18.0       1/1
+paper5.lits     off   0.7579       698      4276      2463      6205       3.0         -
+paper5.lits   nudge   0.7503       506      5924      3777      8431       5.0       1/1
+paper5.lits    auto   0.7459       250      6355      4180     10035      11.0       1/1
+paper5.lits   exact   0.7456       129      6684      4748     10755      22.0       1/1
+paper6.lits     off   0.7405       841      6010      3466      7976       5.0         -
+paper6.lits   nudge   0.7405       646      6019      3470      7871       7.0       0/1
+paper6.lits    auto   0.7410       421      8341      4672     11654      12.0       1/1
+paper6.lits   exact   0.7407       240      8677      4784     12231      22.0       1/1
+pic.lits        off   0.7186       725      6458      3543      8296       8.7         -
+pic.lits      nudge   0.7164       708      8096      4507     10601       9.5       3/4
+pic.lits       auto   0.7171       460      9186      5018     12420      15.8       4/4
+pic.lits      exact   0.7161       179      9639      5385     13390      43.0       4/4
+progc.lits      off   0.7586       872      6650      3916      8834       5.0         -
+progc.lits    nudge   0.7620       672      7866      4171     10361       7.0       1/1
+progc.lits     auto   0.7583       461      9192      4818     12288      11.0       1/1
+progc.lits    exact   0.7583       206      8367      4696     11689      26.0       1/1
+progl.lits      off   0.7241       679      5359      3176      7046       6.0         -
+progl.lits    nudge   0.7172       638      7992      4634     11013       7.0       1/1
+progl.lits     auto   0.7187       393      8235      4375     11264      12.0       1/1
+progl.lits    exact   0.7183       225      8956      4876     12734      22.0       1/1
+progp.lits      off   0.7635       693      5441      3558      7599       5.0         -
+progp.lits    nudge   0.7635       521      5385      3423      7385       7.0       0/1
+progp.lits     auto   0.7581       332      7641      4554     10995      12.0       1/1
+progp.lits    exact   0.7600       144      7405      4547     11053      29.0       1/1
+trans.lits      off   0.7588       945      6733      3717      8223       6.0         -
+trans.lits    nudge   0.7584       770      7483      4066      9288       8.0       1/1
+trans.lits     auto   0.7586       565     10128      5212     13222      12.0       1/1
+trans.lits    exact   0.7584       243     10353      5684     13498      30.0       1/1
+== geomean over 18 files (G=8K)
+   off: enc-e2e    729 ( +0.0%)  dec-e2e   5923 ( +0.0%)  enc-k   3358  dec-k   7742  ratio +0.000pp
+ nudge: enc-e2e    626 (-14.1%)  dec-e2e   6868 (+16.0%)  enc-k   3883  dec-k   9139  ratio -0.135pp
+  auto: enc-e2e    382 (-47.6%)  dec-e2e   8144 (+37.5%)  enc-k   4578  dec-k  11228  ratio -0.160pp
+ exact: enc-e2e    178 (-75.6%)  dec-e2e   8328 (+40.6%)  enc-k   4741  dec-k  11600  ratio -0.208pp
+
+LADDER G=16K reps=7 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+bib.lits        off   0.7277       376      6461      2273      6925      26.0         -
+bib.lits      nudge   0.7277       647      9061      3811      9871      15.0       0/1
+bib.lits       auto   0.7295       373     10513      4889     12481      29.0       1/1
+bib.lits      exact   0.7298       247     10474      4762     12463      45.0       1/1
+book1.lits      off   0.6667      1286      7821      3966      8994       7.0         -
+book1.lits    nudge   0.6667      1067      8037      4061      9405       9.2       2/5
+book1.lits     auto   0.6669       812     10568      5137     12772      13.8       5/5
+book1.lits    exact   0.6665       505     10622      5158     12830      23.8       5/5
+book2.lits      off   0.7125      1152      7347      3825      8463       9.0         -
+book2.lits    nudge   0.7137      1077      8531      4307      9804      10.3       2/3
+book2.lits     auto   0.7124       796     10437      4974     12262      15.7       3/3
+book2.lits    exact   0.7147       461     11141      5257     12823      29.3       3/3
+geo.lits        off   0.7765       770      7363      3883      8146      16.0         -
+geo.lits      nudge   0.7774       758      8474      4698      9933      17.0       4/4
+geo.lits       auto   0.7765       565      6787      3880      8091      23.3       0/4
+geo.lits      exact   0.7758       158      8474      4613      9956      94.3       4/4
+news.lits       off   0.7546      1155      7096      3793      8328       7.8         -
+news.lits     nudge   0.7563      1080      9036      4402     10804       9.0       3/4
+news.lits      auto   0.7557       809     10776      5310     12995      13.5       4/4
+news.lits     exact   0.7560       413     10613      5286     12856      28.8       4/4
+obj1.lits       off   0.9239       578      5889      3532      7540      12.0         -
+obj1.lits     nudge   0.9293       647      7493      4522      9440      11.0       1/1
+obj1.lits      auto   0.9295       383      8220      4972     10815      20.0       1/1
+obj1.lits     exact   0.9274        67      7581      4834      9827     123.0       1/1
+obj2.lits       off   0.9038       801      6750      3752      8061      13.0         -
+obj2.lits     nudge   0.9047       755      7575      4125      9087      14.3       3/3
+obj2.lits      auto   0.9066       502      7637      4333      9186      23.3       2/3
+obj2.lits     exact   0.9090       145      9087      5248     10855      88.7       3/3
+paper1.lits     off   0.7292       840      6120      3449      7856       6.0         -
+paper1.lits   nudge   0.7265       627      7579      4127      9790       9.0       1/1
+paper1.lits    auto   0.7282       384      8623      5003     11400      16.0       1/1
+paper1.lits   exact   0.7274       212      8695      4935     11653      30.0       1/1
+paper2.lits     off   0.6788       807      7593      3653      8814       8.0         -
+paper2.lits   nudge   0.6788       736      6934      3672      8641       9.0       0/1
+paper2.lits    auto   0.6757       349      9825      4690     12542      22.0       1/1
+paper2.lits   exact   0.6765       173      9344      4475     11901      46.0       1/1
+paper3.lits     off   0.6847       744      6973      3490      8887       7.0         -
+paper3.lits   nudge   0.6847       744      6749      3487      8821       7.0       0/1
+paper3.lits    auto   0.6811       430      9544      4758     12392      14.0       1/1
+paper3.lits   exact   0.6811       233      9544      4718     12428      27.0       1/1
+paper4.lits     off   0.7135       532      5421      3331      8195       5.0         -
+paper4.lits   nudge   0.7135       532      5403      3308      8187       5.0       0/1
+paper4.lits    auto   0.7100       246      6221      3603      9623      12.0       1/1
+paper4.lits   exact   0.7100       145      6170      3611      9623      21.0       1/1
+paper5.lits     off   0.7579       694      4047      2404      6014       3.0         -
+paper5.lits   nudge   0.7503       501      5483      3490      8331       5.0       1/1
+paper5.lits    auto   0.7459       271      6242      3787      9928      10.0       1/1
+paper5.lits   exact   0.7456       129      6658      4562     10797      22.0       1/1
+paper6.lits     off   0.7405       734      6469      3546      8650       6.0         -
+paper6.lits   nudge   0.7405       583      6266      3640      8162       8.0       0/1
+paper6.lits    auto   0.7410       251      8650      4881     11952      21.0       1/1
+paper6.lits   exact   0.7407       135      8926      5006     12486      40.0       1/1
+pic.lits        off   0.7101      1041      8096      4171      9277      11.5         -
+pic.lits      nudge   0.7115      1068     10655      5420     12663      12.0       2/2
+pic.lits       auto   0.7162       821     13263      6554     16053      17.0       2/2
+pic.lits      exact   0.7098       265     12046      5967     14327      57.5       2/2
+progc.lits      off   0.7586       754      6655      3893      8688       6.0         -
+progc.lits    nudge   0.7620       674      7932      4237     10235       7.0       1/1
+progc.lits     auto   0.7583       429      9024      5258     12433      12.0       1/1
+progc.lits    exact   0.7583       192      8180      4742     11721      28.0       1/1
+progl.lits      off   0.7241       676      5291      3108      7070       6.0         -
+progl.lits    nudge   0.7172       569      7939      4672     10969       8.0       1/1
+progl.lits     auto   0.7187       394      8069      4476     11219      12.0       1/1
+progl.lits    exact   0.7183       207      8624      5126     12753      24.0       1/1
+progp.lits      off   0.7635       692      5402      3550      7451       5.0         -
+progp.lits    nudge   0.7635       692      5402      3547      7477       5.0       0/1
+progp.lits     auto   0.7581       360      7627      4496     11068      11.0       1/1
+progp.lits    exact   0.7600       187      7378      4572     10952      22.0       1/1
+trans.lits      off   0.7588       847      6793      3846      8455       7.0         -
+trans.lits    nudge   0.7584       699      7437      4044      9455       9.0       1/1
+trans.lits     auto   0.7586       526     10177      5228     13369      13.0       1/1
+trans.lits    exact   0.7584       251     10314      5665     13520      29.0       1/1
+== geomean over 18 files (G=16K)
+   off: enc-e2e    773 ( +0.0%)  dec-e2e   6448 ( +0.0%)  enc-k   3486  dec-k   8057  ratio +0.000pp
+ nudge: enc-e2e    726 ( -6.1%)  dec-e2e   7433 (+15.3%)  enc-k   4055  dec-k   9433  ratio -0.015pp
+  auto: enc-e2e    448 (-42.0%)  dec-e2e   8839 (+37.1%)  enc-k   4746  dec-k  11565  ratio -0.091pp
+ exact: enc-e2e    204 (-73.6%)  dec-e2e   8969 (+39.1%)  enc-k   4892  dec-k  11806  ratio -0.112pp
+
+LADDER G=32K reps=7 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+bib.lits        off   0.7277       343      6383      2312      6908      29.0         -
+bib.lits      nudge   0.7277       612      8965      3772      9859      16.0       0/1
+bib.lits       auto   0.7295       372     10487      4844     12408      29.0       1/1
+bib.lits      exact   0.7298       246     10383      4708     12408      45.0       1/1
+book1.lits      off   0.6631      1428      8313      4003      9033      10.0         -
+book1.lits    nudge   0.6631      1394      8257      3975      8919      10.3       0/3
+book1.lits     auto   0.6642      1057     12027      5566     13506      17.0       3/3
+book1.lits    exact   0.6647       706     11662      5434     13399      27.3       3/3
+book2.lits      off   0.7104      1375      7647      3918      8345      10.5         -
+book2.lits    nudge   0.7111      1288      9483      4655     10271      12.5       2/2
+book2.lits     auto   0.7109       908     10757      4945     11983      20.0       2/2
+book2.lits    exact   0.7112       585     10798      4916     11983      33.5       2/2
+geo.lits        off   0.7739      1002      7699      3759      7954      22.5         -
+geo.lits      nudge   0.7735       986      8210      4282      9057      24.0       1/2
+geo.lits       auto   0.7739       695      7114      3732      7756      36.0       0/2
+geo.lits      exact   0.7719       250      8980      4600      9817     116.5       2/2
+news.lits       off   0.7508      1383      8010      3888      8690      12.0         -
+news.lits     nudge   0.7523      1371      9773      4451     10600      13.0       2/2
+news.lits      auto   0.7526      1132     12149      5420     13304      18.0       2/2
+news.lits     exact   0.7529       622     11659      5286     12935      36.5       2/2
+obj1.lits       off   0.9239       539      5788      3464      7407      13.0         -
+obj1.lits     nudge   0.9293       598      7394      4405      9346      12.0       1/1
+obj1.lits      auto   0.9295       365      8172      4815     10773      21.0       1/1
+obj1.lits     exact   0.9274        77      7588      4911      9839     106.0       1/1
+obj2.lits       off   0.9126       994      6832      3623      7693      14.5         -
+obj2.lits     nudge   0.9117       866      8030      4013      9038      18.0       2/2
+obj2.lits      auto   0.9186       634      9308      5184     10745      27.5       2/2
+obj2.lits     exact   0.9152       198      9391      5271     10636      96.5       2/2
+paper1.lits     off   0.7292       747      6201      3476      7827       7.0         -
+paper1.lits   nudge   0.7265       775      7719      4183      9825       7.0       1/1
+paper1.lits    auto   0.7282       385      8722      5076     11478      16.0       1/1
+paper1.lits   exact   0.7274       243      8786      4941     11589      26.0       1/1
+paper2.lits     off   0.6788       906      7221      3856      8869       7.0         -
+paper2.lits   nudge   0.6788       739      6980      3739      8777       9.0       0/1
+paper2.lits    auto   0.6757       400     10001      4789     12486      19.0       1/1
+paper2.lits   exact   0.6765       225      9449      4572     11918      35.0       1/1
+paper3.lits     off   0.6847       844      7121      3596      9178       6.0         -
+paper3.lits   nudge   0.6847       749      7020      3608      8963       7.0       0/1
+paper3.lits    auto   0.6811       461      9732      4872     12672      13.0       1/1
+paper3.lits   exact   0.6811       218      9721      4858     12672      29.0       1/1
+paper4.lits     off   0.7135       645      5720      3468      8375       4.0         -
+paper4.lits   nudge   0.7135       535      5670      3441      8333       5.0       0/1
+paper4.lits    auto   0.7100       322      6510      3738      9884       9.0       1/1
+paper4.lits   exact   0.7100       139      6490      3716      9758      22.0       1/1
+paper5.lits     off   0.7579       712      4188      2639      6223       3.0         -
+paper5.lits   nudge   0.7503       506      5604      3781      8440       5.0       1/1
+paper5.lits    auto   0.7459       301      6483      4141     10168       9.0       1/1
+paper5.lits   exact   0.7456       142      6831      4766     11038      20.0       1/1
+paper6.lits     off   0.7405       735      6098      3569      7991       6.0         -
+paper6.lits   nudge   0.7405       654      6036      3739      8045       7.0       0/1
+paper6.lits    auto   0.7410       422      8391      4784     11621      12.0       1/1
+paper6.lits   exact   0.7407       212      8722      4890     12267      25.0       1/1
+pic.lits        off   0.7088      1193      8567      4118      9226      19.0         -
+pic.lits      nudge   0.7119      1272     11150      5244     12168      19.0       1/1
+pic.lits       auto   0.7129      1165     12997      5904     14576      22.0       1/1
+pic.lits      exact   0.7081       473     12721      5778     14087      62.0       1/1
+progc.lits      off   0.7586       751      6456      3818      8555       6.0         -
+progc.lits    nudge   0.7620       672      7678      4142     10039       7.0       1/1
+progc.lits     auto   0.7583       428      8844      5041     12007      12.0       1/1
+progc.lits    exact   0.7583       199      8890      4723     12378      27.0       1/1
+progl.lits      off   0.7241       789      5403      3305      7166       5.0         -
+progl.lits    nudge   0.7172       640      8038      4722     11371       7.0       1/1
+progl.lits     auto   0.7187       245      8292      4500     11309      20.0       1/1
+progl.lits    exact   0.7183       192      8852      5167     12581      26.0       1/1
+progp.lits      off   0.7635       598      5483      3602      7444       6.0         -
+progp.lits    nudge   0.7635       693      5455      3578      7391       5.0       0/1
+progp.lits     auto   0.7581       360      7725      4503     11216      11.0       1/1
+progp.lits    exact   0.7600       180      7511      4607     10938      23.0       1/1
+trans.lits      off   0.7588       840      6910      3695      8773       7.0         -
+trans.lits    nudge   0.7584       700      7443      4068      9308       9.0       1/1
+trans.lits     auto   0.7586       435     10140      5195     13586      16.0       1/1
+trans.lits    exact   0.7584       209     10365      5646     13608      35.0       1/1
+== geomean over 18 files (G=32K)
+   off: enc-e2e    829 ( +0.0%)  dec-e2e   6571 ( +0.0%)  enc-k   3530  dec-k   8049  ratio +0.000pp
+ nudge: enc-e2e    793 ( -4.3%)  dec-e2e   7577 (+15.3%)  enc-k   4076  dec-k   9363  ratio -0.027pp
+  auto: enc-e2e    498 (-39.9%)  dec-e2e   9145 (+39.2%)  enc-k   4803  dec-k  11638  ratio -0.073pp
+ exact: enc-e2e    242 (-70.8%)  dec-e2e   9232 (+40.5%)  enc-k   4911  dec-k  11810  ratio -0.130pp
+
+LADDER G=64K reps=7 fse=0 (PH)
+file            cfg    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+bib.lits        off   0.7277       339      6829      2568      7167      30.0         -
+bib.lits      nudge   0.7277       733      8974      3966      9836      13.0       0/1
+bib.lits       auto   0.7295       412     10474      4875     12426      26.0       1/1
+bib.lits      exact   0.7298       223     10461      4762     12537      50.0       1/1
+book1.lits      off   0.6619      1484      8313      3945      8752      14.0         -
+book1.lits    nudge   0.6619      1517      8313      3940      8780      13.5       0/2
+book1.lits     auto   0.6629      1235     12470      5599     13703      21.0       2/2
+book1.lits    exact   0.6629       952     12433      5588     13792      29.0       2/2
+book2.lits      off   0.7104      1446      8151      3781      8699      19.0         -
+book2.lits    nudge   0.7097      1472     10729      4818     11429      21.0       1/1
+book2.lits     auto   0.7163      1300     14067      6153     15129      27.0       1/1
+book2.lits    exact   0.7147       879     13589      5837     14503      43.0       1/1
+geo.lits        off   0.7708      1153      8299      4017      8693      38.0         -
+geo.lits      nudge   0.7714      1154      9422      4638      9852      40.0       1/1
+geo.lits       auto   0.7708       927      8282      4011      8675      51.0       0/1
+geo.lits      exact   0.7714       378      9738      4824     10476     150.0       1/1
+news.lits       off   0.7498      1487      7905      3775      8395      21.0         -
+news.lits     nudge   0.7497      1593     10250      4545     10721      21.0       1/1
+news.lits      auto   0.7506      1222     12758      5627     13717      33.0       1/1
+news.lits     exact   0.7506       855     12817      5574     13475      51.0       1/1
+obj1.lits       off   0.9239       579      5923      3535      7520      12.0         -
+obj1.lits     nudge   0.9293       524      7533      4493      9461      14.0       1/1
+obj1.lits      auto   0.9295       311      8016      4865     10310      25.0       1/1
+obj1.lits     exact   0.9274        79      7527      4948      9908     103.0       1/1
+obj2.lits       off   0.9097      1161      7985      3884      8561      24.0         -
+obj2.lits     nudge   0.9097      1195      7977      3875      8518      23.0       0/1
+obj2.lits      auto   0.9175       889      9616      5168     10298      37.0       1/1
+obj2.lits     exact   0.9143       311      9727      5121     10387     120.0       1/1
+paper1.lits     off   0.7292       743      6133      3383      7733       7.0         -
+paper1.lits   nudge   0.7265       691      7545      4069      9790       8.0       1/1
+paper1.lits    auto   0.7282       363      8570      4921     11415      17.0       1/1
+paper1.lits   exact   0.7274       194      8650      4811     11478      33.0       1/1
+paper2.lits     off   0.6788       892      7341      3606      9438       7.0         -
+paper2.lits   nudge   0.6788       739      7147      3736      8879       9.0       0/1
+paper2.lits    auto   0.6757       365      9883      4775     12617      21.0       1/1
+paper2.lits   exact   0.6765       198      9492      4531     11901      40.0       1/1
+paper3.lits     off   0.6847       842      7103      3567      9021       6.0         -
+paper3.lits   nudge   0.6847       748      6927      3577      8849       7.0       0/1
+paper3.lits    auto   0.6811       460      9588      4824     12465      13.0       1/1
+paper3.lits   exact   0.6811       233      9566      4830     12502      27.0       1/1
+paper4.lits     off   0.7135       535      5524      3418      8219       5.0         -
+paper4.lits   nudge   0.7135       534      5517      3395      8219       5.0       0/1
+paper4.lits    auto   0.7100       267      6338      3628      9769      11.0       1/1
+paper4.lits   exact   0.7100       123      6286      3652      9758      25.0       1/1
+paper5.lits     off   0.7579       568      4074      2554      6209       4.0         -
+paper5.lits   nudge   0.7503       432      5519      3782      8457       6.0       1/1
+paper5.lits    auto   0.7459       273      6355      4118     10011      10.0       1/1
+paper5.lits   exact   0.7456       110      6776      4830     10909      26.0       1/1
+paper6.lits     off   0.7405       735      6058      3567      7976       6.0         -
+paper6.lits   nudge   0.7405       742      6243      3747      8571       6.0       0/1
+paper6.lits    auto   0.7410       392      8357      4803     11637      13.0       1/1
+paper6.lits   exact   0.7407       184      8731      4895     12412      29.0       1/1
+pic.lits        off   0.7088      1345      8585      4132      9236      16.0         -
+pic.lits      nudge   0.7119      1271     11135      5221     12150      19.0       1/1
+pic.lits       auto   0.7129      1210     12956      5942     14426      21.0       1/1
+pic.lits      exact   0.7081       434     12838      5834     14111      68.0       1/1
+progc.lits      off   0.7586       751      6476      3822      8608       6.0         -
+progc.lits    nudge   0.7620       671      7742      4106     10087       7.0       1/1
+progc.lits     auto   0.7583       428      8844      5007     11837      12.0       1/1
+progc.lits    exact   0.7583       199      9015      4728     11418      27.0       1/1
+progl.lits      off   0.7241       790      5467      3322      7259       5.0         -
+progl.lits    nudge   0.7172       640      8116      4733     11386       7.0       1/1
+progl.lits     auto   0.7187       285      8325      4459     11417      17.0       1/1
+progl.lits    exact   0.7183       185      8852      5151     12469      27.0       1/1
+progp.lits      off   0.7635       692      5508      3544      7517       5.0         -
+progp.lits    nudge   0.7635       692      5480      3547      7470       5.0       0/1
+progp.lits     auto   0.7581       393      7711      4545     11171      10.0       1/1
+progp.lits    exact   0.7600       196      7477      4587     11306      21.0       1/1
+trans.lits      off   0.7588       839      7201      3682      8207       7.0         -
+trans.lits    nudge   0.7584       642      7510      4128      9476      10.0       1/1
+trans.lits     auto   0.7586       492     10214      5179     13348      14.0       1/1
+trans.lits    exact   0.7584       242     10443      5575     13433      30.0       1/1
+== geomean over 18 files (G=64K)
+   off: enc-e2e    845 ( +0.0%)  dec-e2e   6707 ( +0.0%)  enc-k   3534  dec-k   8137  ratio +0.000pp
+ nudge: enc-e2e    823 ( -2.6%)  dec-e2e   7721 (+15.1%)  enc-k   4100  dec-k   9477  ratio -0.033pp
+  auto: enc-e2e    528 (-37.5%)  dec-e2e   9365 (+39.6%)  enc-k   4875  dec-k  11788  ratio -0.038pp
+ exact: enc-e2e    258 (-69.5%)  dec-e2e   9473 (+41.2%)  enc-k   4976  dec-k  11960  ratio -0.095pp

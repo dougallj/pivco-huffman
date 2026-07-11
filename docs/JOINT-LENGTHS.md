@@ -550,3 +550,17 @@ at 4-8 K).  Auto doubles decode at small G (2.08 -> 4.85 GB/s at
 win ("off") is largest exactly where the joint share is also
 largest — small windows — because both attack per-window fixed
 costs.
+
+## Out-of-sample check: Calgary (Goodhart test)
+
+The nudge scorer, auto schedule, coarse granularity, lambda and guard
+were all tuned while measuring Silesia lits.  Frozen and re-run on
+Calgary LZ4HC-9 literals (18 files, 372 KB — smaller files, noisier
+windows, higher-entropy members like geo/obj*): the ladder holds.
+Decode e2e vs off: nudge +15..+20 %, auto +37..+40 %, exact
++39..+41 % at every G in 4-64 K, with exact ~= auto again.  Ratio
+IMPROVES at every rung and every G (-0.015 to -0.602 pp) — stronger
+than on Silesia, because smaller windows mean raggeder baseline trees
+and bigger record savings.  Encode deltas are more negative than
+Silesia's at equal G (tiny files amortize the joint pass worse).
+Results: results/m4-20260711-calgary-ladder-ph.txt.

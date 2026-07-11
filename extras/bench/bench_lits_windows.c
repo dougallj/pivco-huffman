@@ -95,11 +95,17 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
     }
 
     /* ---- encode kernels (timed) ---- */
+    /* Tiny files (Calgary-scale) finish a whole-file pass below the
+     * timer tick; loop enough passes inside the timed region that it
+     * spans ~8 MB of work. */
+    const int inner = (int)(1 + ((size_t)8 << 20) / (n ? n : 1));
     size_t total_enc = 0;
     double enc_best = 0;
     for (int rep = 0; rep < reps; rep++) {
         double t1 = now_sec();
         size_t off = 0;
+        for (int ii = 0; ii < inner; ii++) {
+        off = 0;
         for (size_t w = 0; w < nwin; w++) {
             woff[w] = off;
             size_t wlen = (w + 1) * G <= n ? G : n - w * G;
@@ -110,8 +116,9 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
                 off += el;
             }
         }
+        }
         woff[nwin] = off; total_enc = off;
-        double mbs = (double)n / (now_sec() - t1) / 1e6;
+        double mbs = (double)n * inner / (now_sec() - t1) / 1e6;
         if (mbs > enc_best) enc_best = mbs;
     }
 
@@ -119,6 +126,7 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
     double dec_best = 0;
     for (int rep = 0; rep < reps; rep++) {
         double t1 = now_sec();
+        for (int ii = 0; ii < inner; ii++)
         for (size_t w = 0; w < nwin; w++) {
             size_t wlen = (w + 1) * G <= n ? G : n - w * G;
             size_t off = woff[w], dof = 0;
@@ -130,7 +138,7 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
                 dof += (wlen - dof < PIVCO_BLOCK_SIZE) ? wlen - dof : PIVCO_BLOCK_SIZE;
             }
         }
-        double mbs = (double)n / (now_sec() - t1) / 1e6;
+        double mbs = (double)n * inner / (now_sec() - t1) / 1e6;
         if (mbs > dec_best) dec_best = mbs;
     }
     if (memcmp(dec, data, n) != 0) return -2;
@@ -139,6 +147,7 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
     double dec_e2e = 0;
     for (int rep = 0; rep < reps; rep++) {
         double t1 = now_sec();
+        for (int ii = 0; ii < inner; ii++)
         for (size_t w = 0; w < nwin; w++) {
             size_t wlen = (w + 1) * G <= n ? G : n - w * G;
             pivco_huffman_build_decode_table(tabs[w].code_len, dt);
@@ -151,7 +160,7 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
                 dof += (wlen - dof < PIVCO_BLOCK_SIZE) ? wlen - dof : PIVCO_BLOCK_SIZE;
             }
         }
-        double mbs = (double)n / (now_sec() - t1) / 1e6;
+        double mbs = (double)n * inner / (now_sec() - t1) / 1e6;
         if (mbs > dec_e2e) dec_e2e = mbs;
     }
     if (memcmp(dec, data, n) != 0) return -3;
