@@ -194,3 +194,56 @@ ratio, the decode ceiling rises again — the λ-sweep shows 91 % of
 merge passes are removable if the gap bits become free.  Conversely
 if the frontier knee (Q3) is where we already operate, this document
 closes the question and PH stays the shipping configuration.
+
+---
+
+## Post-review addendum (2026-07-11, after RESPONSE2.md; verdicts verified)
+
+All load-bearing claims of the review were re-derived here before
+acceptance:
+
+* **Q1 contiguity: TRUE** (convexity exchange on phi(W) = W log(W/m);
+  integral argument checked; both counterexamples to universal
+  size-ordering verified numerically).  Groups order by marginal
+  score S_j(W) = lambda'(log2 W + 1/ln2) - (mu*r + kappa_D +
+  lambda'*D), reducing to fullness W/2^D for gap alone.
+* **Q2: exact segmentation/Kraft DP** over (sorted prefix k, Kraft
+  mass q in 2^-R units), one transition per (r, D) type, O(1) costs
+  from prefix sums of n log n.  Grid = the old mass-DP size; our
+  diagonal/parity/capacity-band machinery is the natural next attack
+  on it.  Exact for the free-partition H-model; lower bound for the
+  lengths-only wire (chunk multiplicity + value order re-imposed via
+  the reviewer's edge-path MILP, or rescoring).
+* **Q5 skew theorem: FALSE** — verified invariant
+  sum_v W_v (1 - H2(q_v)) = sum_c W_c r_c - N H(P_1..P_C): for a
+  fixed partition and root depths, aggregate skew redundancy is
+  arrangement-INVARIANT; freeing depths, maximizing it just means a
+  deep bad tree.  The observed skew increase is a SELECTION effect:
+  entropy-aware flattening removes balanced (uncompressible) bitmaps
+  and retains skewed (compressible) ones.
+* **Q4 direction was backwards in our draft**: a better bitmap coder
+  makes RETAINING nonuniform merges cheaper, i.e. the wire-only
+  penalty of flattening is nondecreasing in coder quality.  The
+  small-window regime (coder never fires) is exactly where flattening
+  is ratio-free — matching the measured 4-8 K ratio IMPROVEMENTS.
+* **Two ideal models must be kept distinct**: H-model (W H2(q),
+  uniform flats free) vs E-model (log2 C(W,K), conditioned on counts
+  already on the wire via K_right — slightly BEYOND eta = 1, by
+  (1/2) log2(2 pi W q(1-q)) per node).  Uniform flats are H-free but
+  E-positive; finite-block correction ~ (m-1)/(2 ln 2) bits (~23
+  bytes for a D = 8 flat) — visible at small cadences.
+* **Local contraction rule** (verified): merging two D-flats across a
+  merge costs Delta G_H = W (1 - H2(q)) in gap — quadratically cheap
+  near balance — vs time saving W (mu + kappa_D - kappa_{D+1}).
+* **PH identity** (ours, found during verification): under PH the
+  routing wire bits equal the merge-pass count (both = sum W_c r_c),
+  so ratio and decode speed are one objective in the raw regime —
+  explaining the simultaneous wins at G <= 8 K.
+
+Engineering roadmap adopted from the review: four rate oracles (PH /
+H-ideal / E-ideal / measured-FSE), the segmentation DP as frontier
+generator + lower bound, per-contraction (W, q) measurement to locate
+the real knee, and two coder experiments — 8/16-bit
+block-hypergeometric enumerative bitmaps and a single block-global
+binary stream (amortizing the per-node marker/termination that
+currently dwarfs first-order inefficiency at small W).
