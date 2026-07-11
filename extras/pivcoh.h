@@ -1,4 +1,4 @@
-/* pivcoh.h - v1.0 - minimal single-file PIVCO-Huffman block codec
+/* pivcoh.h - v1.1 - minimal single-file PIVCO-Huffman block codec
  *
  * A tiny, scalar, allocation-free-capable implementation of the
  * PIVCO-Huffman wire format (https://github.com/MarcinZukowski/pivco-huffman).
@@ -57,10 +57,12 @@
  * bits/symbol plus per-node headers and byte rounding). */
 #define PIVCOH_ENCODE_BOUND(n)  ((11 * (size_t)(n) + 7) / 8 + 1024)
 
-/* Scratch bytes for encode or decode of blocks up to n symbols (~13n:
- * the walk holds one right-subtree buffer per tree level, and the tree
- * is up to 11 deep, plus the encoder's rank buffer). */
-#define PIVCOH_SCRATCH_SIZE(n)  (13 * (size_t)(n))
+/* Scratch bytes for encode or decode of blocks up to n symbols (2n: the
+ * walk places each node's larger child in place, so a K-element subtree
+ * touches at most K scratch bytes — n for the decoder's partner buffer
+ * or the encoder's partition pool, plus n for the encoder's rank
+ * buffer; decode uses only the first n). */
+#define PIVCOH_SCRATCH_SIZE(n)  (2 * (size_t)(n))
 
 typedef struct { uint8_t kd, param, right; } pivcoh__rec;
 
@@ -315,24 +317,38 @@ static void pivcoh__enc(const pivcoh_table *t, int idx, uint8_t *ranks, int K,
     uint8_t *bm = p;
     p += (K + 7) >> 3;
     memset(bm, 0, (size_t)((K + 7) >> 3));
-    int KL = 0, KR = 0;                        /* bit j = 1: rank > thr (right) */
-    for (j = 0; j < K; j++) {
-        uint8_t v = ranks[j];
-        if (v > rec->param) {
-            bm[j >> 3] |= (uint8_t)(1u << (j & 7));
-            if (kind != PIVCOH__PAIR) pool[KR] = v;
-            KR++;
-        } else {
-            if (kind == PIVCOH__FULL) ranks[KL] = v;
-            KL++;
-        }
-    }
+    int KR = 0;                                /* bit j = 1: rank > thr (right) */
+    for (j = 0; j < K; j++)
+        if (ranks[j] > rec->param) { bm[j >> 3] |= (uint8_t)(1u << (j & 7)); KR++; }
     if (kr) { kr[0] = (uint8_t)KR; kr[1] = (uint8_t)(KR >> 8); }
     *pp = p;
-    if (kind == PIVCOH__FULL && KL > 0)
-        pivcoh__enc(t, idx + 1, ranks, KL, pp, pool + KR);
-    if (kind != PIVCOH__PAIR && KR > 0)
-        pivcoh__enc(t, idx + rec->right, pool, KR, pp, pool + KR);
+    if (kind == PIVCOH__PAIR) return;
+    /* Mirror of the decode placement: the larger side compacts IN PLACE in
+     * the rank slab (stable: write cursor <= read cursor), the smaller side
+     * is extracted to the pool, and the first child's slab — dead once it
+     * returns — serves as the second child's pool.  A K-subtree touches at
+     * most K pool bytes (exact by induction).  LEAF_LEFT drops its left
+     * side entirely and needs no pool at this level. */
+    int KL = K - KR, wl = 0, wr = 0;
+    if (kind == PIVCOH__LEAFL) {
+        for (j = 0; j < K; j++)
+            if (ranks[j] > rec->param) ranks[wr++] = ranks[j];
+        if (KR > 0) pivcoh__enc(t, idx + rec->right, ranks, KR, pp, pool);
+    } else if (KL >= KR) {
+        for (j = 0; j < K; j++) {
+            uint8_t v = ranks[j];
+            if (v > rec->param) pool[wr++] = v; else ranks[wl++] = v;
+        }
+        if (KL > 0) pivcoh__enc(t, idx + 1, ranks, KL, pp, pool + KR);
+        if (KR > 0) pivcoh__enc(t, idx + rec->right, pool, KR, pp, ranks);
+    } else {
+        for (j = 0; j < K; j++) {
+            uint8_t v = ranks[j];
+            if (v > rec->param) ranks[wr++] = v; else pool[wl++] = v;
+        }
+        if (KL > 0) pivcoh__enc(t, idx + 1, pool, KL, pp, pool + KL);
+        if (KR > 0) pivcoh__enc(t, idx + rec->right, ranks, KR, pp, pool);
+    }
 }
 
 PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
@@ -356,12 +372,10 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
 /* ---- decode ---- */
 
 /* Returns the advanced input pointer, or NULL on malformed input.  out
- * receives exactly K symbols; right subtrees decode into pool and merge
- * back (the FULL merge runs backward in place, so only the right side
- * needs scratch — held pool bytes across the recursion never exceed the
- * block size). */
+ * receives exactly K symbols; partner must have capacity K (see the
+ * placement note at the merge below). */
 static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t *out,
-                                  const uint8_t *p, const uint8_t *end, uint8_t *pool)
+                                  const uint8_t *p, const uint8_t *end, uint8_t *partner)
 {
     const pivcoh__rec *rec = &t->sched[idx];
     int kind = rec->kd & 3, j;
@@ -397,26 +411,43 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         for (j = 0; j < K; j++) out[j] = t->rank_to_sym[rec->param + PIVCOH__BIT(j)];
         return p;
     }
-    if (kind == PIVCOH__LEAFL) {               /* left child is one leaf symbol */
-        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, pool, p, end, pool + KR)))
+    /* The larger child decodes IN PLACE into out's tail; the smaller into
+     * partner[0..KS), its own recursion ping-ponging into out's still-empty
+     * prefix (right-larger children take partner+KL, capacity K-KL = KR).
+     * So a K-subtree touches at most K partner bytes — exact by induction,
+     * no allocator — and the forward merge is safe because its write cursor
+     * can never pass its tail-side read cursor (j = li+ri <= tail0+ti, with
+     * equality a self-copy; the li/ri guards keep hostile bitmaps inside). */
+    int KL = K - KR;
+    if (kind == PIVCOH__LEAFL) {               /* left = KL copies of one leaf */
+        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, p, end, partner)))
             return NULL;
         uint8_t ls = t->rank_to_sym[rec->param];
         int r = 0;
         for (j = 0; j < K; j++) {
-            if (PIVCOH__BIT(j)) { if (r == KR) return NULL; out[j] = pool[r++]; }
+            if (PIVCOH__BIT(j)) { if (r == KR) return NULL; out[j] = out[KL + r]; r++; }
             else out[j] = ls;
         }
         return r == KR ? p : NULL;             /* bitmap must match K_right */
     }
-    /* FULL: left into out's prefix, right into pool, merge backward */
-    int KL = K - KR;
-    if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, out, p, end, pool))) return NULL;
-    if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, pool, p, end, pool + KR)))
-        return NULL;
-    int li = KL, ri = KR;
-    for (j = K - 1; j >= 0; j--) {
-        if (PIVCOH__BIT(j)) { if (!ri) return NULL; out[j] = pool[--ri]; }
-        else               { if (!li) return NULL; out[j] = out[--li]; }
+    const uint8_t *L, *R;
+    if (KL >= KR) {
+        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, out + KR, p, end, partner)))
+            return NULL;
+        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, partner, p, end, out)))
+            return NULL;
+        L = out + KR; R = partner;
+    } else {
+        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, partner, p, end, out)))
+            return NULL;
+        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, p, end, partner + KL)))
+            return NULL;
+        L = partner; R = out + KL;
+    }
+    int li = 0, ri = 0;
+    for (j = 0; j < K; j++) {
+        if (PIVCOH__BIT(j)) { if (ri == KR) return NULL; out[j] = R[ri++]; }
+        else               { if (li == KL) return NULL; out[j] = L[li++]; }
     }
     return p;
 #undef PIVCOH__BIT
@@ -430,7 +461,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
     if (!t || !in || !out || !t->num_ranks || in_len < 2) return -1;
     int N = in[0] | in[1] << 8;
     if (N < 1 || (size_t)N > out_cap) return -1;
-    uint8_t *sc = scratch ? (uint8_t *)scratch : (uint8_t *)malloc(PIVCOH_SCRATCH_SIZE(N));
+    uint8_t *sc = scratch ? (uint8_t *)scratch : (uint8_t *)malloc((size_t)N);
     if (!sc) return -1;
     const uint8_t *p = pivcoh__dec(t, 0, N, out, in + 2, in + in_len, sc);
     if (!scratch) free(sc);
