@@ -195,6 +195,22 @@ tree-arrangement INVARIANT (multinomial cancellation), strengthening
 K4.  Better within-class orders without full rank bytes: permutation
 codebook (4-8 bit profile per tree) or hash order.
 
+## Corpus & aggregation (applies to every lits table below)
+
+The ".lits" corpus is the Silesia corpus (all 12 members) preprocessed
+by extras/lz4_lits.c: LZ4HC level 9, literal runs concatenated per
+file -- the byte stream an LZ-front-ended entropy coder sees.  32.9 MB
+total; per-file literal fractions 3.5 % (xml) to ~22 % (mozilla);
+verified reproducible byte-identically (2026-07-11).  Files are never
+concatenated: each file is windowed independently into G-byte slices
+(last window short), timed whole-file (best-of-reps), one number per
+file; summaries are the UNWEIGHTED GEOMEAN across the 12 files for
+speeds and the unweighted mean for ratio (which includes the
+128-byte-per-window lengths header).  Unweighted = "typical data
+type", not "typical byte"; bytes-weighting would tilt toward the
+binary-ish members where joint wins biggest, so geomeans are mildly
+conservative here.
+
 ## Realistic-workload results (Silesia zstd literals, tables per window)
 
 M4, 12 .lits files, per-window table build + 16K-block encode/decode,
