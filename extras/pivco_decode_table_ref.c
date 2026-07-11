@@ -188,11 +188,8 @@ static int ref_sched_gen(ref_gen_t *g, unsigned depth)
         g->next++;
         unsigned b = c->bit;
         unsigned rank0 = g->rank;
-        uint8_t *dst = &g->dt->rank_to_sym[rank0];
-        const uint8_t *s = &g->items[c->sym_idx];
-        if (b == 0)      dst[0] = s[0];
-        else if (b == 1) { dst[0] = s[0]; dst[1] = s[1]; }
-        else             memcpy(dst, s, (size_t)1 << b);
+        memcpy(&g->dt->rank_to_sym[rank0], &g->items[c->sym_idx],
+               (size_t)1 << b);
         g->rank += 1u << b;
         if (b == 0) return 0;               /* a bare leaf needs no record */
         pivco_sched_rec_t *rec = &g->dt->sched[g->sched_len++];
