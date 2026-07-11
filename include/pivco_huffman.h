@@ -412,6 +412,15 @@ int  pivco_huffman_get_joint_granularity(void);
  * plain Huffman lengths.  Pass big values to disable (experiments). */
 void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap);
 
+/* Per-flat-depth kernel costs kappa[b], b = 0..8, in merge-pass units
+ * (measured flat-kernel time per symbol at depth b, divided by merge
+ * time per symbol).  Default all zeros = kernels modeled free, the
+ * historical objective.  Real tables are not monotone in b; all solve
+ * paths (exact slot DP via per-level cost-ordered sweeps, mass DP,
+ * coarse, nudge) and the adoption guard price them consistently.
+ * NULL resets to zeros. */
+void pivco_huffman_set_joint_kappa(const double kappa[9]);
+
 /* ---------- Table construction ---------- */
 
 int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],

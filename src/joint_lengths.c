@@ -85,6 +85,22 @@ void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap)
     g_joint_guard_pass = pass_cap > 0 ? pass_cap : 0.90;
 }
 
+/* Per-flat-depth kernel costs kappa[b], b = 0..8, in merge-pass units
+ * (kappa_b = measured flat-kernel ns/sym at depth b divided by merge
+ * ns/sym).  Default all-zero = the historical model.  Real tables are
+ * NOT monotone in b (D = 4/8 kernels are cheap, D = 5/7 dear); the
+ * solvers below stay exact for any table — the slot DP by sweeping
+ * each level's chunk types in cost order (see jl_slot_order), the
+ * mass DP by its global item sort. */
+static double g_joint_kappa[9] = {0};
+
+void pivco_huffman_set_joint_kappa(const double kappa[9])
+{
+    for (int b = 0; b <= 8; b++)
+        g_joint_kappa[b] = (kappa && kappa[b] >= 0.0 && kappa[b] < 100.0)
+                         ? kappa[b] : 0.0;
+}
+
 typedef struct {
     double   cost;      /* per-occurrence: L + lambda * (L - b) */
     uint8_t  L, b;
@@ -94,8 +110,10 @@ typedef struct {
 
 static int jl_cmp_item(const void *a, const void *b)
 {
-    double d = ((const jl_item_t *)a)->cost - ((const jl_item_t *)b)->cost;
-    return d < 0 ? -1 : d > 0 ? 1 : 0;
+    const jl_item_t *x = a, *y = b;
+    if (x->cost != y->cost) return x->cost < y->cost ? -1 : 1;
+    if (x->L != y->L) return (int)x->L - (int)y->L;
+    return (int)y->b - (int)x->b;       /* deterministic: larger b first */
 }
 
 typedef struct { uint64_t freq; uint8_t sym; } jl_sf_t;
@@ -182,6 +200,44 @@ static inline int jl_row_jcap(int t, int h, int sigma)
     return (kcap - p) >> 1;
 }
 
+/* Within-level sweep/deal order for the slot DP under kernel costs.
+ * cost(L, b) = L(1+lam) + g(b) with g(b) = lam*(kap[b] - b): the
+ * within-level cost order is L-independent, so one sorted order
+ * serves every level.  Exactness of the slot DP (sorted-matching over
+ * level-major processing) needs
+ *   (a) cross-level monotonicity: spread(g) <= 1 + lam
+ *       (kappa = 0 recovers the classic lam <= 1/7), and
+ *   (b) b = 0 dearest within the level (the parity fold runs it
+ *       last).
+ * Fills border[0..*nb) with b = 1..bcap sorted by ascending g and
+ * returns 1 iff both hold; on 0 the caller must use the mass DP,
+ * whose global item sort is order-condition-free. */
+static int jl_slot_order(double lam, const double *kap, int bcap,
+                         int border[8], int *nb)
+{
+    double g[9];
+    double gmin = 0, gmax = 0;
+    for (int b = 0; b <= bcap; b++) {
+        g[b] = lam * (kap[b] - (double)b);
+        if (b == 0 || g[b] < gmin) gmin = g[b];
+        if (b == 0 || g[b] > gmax) gmax = g[b];
+    }
+    if (gmax - gmin > (1.0 + lam) * (1.0 - 1e-9)) return 0;
+    int n = 0;
+    for (int b = 1; b <= bcap; b++) {
+        if (g[b] > g[0] + 1e-12) return 0;   /* b0 must stay dearest */
+        int i = n++;
+        while (i > 0 && (g[border[i - 1]] > g[b]
+                         || (g[border[i - 1]] == g[b] && border[i - 1] < b))) {
+            border[i] = border[i - 1];
+            i--;
+        }
+        border[i] = b;                       /* ties: larger b first */
+    }
+    *nb = n;
+    return 1;
+}
+
 /* lmax/bcap parameterize the level range and flat-depth cap so the
  * same solver runs the exact problem (11, 8) and the 4-grouped coarse
  * problem (9, 6): a group of 4 sorted symbols at real level L is a
@@ -189,9 +245,12 @@ static inline int jl_row_jcap(int t, int h, int sigma)
  * b' = b - 2 with an identical cost form (the +2 bits per symbol is a
  * constant offset). */
 static double jl_solve_slots(const double *P, int sigma, double lam,
-                             int lmax, int bcap,
+                             int lmax, int bcap, const double *kap,
                              uint16_t out_BL[JL_LMAX + 1])
 {
+    int border[8], nb;
+    if (!jl_slot_order(lam, kap, bcap, border, &nb))
+        return -1.0;                 /* caller falls back to the mass DP */
     const int W = (((sigma >> 1) + 2) + 3) & ~3;   /* compact row width */
     const size_t plane = (size_t)(sigma + 1) * (size_t)W;
     float    *cost = malloc(plane * sizeof(float));
@@ -239,11 +298,14 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
             uint16_t *prow = archL + (size_t)t * W;   /* pick, archived
                                                        * in place      */
             memset(prow, 0, (size_t)(jcap + 1) * sizeof(uint16_t));
-            for (int b = bmax; b >= 1; b--) {
+            for (int oi = 0; oi < nb; oi++) {
+                const int b = border[oi];
+                if (b > bmax) continue;
                 const int jstep = 1 << (b - 1);       /* = 2^b slots / 2 */
                 const int jhi = jcap - jstep;         /* dest j <= jcap  */
                 if (jhi < 0) continue;
-                const float a = (float)((double)L + lam * (double)(L - b));
+                const float a = (float)((double)L
+                                         + lam * ((double)(L - b) + kap[b]));
                 const float *dpb = dPt[p][b];
                 int j = jhi;
                 /* 0/1 in-place: dest j + jstep > src j, so iterate j
@@ -296,7 +358,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
          * unified source index (k - d - (t&1))/2.  The subloop that
          * contains the top cell runs first (it holds the only
          * same-row read). */
-        const float a0 = (float)((double)L * (1.0 + lam));
+        const float a0 = (float)((double)L * (1.0 + lam) + lam * kap[0]);
         for (int tp = thi[L + 1]; tp >= tlo[L + 1]; tp--) {
             const int pp = tp & 1;
             const int jcap2 = jl_row_jcap(tp, h - 1, sigma);
@@ -376,6 +438,7 @@ static double jl_solve_slots(const double *P, int sigma, double lam,
  * order (lam > 1/7), where the slot-ledger DP's exactness argument
  * does not apply. */
 static double jl_solve_mass(const double *P, int sigma, double lam,
+                            const double *kap,
                             uint16_t out_BL[JL_LMAX + 1])
 {
     jl_item_t items[JL_MAXITEMS];
@@ -384,7 +447,8 @@ static double jl_solve_mass(const double *P, int sigma, double lam,
         int bmax = L < 8 ? L : 8;
         for (int b = 0; b <= bmax; b++) {
             if ((1 << b) > sigma) break;
-            items[n_items].cost = (double)L + lam * (double)(L - b);
+            items[n_items].cost = (double)L
+                                + lam * ((double)(L - b) + kap[b]);
             items[n_items].L    = (uint8_t)L;
             items[n_items].b    = (uint8_t)b;
             items[n_items].size = (uint16_t)(1 << b);
@@ -477,18 +541,23 @@ static inline int jl_nudge_clamp(int c, int s, int rest, int h)
     return c < lo ? lo : c > hi ? hi : c;
 }
 
-/* Exact chunk cost of placing count c at level L on prefix [k, k+c). */
+/* Exact chunk cost of placing count c at level L on prefix [k, k+c);
+ * bits are dealt in the within-level cost order ord[0..nord). */
 static inline double jl_nudge_chunkcost(const double *P, int k, int c,
-                                        int L, double lam)
+                                        int L, double lam,
+                                        const double *kap,
+                                        const int *ord, int nord)
 {
     double sc = 0;
     int off = 0;
-    for (int b = 10; b >= 0; b--)
+    for (int oi = 0; oi < nord; oi++) {
+        const int b = ord[oi];
         if (c & (1 << b)) {
             sc += (P[k + off + (1 << b)] - P[k + off])
-                * ((double)L + lam * (double)(L - b));
+                * ((double)L + lam * ((double)(L - b) + kap[b]));
             off += 1 << b;
         }
+    }
     return sc;
 }
 
@@ -496,6 +565,7 @@ static inline double jl_nudge_chunkcost(const double *P, int k, int c,
  * baseline counts; returns the exact modeled cost of that completion.
  * Used as the lookahead scorer for candidate choices. */
 static double jl_nudge_rollout(const double *P, int sigma, double lam,
+                               const double *kap, const int *ord, int nord,
                                const int cls_n[JL_LMAX + 1],
                                int k, int s, int L0)
 {
@@ -504,7 +574,7 @@ static double jl_nudge_rollout(const double *P, int sigma, double lam,
         const int c = jl_nudge_clamp(cls_n[L], s, sigma - k,
                                      JL_LMAX - L);
         if (c < 0) return INFINITY;
-        cost += jl_nudge_chunkcost(P, k, c, L, lam);
+        cost += jl_nudge_chunkcost(P, k, c, L, lam, kap, ord, nord);
         k += c;
         s = 2 * (s - c);
     }
@@ -513,6 +583,7 @@ static double jl_nudge_rollout(const double *P, int sigma, double lam,
 
 /* One greedy walk; returns the committed path's exact modeled cost. */
 static double jl_nudge_walk(const double *P, int sigma, double lam,
+                            const double *kap, const int *ord, int nord,
                             const int base[JL_LMAX + 1],
                             uint16_t out_BL[JL_LMAX + 1])
 {
@@ -546,13 +617,14 @@ static double jl_nudge_walk(const double *P, int sigma, double lam,
             int c = jl_nudge_clamp(cand[i], s, sigma - k, JL_LMAX - L);
             if (c < 0 || c == prev) continue;
             prev = c;
-            const double sc = jl_nudge_chunkcost(P, k, c, L, lam)
-                + jl_nudge_rollout(P, sigma, lam, base,
+            const double sc = jl_nudge_chunkcost(P, k, c, L, lam,
+                                                 kap, ord, nord)
+                + jl_nudge_rollout(P, sigma, lam, kap, ord, nord, base,
                                    k + c, 2 * (s - c), L + 1);
             if (sc < best) { best = sc; bestc = c; }
         }
         out_BL[L] = (uint16_t)bestc;   /* binary decomposition == bits */
-        total += jl_nudge_chunkcost(P, k, bestc, L, lam);
+        total += jl_nudge_chunkcost(P, k, bestc, L, lam, kap, ord, nord);
         k += bestc;
         s = 2 * (s - bestc);
     }
@@ -560,14 +632,32 @@ static double jl_nudge_walk(const double *P, int sigma, double lam,
 }
 
 static double jl_nudge(const double *P, int sigma, double lam,
+                       const double *kap,
                        const int cls_n[JL_LMAX + 1],
                        uint16_t out_BL[JL_LMAX + 1])
 {
+    /* Within-level deal order under kappa: all b in 0..8 by ascending
+     * g(b) = lam*(kap[b] - b) (no validity condition — the nudger is
+     * a heuristic and the guard re-scores its output). */
+    int ord[9];
+    int n = 0;
+    for (int b = 0; b <= 8; b++) {
+        double gb = lam * (kap[b] - (double)b);
+        int i = n++;
+        while (i > 0) {
+            double gp = lam * (kap[ord[i - 1]] - (double)ord[i - 1]);
+            if (gp > gb || (gp == gb && ord[i - 1] < b)) {
+                ord[i] = ord[i - 1];
+                i--;
+            } else break;
+        }
+        ord[i] = b;
+    }
     /* Score with an inflated lambda: greedy under-commits to
      * flattening relative to the exact DP, and the caller's adoption
      * guard judges with the REAL lambda anyway, so biasing the search
      * toward flatter shapes raises adoption without risking quality. */
-    return jl_nudge_walk(P, sigma, lam * 1.5, cls_n, out_BL);
+    return jl_nudge_walk(P, sigma, lam * 1.5, kap, ord, n, cls_n, out_BL);
 }
 
 /* Core over an already freq-desc-sorted symbol list.  sf is caller
@@ -577,6 +667,7 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
                             uint8_t lengths[PIVCO_MAX_SYMBOLS])
 {
     const double lam = g_joint_lambda;
+    const double *kap = g_joint_kappa;
     if (lam <= 0.0) return -1;
     if (sigma < 2 || sigma > (1 << JL_LMAX)) return -1;
 
@@ -598,17 +689,23 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
         for (int L = 1; L <= JL_LMAX; L++) {
             if (!cls_n[L]) continue;
             prod_bits += cls_w[L] * L;
-            double dbar = 0;
+            double dbar = 0, kbar = 0;
             for (int b = 0; b <= JL_LMAX; b++)
-                if (cls_n[L] & (1 << b)) dbar += (double)b * (1 << b);
+                if (cls_n[L] & (1 << b)) {
+                    dbar += (double)b * (1 << b);
+                    kbar += (b <= 8 ? kap[b] : 0.0) * (double)(1 << b);
+                }
             dbar /= (double)cls_n[L];
-            prod_passes += cls_w[L] * ((double)L - dbar);
+            kbar /= (double)cls_n[L];
+            prod_passes += cls_w[L] * ((double)L - dbar + kbar);
         }
     }
 
-    /* Solve: slot-ledger DP (exact and fast) whenever the level-order
-     * == cost-order condition lam <= 1/7 holds — always true for the
-     * production lambda range; exact mass DP otherwise.
+    /* Solve: slot-ledger DP (exact and fast) whenever level-major
+     * processing is a global cost order — jl_slot_order's spread
+     * bound, which at kappa = 0 is the classic lam <= 1/7 and holds
+     * for the production lambda range under real kernel tables; exact
+     * mass DP otherwise (any lambda, any kappa).
      *
      * Granularity g > 1 groups the freq-sorted symbols by g and solves
      * the identical problem g levels shallower (a group of g = 2^G
@@ -622,7 +719,12 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
     int gran = g_joint_gran;
     if (gran == 0)   /* auto: keep the solve ~<= 10 us at every sigma */
         gran = sigma <= 64 ? 1 : sigma <= 128 ? 2 : 4;
-    if (gran > 1 && (sigma < 8 * gran || lam > (1.0 / 7.0) + 1e-9))
+    int obuf[8], on;
+    if (gran > 1 && (sigma < 8 * gran
+                     || !jl_slot_order(lam,
+                                       kap + (gran == 8 ? 3 : gran == 4 ? 2 : 1),
+                                       8 - (gran == 8 ? 3 : gran == 4 ? 2 : 1),
+                                       obuf, &on)))
         gran = 1;
     const int glog = gran == 8 ? 3 : gran == 4 ? 2 : gran == 2 ? 1 : 0;
     int sigma_pad = sigma;
@@ -640,50 +742,70 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
 
     uint16_t BL[JL_LMAX + 1] = {0};
     if (gran == -1) {
-        if (jl_nudge(P, sigma, lam, cls_n, BL) < 0) return -1;
+        if (jl_nudge(P, sigma, lam, kap, cls_n, BL) < 0) return -1;
     } else if (glog) {
         double Pg[PIVCO_MAX_SYMBOLS / 2 + 2];
         const int sp = sigma_pad / gran;
         for (int i = 0; i <= sp; i++) Pg[i] = P[i * gran];
         uint16_t BLc[JL_LMAX + 1] = {0};
-        if (jl_solve_slots(Pg, sp, lam, JL_LMAX - glog, 8 - glog, BLc) < 0)
+        /* kap + glog: local b' prices the real depth b' + glog */
+        if (jl_solve_slots(Pg, sp, lam, JL_LMAX - glog, 8 - glog,
+                           kap + glog, BLc) < 0)
             return -1;
         for (int L = 1; L <= JL_LMAX - glog; L++)
             BL[L + glog] = (uint16_t)(BLc[L] << glog);
-    } else if (lam <= (1.0 / 7.0) + 1e-9) {
-        if (jl_solve_slots(P, sigma, lam, JL_LMAX, 8, BL) < 0) return -1;
+    } else if (jl_solve_slots(P, sigma, lam, JL_LMAX, 8, kap, BL) >= 0) {
+        /* slot DP valid (jl_slot_order held) and solved */
     } else {
-        if (jl_solve_mass(P, sigma, lam, BL) < 0) return -1;
+        if (jl_solve_mass(P, sigma, lam, kap, BL) < 0) return -1;
     }
 
-    /* Model the DP result and apply the adoption guard.  Ghost chunks
+    /* Collect the chosen chunks and sort them by GLOBAL per-occurrence
+     * cost — under kappa (or lambda beyond the level-order bound) the
+     * old "L ascending, b descending" deal is no longer the cost
+     * order, and the sorted matching the solvers assume must be the
+     * assignment we actually realize.  Deterministic ties via
+     * jl_cmp_item. */
+    jl_item_t chunks[2 * JL_LMAX + 18];
+    int nchunks = 0;
+    for (int L = 1; L <= JL_LMAX; L++)
+        for (int b = 0; b <= 10; b++)
+            if (BL[L] & (1 << b)) {
+                chunks[nchunks].cost = (double)L
+                                     + lam * ((double)(L - b)
+                                              + (b <= 8 ? kap[b] : 0.0));
+                chunks[nchunks].L    = (uint8_t)L;
+                chunks[nchunks].b    = (uint8_t)b;
+                chunks[nchunks].size = (uint16_t)(1 << b);
+                nchunks++;
+            }
+    qsort(chunks, (size_t)nchunks, sizeof(jl_item_t), jl_cmp_item);
+
+    /* Model the result and apply the adoption guard.  Ghost chunks
      * carry zero weight, so the model scores real symbols exactly. */
     double dp_bits = 0, dp_passes = 0;
     {
         int cur = 0;
-        for (int L = 1; L <= JL_LMAX; L++)
-            for (int b = 10; b >= 0; b--)
-                if (BL[L] & (1 << b)) {
-                    double w = P[cur + (1 << b)] - P[cur];
-                    dp_bits   += w * L;
-                    dp_passes += w * (L - b);
-                    cur += 1 << b;
-                }
+        for (int i = 0; i < nchunks; i++) {
+            const int L = chunks[i].L, b = chunks[i].b;
+            double w = P[cur + chunks[i].size] - P[cur];
+            dp_bits   += w * L;
+            dp_passes += w * ((double)(L - b) + (b <= 8 ? kap[b] : 0.0));
+            cur += chunks[i].size;
+        }
         if (cur != sigma_pad) return -1;
     }
     if (!(dp_passes <= g_joint_guard_pass * prod_passes
           && dp_bits <= g_joint_guard_bits * prod_bits))
         return -1;
 
-    /* Deal freq-sorted symbols to chunks in cost order (L asc, b desc).
-     * Ghosts (sorted last) land in the final, deepest chunk. */
+    /* Deal freq-sorted symbols to the chunks in that same order.
+     * Ghosts (sorted last) land in the final, dearest chunk. */
     {
         int cur = 0;
-        for (int L = 1; L <= JL_LMAX; L++)
-            for (int b = 10; b >= 0; b--)
-                if (BL[L] & (1 << b))
-                    for (int j = 0; j < (1 << b); j++)
-                        lengths[sf[cur++].sym] = (uint8_t)L;
+        for (int i = 0; i < nchunks; i++)
+            for (int j = 0; j < chunks[i].size; j++)
+                lengths[sf[cur++].sym] = (uint8_t)chunks[i].L;
     }
     return 0;
 }

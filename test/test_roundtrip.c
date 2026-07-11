@@ -448,6 +448,34 @@ static int test_joint_lengths(void)
             }
 #endif
         }
+        /* Nonmonotone kernel-cost table: every solve path must stay
+         * wire-valid (Kraft-complete, decoder-rebuildable). */
+        {
+            static const double kap[9] = { 0.3, 0.1, 1.0, 0.9, 0.4,
+                                           1.3, 0.9, 1.3, 0.25 };
+            pivco_huffman_set_joint_kappa(kap);
+            static const int kgrans[] = { 1, 0, -1 };
+            for (size_t gi = 0; gi < sizeof(kgrans)/sizeof(*kgrans); gi++) {
+                pivco_huffman_set_joint_granularity(kgrans[gi]);
+                pivco_huffman_table_t table, dtable;
+                static uint8_t enc[PIVCO_MAX_ENCODED_SIZE], dec[PIVCO_BLOCK_SIZE];
+                size_t enc_len, consumed;
+                if (pivco_huffman_build_table(freq, &table) != PIVCO_OK
+                    || pivco_huffman_encode_scalar(symbols, PIVCO_BLOCK_SIZE, &table,
+                                                   enc, &enc_len) != PIVCO_OK
+                    || pivco_huffman_build_table_from_code_lens(table.code_len,
+                                                                &dtable) != PIVCO_OK
+                    || pivco_huffman_decode_scalar(enc, enc_len, &dtable,
+                                                   dec, &consumed) != PIVCO_OK
+                    || memcmp(symbols, dec, PIVCO_BLOCK_SIZE) != 0) {
+                    pivco_huffman_set_joint_lambda(0.0);
+                    pivco_huffman_set_joint_granularity(1);
+                    pivco_huffman_set_joint_kappa(NULL);
+                    FAIL("kappa gran=%d roundtrip dist=%d", kgrans[gi], d);
+                }
+            }
+            pivco_huffman_set_joint_kappa(NULL);
+        }
         pivco_huffman_set_joint_granularity(1);
     }
     pivco_huffman_set_joint_lambda(0.0);
