@@ -215,19 +215,18 @@ static int ref_sched_gen(ref_gen_t *g, unsigned depth)
     if (ref_sched_gen(g, depth + 1) != 0)
         return -1;
 
-    int left_leaf  = right_sched == left_sched && right_rank == left_rank + 1;
-    int right_leaf = g->sched_len == right_sched && g->rank == right_rank + 1;
-    /* A lone-leaf RIGHT child never occurs: chunk depths never decrease
-     * left-to-right under a node, so a lone leaf beside an internal
-     * sibling is always left -- and sibling lone leaves are impossible
-     * outright, since a lone leaf at depth d is length class d's b=0
-     * chunk and each class emits at most one (a same-length pair
-     * arrives as one b=1 chunk instead; two-symbol tables land in the
-     * chunk case above).  The production builder additionally maps
-     * both-lone to PAIR for its NAIVE research tree mode, whose
-     * all-singletons decomposition does produce sibling lone leaves. */
-    if (right_leaf)
-        return -1;
+    /* Only the LEFT child needs the lone-leaf test.  A lone right child
+     * would be a b=0 chunk still unconsumed after the left subtree; but
+     * the list is depth-sorted with equal-depth chunks singleton-first
+     * (the sort is STABLE -- keep it so -- classes generate in
+     * ascending L, and depth d's only possible singleton is length
+     * class d's b=0 chunk), so that singleton would have been consumed
+     * as the left child instead.  Corrupt lengths only corrupt the
+     * counts, and every count vector still obeys this.  (The production
+     * builder does classify lone-right and both-lone nodes: its NAIVE
+     * research tree mode decomposes every symbol into a singleton,
+     * making both reachable there.) */
+    int left_leaf = right_sched == left_sched && right_rank == left_rank + 1;
 
     pivco_sched_rec_t *rec = &g->dt->sched[node];
     rec->kd    = left_leaf ? (uint8_t)PIVCO_SCHED_LEAF_LEFT
