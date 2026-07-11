@@ -69,6 +69,22 @@ int pivco_huffman_get_joint_granularity(void)
     return g_joint_gran;
 }
 
+/* Adoption-guard thresholds: a solve result replaces the baseline
+ * lengths only if modeled passes <= pass_cap * baseline AND modeled
+ * bits <= bits_cap * baseline.  The exact DP already guarantees
+ * bits + lambda*passes <= baseline IN-MODEL (the baseline is a
+ * feasible point), so the guard is a firewall for model-vs-reality
+ * gaps (kappa = 0, merge types, FSE effects) plus a floor that skips
+ * not-worth-it wins.  (1e9, 1e9) disables it (experiments only). */
+static double g_joint_guard_bits = 1.015;
+static double g_joint_guard_pass = 0.90;
+
+void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap)
+{
+    g_joint_guard_bits = bits_cap > 0 ? bits_cap : 1.015;
+    g_joint_guard_pass = pass_cap > 0 ? pass_cap : 0.90;
+}
+
 typedef struct {
     double   cost;      /* per-occurrence: L + lambda * (L - b) */
     uint8_t  L, b;
@@ -658,7 +674,8 @@ int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
                 }
         if (cur != sigma_pad) return -1;
     }
-    if (!(dp_passes <= 0.90 * prod_passes && dp_bits <= 1.015 * prod_bits))
+    if (!(dp_passes <= g_joint_guard_pass * prod_passes
+          && dp_bits <= g_joint_guard_bits * prod_bits))
         return -1;
 
     /* Deal freq-sorted symbols to chunks in cost order (L asc, b desc).
