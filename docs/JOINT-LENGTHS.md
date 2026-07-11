@@ -503,3 +503,34 @@ So: the price is the right mechanism; the failure mode lives in the
 cost model on deep-tree shapes (geometric / narrow-bell), where the
 "win" ships as much-smaller-but-slower.  pivco_huffman_set_joint_guard
 exposes the thresholds (defaults 1.015 / 0.90).
+
+## Cross-baseline: the whole stack vs upstream/main (0a378fb)
+
+Same M4 PH e2e methodology, old main (pre fast-tables, pre joint)
+as 100%.  "off" = fast tables alone; rungs add the joint pass:
+
+| G     | rung  | enc-e2e   | dec-e2e    | ratio vs old |
+|-------|-------|-----------|------------|--------------|
+| 4 K   | off   | +19.8 %   | +39.6 %    |  0.000 pp    |
+|       | nudge | +9.5 %    | +95.4 %    | -0.258 pp    |
+|       | auto  | -31.2 %   | +133.2 %   | -0.266 pp    |
+|       | exact | -75.6 %   | +134.0 %   | -0.406 pp    |
+| 16 K  | off   | +6.9 %    | +26.8 %    |  0.000 pp    |
+|       | nudge | +4.8 %    | +57.5 %    | +0.090 pp    |
+|       | auto  | -19.5 %   | +82.9 %    | +0.214 pp    |
+| 64 K  | off   | +1.0 %    | +6.2 %     |  0.000 pp    |
+|       | nudge | +8.5 %    | +25.1 %    | +0.101 pp    |
+|       | auto  | -1.1 %    | +50.4 %    | +0.202 pp    |
+| 128 K | off   | +7.8 %    | +5.6 %     |  0.000 pp    |
+|       | nudge | +15.4 %   | +26.1 %    | +0.102 pp    |
+|       | auto  | +11.9 %   | +45.3 %    | +0.180 pp    |
+|       | exact | -23.3 %   | +47.2 %    | +0.099 pp    |
+
+(8 K and 32 K in results/m4-20260711-oldmain-baseline-ph.txt.)
+Nudge beats upstream on BOTH speed axes at every G — +5..+15 %
+encode and +25..+95 % decode within +-0.1 pp of ratio (better ratio
+at 4-8 K).  Auto doubles decode at small G (2.08 -> 4.85 GB/s at
+4 K) and is encode-positive at 128 K.  The fast-tables share of the
+win ("off") is largest exactly where the joint share is also
+largest — small windows — because both attack per-window fixed
+costs.

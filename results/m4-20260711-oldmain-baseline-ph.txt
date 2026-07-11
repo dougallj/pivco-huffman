@@ -1,0 +1,94 @@
+# Cross-baseline: solve ladder vs upstream/main @ 0a378fb (pre fast-tables, pre joint)
+# PH, M4 mini, reps=5, 20s cooldowns; old main measured with the same e2e methodology
+# (old-API bench from b837183, joint calls stripped); new-branch rows from the ladder capture.
+# Old-main per-G raw output follows; comparison table in docs/JOINT-LENGTHS.md.
+
+G=4K lambda=0.00 reps=5 fse=0 (PH)
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6924       115       817       434      1417      26.0         -
+mozilla.lits  0.00   0.9653       225      1747      1787      4592      15.9         -
+mr.lits       0.00   0.8207       398      1860      1989      5432       8.2         -
+nci.lits      0.00   0.5604       773      3477      3016      7254       3.9         -
+ooffice.lits  0.00   0.9451       352      1825      1536      5028       9.0         -
+osdb.lits     0.00   0.9293       379      1996      1582      5749       8.2         -
+reymont.lits  0.00   0.7354       771      3135      2984      7613       3.9         -
+samba.lits    0.00   0.9142       655      2264      2179      6759       4.4         -
+sao.lits      0.00   0.9935       593      2116      2324      6144       5.1         -
+webster.lits  0.00   0.7049       578      2299      1726      5395       4.7         -
+x-ray.lits    0.00   0.8833       457      1717      1932      4858       6.8         -
+xml.lits      0.00   0.7181       709      3245      3189      7707       4.4         -
+
+G=8K lambda=0.00 reps=5 fse=0 (PH)
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6711       258      1457       814      2301      21.7         -
+mozilla.lits  0.00   0.9519       366      3001      2263      5784      18.7         -
+mr.lits       0.00   0.8040       702      3380      3366      7837       9.2         -
+nci.lits      0.00   0.5395      1080      5464      3790      9562       5.4         -
+ooffice.lits  0.00   0.9283       656      3365      2454      6628       9.1         -
+osdb.lits     0.00   0.9077       753      3488      2680      7350       7.8         -
+reymont.lits  0.00   0.7140      1066      5181      3886      9817       5.5         -
+samba.lits    0.00   0.8984       983      4026      3389      7801       5.9         -
+sao.lits      0.00   0.9775      1042      3667      3541      7747       5.5         -
+webster.lits  0.00   0.6828       902      4203      2663      6804       6.0         -
+x-ray.lits    0.00   0.8625       722      3100      3082      6781       8.7         -
+xml.lits      0.00   0.6996       968      4999      3699      9248       6.1         -
+
+G=16K lambda=0.00 reps=5 fse=0 (PH)
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6609       506      2595      1662      3647      22.2         -
+mozilla.lits  0.00   0.9471       626      4734      2678      7279      20.0         -
+mr.lits       0.00   0.7986       989      5049      4292      8900      12.6         -
+nci.lits      0.00   0.5292      1359      7192      4921     10138       8.6         -
+ooffice.lits  0.00   0.9215      1139      4985      3458      7641       9.6         -
+osdb.lits     0.00   0.8969      1288      5120      3675      8871       8.2         -
+reymont.lits  0.00   0.7064      1402      7039      4783     10659       8.2         -
+samba.lits    0.00   0.8925      1398      5874      4523      9517       8.1         -
+sao.lits      0.00   0.9729      1433      5312      4243      8829       7.5         -
+webster.lits  0.00   0.6718      1266      6063      3535      8382       8.3         -
+x-ray.lits    0.00   0.8524       935      4844      4024      7758      13.4         -
+xml.lits      0.00   0.6973      1267      6606      4404     10276       8.7         -
+
+G=32K lambda=0.00 reps=5 fse=0 (PH)
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6581       507      2549      1197      3079      36.8         -
+mozilla.lits  0.00   0.9482       773      6008      2753      7408      30.5         -
+mr.lits       0.00   0.7993      1069      6483      4050      8608      22.1         -
+nci.lits      0.00   0.5260      1487      8331      4864     10138      15.1         -
+ooffice.lits  0.00   0.9219      1407      6227      3391      8063      13.5         -
+osdb.lits     0.00   0.8933      1554      6513      3688      8435      12.2         -
+reymont.lits  0.00   0.7030      1622      9099      5181     12034      13.2         -
+samba.lits    0.00   0.8936      1605      7775      4665     10435      13.3         -
+sao.lits      0.00   0.9747      1735      6611      4308      8449      11.2         -
+webster.lits  0.00   0.6687      1457      7248      3522      8169      13.1         -
+x-ray.lits    0.00   0.8491      1069      6232      4238      8067      22.9         -
+xml.lits      0.00   0.7058      1516      8407      4624     10276      13.7         -
+
+G=64K lambda=0.00 reps=5 fse=0 (PH)
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6572       658      3308      1669      3647      59.5         -
+mozilla.lits  0.00   0.9504       903      7101      2804      7322      49.1         -
+mr.lits       0.00   0.8010      1149      7361      4008      8120      39.1         -
+nci.lits      0.00   0.5248      1567      8951      4808      9899      27.8         -
+ooffice.lits  0.00   0.9249      1585      6971      3444      7953      22.1         -
+osdb.lits     0.00   0.8914      1728      7484      3832      8721      20.4         -
+reymont.lits  0.00   0.7041      1665     10082      5181     11658      25.3         -
+samba.lits    0.00   0.8976      1752      8589      4620     10039      22.8         -
+sao.lits      0.00   0.9782      1897      7481      4220      8504      18.9         -
+webster.lits  0.00   0.6671      1580      7989      3561      8334      22.6         -
+x-ray.lits    0.00   0.8477      1140      7130      4317      8027      42.3         -
+xml.lits      0.00   0.7148      1567      8407      4404      9735      25.3         -
+
+G=128K lambda=0.00 reps=5 fse=0 (PH)
+file           lam    ratio   enc-e2e   dec-e2e     enc-k     dec-k build u/w   adopted
+dickens.lits  0.00   0.6579       478      2789      1089      2577     139.3         -
+mozilla.lits  0.00   0.9520       819      7124      2533      6819     107.5         -
+mr.lits       0.00   0.8009      1116      7361      3787      7647      76.5         -
+nci.lits      0.00   0.5242      1479      8765      4360      9246      53.7         -
+ooffice.lits  0.00   0.9276      1569      6862      3301      7291      41.8         -
+osdb.lits     0.00   0.8902      1844      8299      3913      8758      36.9         -
+reymont.lits  0.00   0.7217      1829     10362      4845     10972      42.3         -
+samba.lits    0.00   0.9044      1826      8877      4447      9555      40.4         -
+sao.lits      0.00   0.9818      2021      8184      4266      8559      34.0         -
+webster.lits  0.00   0.6664      1671      8506      3588      8456      40.2         -
+x-ray.lits    0.00   0.8473      1179      7833      4261      8403      80.4         -
+xml.lits      0.00   0.7284      1831     10880      5138     11560      32.5         -
