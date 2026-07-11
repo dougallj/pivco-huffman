@@ -211,7 +211,7 @@ type", not "typical byte"; bytes-weighting would tilt toward the
 binary-ish members where joint wins biggest, so geomeans are mildly
 conservative here.
 
-## Realistic-workload results (Silesia zstd literals, tables per window)
+## Realistic-workload results (Silesia LZ4HC-9 literals, tables per window)
 
 M4, 12 .lits files, per-window table build + 16K-block encode/decode,
 ratio INCLUDES the 128-byte lengths header per window, lambda = 0.1:
