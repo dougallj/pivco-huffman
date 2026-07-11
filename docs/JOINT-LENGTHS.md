@@ -564,3 +564,17 @@ than on Silesia, because smaller windows mean raggeder baseline trees
 and bigger record savings.  Encode deltas are more negative than
 Silesia's at equal G (tiny files amortize the joint pass worse).
 Results: results/m4-20260711-calgary-ladder-ph.txt.
+
+## Raw (non-literal) corpora: no blowups
+
+Whole raw Silesia + Calgary files (not LZ literals — skewed,
+structured, includes pic ~ the geometric shape): ladder holds at
+reduced magnitude.  Geomeans: nudge +8..+18 % dec-e2e, auto
++27..+37 %, exact +36..+42 %, ratio -0.46..+0.25 pp.  Worst single
+file/config across everything: dec -2.8 % (obj1, auto 16K,
+noise-scale), ratio +0.56 pp (progc, auto 64K — inside the guard
+cap).  pic — the geometric-shaped fear — GAINS +4..+12 % under
+exact: the synthetic geometric pathology (smooth exponential decay,
+natural depth >> 11) does not arise in real windows, whose
+dominant-symbol + ragged-tail shape the model prices fine.
+Results: results/m4-20260711-raw-corpora-ladder-ph.txt.
