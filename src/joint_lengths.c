@@ -85,6 +85,25 @@ void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap)
     g_joint_guard_pass = pass_cap > 0 ? pass_cap : 0.90;
 }
 
+/* Merge-kind costs for the kind-aware time model (guard side), in
+ * units of a FULL merge pass (two internal children; mu_full == 1 by
+ * definition): mu_cst = merge with a lone-leaf child (the cheap cst
+ * kernels); prefill in [0,1] = fraction of the prefilled top-symbol
+ * leaf's weight its parent merge skips (the decoder memsets the most
+ * frequent symbol and half-partitions past it).  The D = 1 pair
+ * node's own kernel is priced by kappa[1] (it IS that kernel), and
+ * two same-depth lone-leaf chunks cannot coexist on this wire, so no
+ * separate pair-merge knob exists.  Defaults (1, 0) with kappa = 0
+ * reproduce the kind-blind pass model exactly. */
+static double g_joint_mu_cst = 1.0;
+static double g_joint_prefill = 0.0;
+
+void pivco_huffman_set_joint_merge_costs(double mu_cst, double prefill)
+{
+    g_joint_mu_cst  = (mu_cst  > 0 && mu_cst  < 100) ? mu_cst  : 1.0;
+    g_joint_prefill = (prefill >= 0 && prefill <= 1) ? prefill : 0.0;
+}
+
 /* Per-flat-depth kernel costs kappa[b], b = 0..8, in merge-pass units
  * (kappa_b = measured flat-kernel ns/sym at depth b divided by merge
  * ns/sym).  Default all-zero = the historical model.  Real tables are
@@ -114,6 +133,87 @@ static int jl_cmp_item(const void *a, const void *b)
     if (x->cost != y->cost) return x->cost < y->cost ? -1 : 1;
     if (x->L != y->L) return (int)x->L - (int)y->L;
     return (int)y->b - (int)x->b;       /* deterministic: larger b first */
+}
+
+/* ---- kind-aware decode-time model ----------------------------------
+ *
+ * The per-occurrence model (passes + kappa) prices every merge alike,
+ * but the decoder's merges differ by KIND: a merge with a lone-leaf
+ * child uses the cheap cst kernels (and skips the prefilled top
+ * symbol's side entirely), while a merge of two internal streams pays
+ * the full partition.  Tree arrangement is deterministic from the
+ * chunk multiset (wire: roots sorted by depth, canonical prefixes),
+ * so for <= ~40 chunks we simulate the skeleton exactly and price
+ * each node by kind.  Used by the adoption guard on BOTH sides of its
+ * comparison; the DP keeps its separable search cost (the guard is
+ * where mispricing must not survive). */
+typedef struct { uint8_t r, D; double W; } jl_ch_t;
+
+static int jl_cmp_ch(const void *a, const void *b)
+{
+    const jl_ch_t *x = a, *y = b;
+    if (x->r != y->r) return (int)x->r - (int)y->r;   /* root depth asc */
+    if (x->D != y->D) return (int)y->D - (int)x->D;   /* deeper flats first */
+    return x->W > y->W ? -1 : x->W < y->W ? 1 : 0;
+}
+
+/* Subtree at depth d spanning chunks ch[*i..): consumes them, returns
+ * the subtree's decode-time units and its weight; *kind reports what
+ * the parent sees (0 = lone leaf, 1 = internal).  pre marks the chunk
+ * index holding the prefilled top symbol (-1 = none). */
+static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
+                     const double *kap, double *Wout, int *kind)
+{
+    if (*i < n && ch[*i].r == d) {
+        const jl_ch_t *c = &ch[(*i)++];
+        *Wout = c->W;
+        if (c->D == 0) { *kind = 0; return 0.0; }
+        *kind = 1;
+        return c->W * kap[c->D <= 8 ? c->D : 8];   /* D=1 pair: kap[1] */
+    }
+    double Wl = 0, Wr = 0, tl, tr;
+    int kl, kr;
+    const int il = *i;
+    tl = jl_sim(ch, n, i, d + 1, pre, kap, &Wl, &kl);
+    tr = jl_sim(ch, n, i, d + 1, pre, kap, &Wr, &kr);
+    double W = Wl + Wr;
+    double t;
+    if (kl == 0 || kr == 0) {
+        t = W * g_joint_mu_cst;               /* one lone leaf: cst_vec */
+        /* prefilled leaf: its side is memset ahead; the merge only
+         * moves the internal side */
+        if (pre >= 0 && ((kl == 0 && il == pre) ||
+                         (kr == 0 && *i - 1 == pre)))
+            t -= (kl == 0 ? Wl : Wr) * g_joint_prefill * g_joint_mu_cst;
+    } else
+        t = W;                                /* full partition */
+    *Wout = W;
+    *kind = 1;
+    return t + tl + tr;
+}
+
+/* Kind-aware decode time for a chunk list (any order; sorted here).
+ * The prefill chunk is the D0 chunk with the greatest weight, if its
+ * weight is the maximum over all chunks' HEAVIEST symbol — we
+ * approximate "the most frequent symbol is a lone leaf" by "the
+ * heaviest D0 chunk outweighs (per symbol) every other chunk", which
+ * is exact under the deal's sorted order. */
+static double jl_time_kinds(jl_ch_t *ch, int n, const double *kap)
+{
+    qsort(ch, (size_t)n, sizeof(jl_ch_t), jl_cmp_ch);
+    /* prefill: the decoder prefills the most frequent SYMBOL; that
+     * symbol lives in the first-dealt (cheapest) chunk.  Discount
+     * applies only when it is a lone leaf (D0). */
+    int pre = -1;
+    double best = -1;
+    for (int i = 0; i < n; i++) {
+        double per = ch[i].W / (double)(1 << ch[i].D);
+        if (per > best) { best = per; pre = ch[i].D == 0 ? i : -1; }
+    }
+    int i = 0, kind;
+    double W;
+    double t = jl_sim(ch, n, &i, 0, pre, kap, &W, &kind);
+    return i == n ? t : -1.0;   /* -1: malformed multiset (cannot happen) */
 }
 
 typedef struct { uint64_t freq; uint8_t sym; } jl_sf_t;
@@ -675,9 +775,10 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
     P[0] = 0.0;
     for (int i = 0; i < sigma; i++) P[i + 1] = P[i] + (double)sf[i].freq;
 
-    /* Production model for the adoption guard: bits + exchangeable-model
-     * merge passes of the INCOMING lengths. */
-    double prod_bits = 0, prod_passes = 0;
+    /* Production model for the adoption guard: bits + kind-aware
+     * decode time of the INCOMING lengths (exchangeable per-class
+     * weights, exact canonical skeleton). */
+    double prod_bits = 0, prod_time = 0;
     int    cls_n[JL_LMAX + 1] = {0};
     {
         double cls_w[JL_LMAX + 1] = {0};
@@ -686,19 +787,22 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
             if (L < 1 || L > JL_LMAX) L = JL_LMAX;
             cls_n[L]++; cls_w[L] += (double)sf[i].freq;
         }
+        jl_ch_t pch[64];
+        int npc = 0;
         for (int L = 1; L <= JL_LMAX; L++) {
             if (!cls_n[L]) continue;
             prod_bits += cls_w[L] * L;
-            double dbar = 0, kbar = 0;
-            for (int b = 0; b <= JL_LMAX; b++)
+            const double wbar = cls_w[L] / (double)cls_n[L];
+            for (int b = 0; b <= 8; b++)
                 if (cls_n[L] & (1 << b)) {
-                    dbar += (double)b * (1 << b);
-                    kbar += (b <= 8 ? kap[b] : 0.0) * (double)(1 << b);
+                    pch[npc].r = (uint8_t)(L - b);
+                    pch[npc].D = (uint8_t)b;
+                    pch[npc].W = wbar * (double)(1 << b);
+                    npc++;
                 }
-            dbar /= (double)cls_n[L];
-            kbar /= (double)cls_n[L];
-            prod_passes += cls_w[L] * ((double)L - dbar + kbar);
         }
+        prod_time = jl_time_kinds(pch, npc, kap);
+        if (prod_time < 0) return -1;
     }
 
     /* Solve: slot-ledger DP (exact and fast) whenever level-major
@@ -783,19 +887,24 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
 
     /* Model the result and apply the adoption guard.  Ghost chunks
      * carry zero weight, so the model scores real symbols exactly. */
-    double dp_bits = 0, dp_passes = 0;
+    double dp_bits = 0, dp_time;
     {
+        jl_ch_t dch[64];
         int cur = 0;
         for (int i = 0; i < nchunks; i++) {
             const int L = chunks[i].L, b = chunks[i].b;
             double w = P[cur + chunks[i].size] - P[cur];
-            dp_bits   += w * L;
-            dp_passes += w * ((double)(L - b) + (b <= 8 ? kap[b] : 0.0));
+            dp_bits += w * L;
+            dch[i].r = (uint8_t)(L - b);
+            dch[i].D = (uint8_t)(b <= 8 ? b : 8);
+            dch[i].W = w;
             cur += chunks[i].size;
         }
         if (cur != sigma_pad) return -1;
+        dp_time = jl_time_kinds(dch, nchunks, kap);
+        if (dp_time < 0) return -1;
     }
-    if (!(dp_passes <= g_joint_guard_pass * prod_passes
+    if (!(dp_time <= g_joint_guard_pass * prod_time
           && dp_bits <= g_joint_guard_bits * prod_bits))
         return -1;
 

@@ -421,6 +421,14 @@ void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap);
  * NULL resets to zeros. */
 void pivco_huffman_set_joint_kappa(const double kappa[9]);
 
+/* Merge-kind costs for the guard's kind-aware time model, in units of
+ * a full (two-internal-children) merge pass: mu_cst = merge with a
+ * lone-leaf child (cheap cst kernels); prefill in [0,1] = fraction of
+ * the prefilled top symbol's weight its parent merge skips.  The D=1
+ * pair kernel is priced by kappa[1].  Defaults (1, 0) with kappa = 0
+ * reproduce the kind-blind pass model exactly. */
+void pivco_huffman_set_joint_merge_costs(double mu_cst, double prefill);
+
 /* ---------- Table construction ---------- */
 
 int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
