@@ -1,0 +1,21 @@
+fse-lambda-commit final validation (M4, PHA, lambda=0.1, per-arch
+profiles incl. fitted tau=4.1):
+
+Dist ladder key rows ('~' = same tree, lambda changed commits only):
+proba80      7.65 | +278.4%~  +276.2%~  +276.2%~   (commit suppression alone)
+bell_s10     8.72 | +30.6%~   +57.7%*   +31.5%~    a-1.47pp (new adoption)
+bell_s30     9.03 | +22.6%*   +45.5%*   +45.4%*    (was -10.5% at nudge)
+geometric   17.77 | vetoed, -1.3..-1.6% noise
+image_jpeg   9.00 | +867%*    +861%*    +869%*
+chinese      6.92 | +39.4%*   +69.2%*   +58.4%*
+
+Corpus candidate default (G=64K, PHA, --joint=0.1, exact, guard on):
+Silesia lits: dec-e2e +47.9% at +0.208pp   (old rule: +33.8% at +0.093pp)
+Calgary lits: dec-e2e +47.8% at -0.051pp   (old rule: +46.7% at -0.065pp)
+  -> out-of-tuning-corpus Goodhart check: no regression (Calgary's 64K
+     windows rarely commit FSE either way; the rule is a no-op there).
+
+The gate thresholds under fitted tau at lambda=0.1: bits saved must
+exceed 0.41/elem on M-class, 0.27 Graviton, 0.60 Zen4, 1.17 GNR (FSE
+effectively disabled under a decode price on GNR -- consistent with
+its measured tau).
