@@ -1,0 +1,38 @@
+Target-speed mode demo (bench_time_target): per window, min bits s.t.
+MODELED decode e2e time <= target; verify vs MEASURED per-window speed.
+G=64K, PH, exact solver, Silesia lits (506 windows), reps=4.
+mu = per-host ns-per-model-pass, median-calibrated on baseline windows.
+hit = measured speed >= target.  capped = model says even flattest tree
+misses (best-effort).  marg = measured/target (p5 / median).
+
+=== M1 Max, margin 0:
+windows 506  G=64K  PH  margin=0%  calibrated mu = 0.0608 ns/pass (p10 0.0567  p90 0.0778)
+target | base-hit  tgt-hit | adopted  capped |   dRatio |   p5 marg  med marg
+   6GB |   10.9%    42.9% |   77.9%    5.7% |  +0.041pp |    0.875x    0.972x
+   8GB |    7.3%    52.4% |   92.1%   25.3% |  +2.452pp |    0.777x    1.012x
+  10GB |    7.3%    73.7% |   92.7%    9.3% |  +6.286pp |    0.802x    4.778x
+  12GB |    7.3%    83.2% |   92.7%    8.9% |  +8.030pp |    0.807x    4.023x
+
+=== M1 Max, margin 15%:
+windows 506  G=64K  PH  margin=15%  calibrated mu = 0.0596 ns/pass (p10 0.0559  p90 0.0760)
+target | base-hit  tgt-hit | adopted  capped |   dRatio |   p5 marg  med marg
+   6GB |   12.8%    84.2% |   85.2%    7.9% |  +0.395pp |    0.937x    1.076x
+   8GB |    7.3%    86.0% |   92.7%    8.9% |  +5.386pp |    0.892x    5.824x
+  10GB |    7.3%    81.0% |   92.7%    8.5% |  +7.503pp |    0.820x    4.831x
+  12GB |    7.3%    83.2% |   92.7%    9.9% |  +8.532pp |    0.765x    4.056x
+
+=== M4, margin 0:
+windows 506  G=64K  PH  margin=0%  calibrated mu = 0.0384 ns/pass (p10 0.0363  p90 0.0509)
+target | base-hit  tgt-hit | adopted  capped |   dRatio |   p5 marg  med marg
+  10GB |    8.5%    35.2% |   80.0%   15.0% |  +0.122pp |    0.831x    0.971x
+  12GB |    7.3%    35.6% |   88.1%   18.4% |  +0.834pp |    0.763x    0.875x
+  14GB |    7.3%    73.3% |   92.7%    7.7% |  +5.285pp |    0.801x    5.651x
+  16GB |    7.3%    74.3% |   92.7%   11.1% |  +6.299pp |    0.789x    5.229x
+
+=== M4, margin 15%:
+windows 506  G=64K  PH  margin=15%  calibrated mu = 0.0376 ns/pass (p10 0.0355  p90 0.0504)
+target | base-hit  tgt-hit | adopted  capped |   dRatio |   p5 marg  med marg
+  10GB |    8.9%    63.8% |   86.6%    5.5% |  +0.596pp |    0.909x    1.024x
+  12GB |    7.5%    84.4% |   92.7%    7.7% |  +4.602pp |    0.938x    5.857x
+  14GB |    7.3%    86.8% |   92.7%    8.7% |  +6.285pp |    0.905x    6.040x
+  16GB |    7.3%    83.4% |   92.7%    8.7% |  +7.642pp |    0.811x    5.291x

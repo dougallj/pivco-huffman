@@ -412,6 +412,19 @@ int  pivco_huffman_get_joint_granularity(void);
  * plain Huffman lengths.  Pass big values to disable (experiments). */
 void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap);
 
+/* Target-speed mode: when > 0, the joint pass returns the smallest-bits
+ * tree whose MODELED decode time meets the target instead of the priced
+ * objective (lambda/guard are ignored).  Units: modeled pass-units per
+ * element; calibrate wall-clock ns-per-pass per host (see
+ * pivco_huffman_joint_model_time).  0 disables (default). */
+void   pivco_huffman_set_joint_time_target(double passes_per_elem);
+double pivco_huffman_get_joint_time_target(void);
+
+/* Modeled decode time of an arbitrary length assignment, in pass-units
+ * per element under the current model settings; -1 on invalid input. */
+double pivco_huffman_joint_model_time(const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                                      const uint8_t lengths[PIVCO_MAX_SYMBOLS]);
+
 /* Per-flat-depth kernel costs kappa[b], b = 0..8, in merge-pass units
  * (measured flat-kernel time per symbol at depth b, divided by merge
  * time per symbol).  Default all zeros = kernels modeled free, the

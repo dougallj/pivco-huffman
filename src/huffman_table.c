@@ -546,7 +546,8 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
      * the decoder rebuilds identically from the transmitted lengths).
      * No-op unless pivco_huffman_set_joint_lambda(>0) was called; on
      * any internal failure the Huffman lengths above are kept. */
-    if (pivco_huffman_get_joint_lambda() > 0.0)
+    if (pivco_huffman_get_joint_lambda() > 0.0
+        || pivco_huffman_get_joint_time_target() > 0.0)
         (void)pivco_joint_optimize_lengths_leaves(leaf, n_used, lengths);
 
     return build_table_finish(lengths, table);
@@ -1070,7 +1071,8 @@ int pivco_huffman_build_codec_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
      * the decoder rebuilds identically from the transmitted lengths).
      * No-op unless pivco_huffman_set_joint_lambda(>0) was called; on
      * any internal failure the Huffman lengths above are kept. */
-    if (pivco_huffman_get_joint_lambda() > 0.0)
+    if (pivco_huffman_get_joint_lambda() > 0.0
+        || pivco_huffman_get_joint_time_target() > 0.0)
         (void)pivco_joint_optimize_lengths_leaves(leaf, n_used, ct->code_len);
 
     int rc = build_core(ct->code_len, &ct->dec, NULL);

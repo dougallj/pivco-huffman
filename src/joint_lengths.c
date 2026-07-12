@@ -85,6 +85,28 @@ void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap)
     g_joint_guard_pass = pass_cap > 0 ? pass_cap : 0.90;
 }
 
+/* Target-speed mode: when set (> 0), the optimizer ignores lambda and
+ * the adoption guard, and instead returns the SMALLEST-BITS tree whose
+ * modeled decode time meets the target — the dual problem to the
+ * priced objective, solved by bisection on lambda over the same
+ * solvers (the frontier is the lower envelope of finitely many trees,
+ * so ~14 bisection steps land on the boundary breakpoint).  Units:
+ * modeled pass-units per element, the jl_time_kinds scale — convert a
+ * wall-clock target with a per-host ns-per-pass calibration.  When
+ * even the flattest tree (lambda = 8, ~fixed-width) misses the target,
+ * it is adopted best-effort iff still modeled faster than baseline. */
+static double g_joint_time_target = 0.0;
+
+void pivco_huffman_set_joint_time_target(double passes_per_elem)
+{
+    g_joint_time_target = passes_per_elem > 0.0 ? passes_per_elem : 0.0;
+}
+
+double pivco_huffman_get_joint_time_target(void)
+{
+    return g_joint_time_target;
+}
+
 /* Merge-kind costs for the kind-aware time model (guard side), in
  * units of a FULL merge pass (two internal children; mu_full == 1 by
  * definition): mu_cst = merge with a lone-leaf child (the cheap cst
@@ -839,66 +861,20 @@ static double jl_nudge(const double *P, int sigma, double lam,
     return jl_nudge_walk(P, sigma, lam * 1.5, kap, ord, n, cls_n, out_BL);
 }
 
-/* Core over an already freq-desc-sorted symbol list.  sf is caller
- * scratch sized PIVCO_MAX_SYMBOLS: ghost-padding may append to it. */
-static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
-                            const uint64_t freq[PIVCO_MAX_SYMBOLS],
-                            uint8_t lengths[PIVCO_MAX_SYMBOLS])
+/* Solve at `lam` and model the result: fills the global-cost-sorted
+ * chunk list plus the modeled bits/time of the dealt assignment.
+ * Extracted from jl_optimize_core so target-speed mode can bisect on
+ * lambda over it.  sf/P are ghost-extended idempotently (the same
+ * ghosts are picked on every call for a given sigma). */
+static int jl_solve_model(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
+                          const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                          double P[PIVCO_MAX_SYMBOLS + 1],
+                          const int cls_n[JL_LMAX + 1],
+                          double lam, const double *kap,
+                          jl_item_t chunks[], int *out_nchunks,
+                          int *out_sigma_pad,
+                          double *out_bits, double *out_time)
 {
-    const double lam = g_joint_lambda;
-    const double *kap = g_joint_kappa;
-    if (lam <= 0.0) return -1;
-    if (sigma < 2 || sigma > (1 << JL_LMAX)) return -1;
-
-    double P[PIVCO_MAX_SYMBOLS + 1];
-    P[0] = 0.0;
-    for (int i = 0; i < sigma; i++) P[i + 1] = P[i] + (double)sf[i].freq;
-
-    /* Production model for the adoption guard: bits + kind-aware
-     * decode time of the INCOMING lengths (exchangeable per-class
-     * weights, exact canonical skeleton). */
-    double prod_bits = 0, prod_time = 0;
-    int    cls_n[JL_LMAX + 1] = {0};
-    {
-        double cls_w[JL_LMAX + 1] = {0};
-        for (int i = 0; i < sigma; i++) {
-            int L = lengths[sf[i].sym];
-            if (L < 1 || L > JL_LMAX) L = JL_LMAX;
-            cls_n[L]++; cls_w[L] += (double)sf[i].freq;
-        }
-        jl_ch_t pch[64];
-        int npc = 0;
-        for (int L = 1; L <= JL_LMAX; L++) {
-            if (!cls_n[L]) continue;
-            prod_bits += cls_w[L] * L;
-            const double wbar = cls_w[L] / (double)cls_n[L];
-            for (int b = 0; b <= 8; b++)
-                if (cls_n[L] & (1 << b)) {
-                    pch[npc].r = (uint8_t)(L - b);
-                    pch[npc].D = (uint8_t)b;
-                    pch[npc].W = wbar * (double)(1 << b);
-                    npc++;
-                }
-        }
-        prod_time = jl_time_kinds(pch, npc, kap, P[sigma]);
-        if (prod_time < 0) return -1;
-    }
-
-    /* Solve: slot-ledger DP (exact and fast) whenever level-major
-     * processing is a global cost order — jl_slot_order's spread
-     * bound, which at kappa = 0 is the classic lam <= 1/7 and holds
-     * for the production lambda range under real kernel tables; exact
-     * mass DP otherwise (any lambda, any kappa).
-     *
-     * Granularity g > 1 groups the freq-sorted symbols by g and solves
-     * the identical problem g levels shallower (a group of g = 2^G
-     * symbols at real level L is a depth-G flat), 4^G fewer states.
-     * On lits-style data the near-optimal solutions are dense: g = 2
-     * loses ~0.13 % of J on average, g = 4 ~0.25 % (measured), and the
-     * adoption guard below still rejects any bad case per window.
-     * sigma is ghost-padded to a multiple of g with zero-frequency
-     * unused byte values — real leaves the encoder never emits; there
-     * are always enough since sigma % g != 0 implies sigma < 256. */
     /* per-take fixed-cost constants: lambda * gamma * blocks, one
      * record for D0 takes, two for deeper chunks */
     double blocks = ceil(P[sigma] / (double)PIVCO_BLOCK_SIZE);
@@ -958,7 +934,6 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
      * order, and the sorted matching the solvers assume must be the
      * assignment we actually realize.  Deterministic ties via
      * jl_cmp_item. */
-    jl_item_t chunks[2 * JL_LMAX + 18];
     int nchunks = 0;
     for (int L = 1; L <= JL_LMAX; L++)
         for (int b = 0; b <= 10; b++)
@@ -973,8 +948,8 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
             }
     qsort(chunks, (size_t)nchunks, sizeof(jl_item_t), jl_cmp_item);
 
-    /* Model the result and apply the adoption guard.  Ghost chunks
-     * carry zero weight, so the model scores real symbols exactly. */
+    /* Model the result.  Ghost chunks carry zero weight, so the model
+     * scores real symbols exactly. */
     double dp_bits = 0, dp_time;
     {
         jl_ch_t dch[64];
@@ -992,9 +967,110 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
         dp_time = jl_time_kinds(dch, nchunks, kap, P[sigma]);
         if (dp_time < 0) return -1;
     }
-    if (!(dp_time <= g_joint_guard_pass * prod_time
-          && dp_bits <= g_joint_guard_bits * prod_bits))
-        return -1;
+    *out_nchunks   = nchunks;
+    *out_sigma_pad = sigma_pad;
+    *out_bits      = dp_bits;
+    *out_time      = dp_time;
+    return 0;
+}
+
+/* Core over an already freq-desc-sorted symbol list.  sf is caller
+ * scratch sized PIVCO_MAX_SYMBOLS: ghost-padding may append to it. */
+static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
+                            const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                            uint8_t lengths[PIVCO_MAX_SYMBOLS])
+{
+    const double lam = g_joint_lambda;
+    const double *kap = g_joint_kappa;
+    if (lam <= 0.0 && g_joint_time_target <= 0.0) return -1;
+    if (sigma < 2 || sigma > (1 << JL_LMAX)) return -1;
+
+    double P[PIVCO_MAX_SYMBOLS + 1];
+    P[0] = 0.0;
+    for (int i = 0; i < sigma; i++) P[i + 1] = P[i] + (double)sf[i].freq;
+
+    /* Production model for the adoption guard: bits + kind-aware
+     * decode time of the INCOMING lengths (exchangeable per-class
+     * weights, exact canonical skeleton). */
+    double prod_bits = 0, prod_time = 0;
+    int    cls_n[JL_LMAX + 1] = {0};
+    {
+        double cls_w[JL_LMAX + 1] = {0};
+        for (int i = 0; i < sigma; i++) {
+            int L = lengths[sf[i].sym];
+            if (L < 1 || L > JL_LMAX) L = JL_LMAX;
+            cls_n[L]++; cls_w[L] += (double)sf[i].freq;
+        }
+        jl_ch_t pch[64];
+        int npc = 0;
+        for (int L = 1; L <= JL_LMAX; L++) {
+            if (!cls_n[L]) continue;
+            prod_bits += cls_w[L] * L;
+            const double wbar = cls_w[L] / (double)cls_n[L];
+            for (int b = 0; b <= 8; b++)
+                if (cls_n[L] & (1 << b)) {
+                    pch[npc].r = (uint8_t)(L - b);
+                    pch[npc].D = (uint8_t)b;
+                    pch[npc].W = wbar * (double)(1 << b);
+                    npc++;
+                }
+        }
+        prod_time = jl_time_kinds(pch, npc, kap, P[sigma]);
+        if (prod_time < 0) return -1;
+    }
+
+    /* Solver strategy (see jl_solve_model): slot-ledger DP whenever
+     * level-major processing is a global cost order (jl_slot_order's
+     * spread bound; the classic lam <= 1/7 at kappa = 0), exact mass
+     * DP otherwise; granularity g > 1 solves the identical problem g
+     * levels shallower on ghost-padded groups. */
+    jl_item_t chunks[2 * JL_LMAX + 18];
+    int nchunks = 0, sigma_pad = 0;
+    double dp_bits = 0, dp_time = 0;
+
+    if (g_joint_time_target > 0.0) {
+        /* ---- target-speed mode: min bits s.t. modeled time <= T ----
+         * Bisect lambda toward the smallest feasible point (bits rise
+         * with lambda, modeled time falls, both stepwise); re-solve
+         * the winner so chunks/padding match the dealt tree exactly. */
+        const double tgt = g_joint_time_target * P[sigma];
+        if (prod_time <= tgt) return -1;    /* baseline already meets it */
+        double best_lam = 8.0;
+        if (jl_solve_model(sf, sigma, freq, P, cls_n, 8.0, kap, chunks,
+                           &nchunks, &sigma_pad, &dp_bits, &dp_time) != 0)
+            return -1;
+        if (dp_time > tgt) {
+            /* even the flattest tree misses the target: best effort,
+             * adopt only if still modeled faster than baseline */
+            if (!(dp_time < prod_time)) return -1;
+        } else {
+            double lo = 0.0, hi = 8.0, best_bits = dp_bits;
+            for (int it = 0; it < 14; it++) {
+                const double mid = 0.5 * (lo + hi);
+                if (jl_solve_model(sf, sigma, freq, P, cls_n, mid, kap,
+                                   chunks, &nchunks, &sigma_pad,
+                                   &dp_bits, &dp_time) == 0
+                    && dp_time <= tgt) {
+                    if (dp_bits <= best_bits) { best_bits = dp_bits; best_lam = mid; }
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            if (jl_solve_model(sf, sigma, freq, P, cls_n, best_lam, kap,
+                               chunks, &nchunks, &sigma_pad,
+                               &dp_bits, &dp_time) != 0 || dp_time > tgt)
+                return -1;                  /* unreachable: winner re-solve */
+        }
+    } else {
+        if (jl_solve_model(sf, sigma, freq, P, cls_n, lam, kap, chunks,
+                           &nchunks, &sigma_pad, &dp_bits, &dp_time) != 0)
+            return -1;
+        /* adoption guard */
+        if (!(dp_time <= g_joint_guard_pass * prod_time
+              && dp_bits <= g_joint_guard_bits * prod_bits))
+            return -1;
+    }
 
     /* Deal freq-sorted symbols to the chunks in that same order.
      * Ghosts (sorted last) land in the final, dearest chunk. */
@@ -1007,10 +1083,46 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
     return 0;
 }
 
+/* Model an arbitrary valid length assignment for freq under the
+ * current kappa/gamma/merge-cost/FSE-tax settings: returns modeled
+ * decode time in pass-units per element (the same scale the guard and
+ * target mode use), or -1 on invalid lengths.  Exposed so harnesses
+ * can calibrate ns-per-pass on a host and audit target-mode
+ * decisions. */
+double pivco_huffman_joint_model_time(const uint64_t freq[PIVCO_MAX_SYMBOLS],
+                                      const uint8_t lengths[PIVCO_MAX_SYMBOLS])
+{
+    double cls_w[JL_LMAX + 1] = {0};
+    int cls_n[JL_LMAX + 1] = {0};
+    double W = 0;
+    for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++) {
+        if (!freq[s]) continue;
+        const int L = lengths[s];
+        if (L < 1 || L > JL_LMAX) return -1.0;
+        cls_n[L]++; cls_w[L] += (double)freq[s]; W += (double)freq[s];
+    }
+    if (W <= 0) return -1.0;
+    jl_ch_t ch[64];
+    int n = 0;
+    for (int L = 1; L <= JL_LMAX; L++) {
+        if (!cls_n[L]) continue;
+        const double wbar = cls_w[L] / (double)cls_n[L];
+        for (int b = 0; b <= 8; b++)
+            if (cls_n[L] & (1 << b)) {
+                ch[n].r = (uint8_t)(L - b);
+                ch[n].D = (uint8_t)b;
+                ch[n].W = wbar * (double)(1 << b);
+                n++;
+            }
+    }
+    const double t = jl_time_kinds(ch, n, g_joint_kappa, W);
+    return t < 0 ? -1.0 : t / W;
+}
+
 int pivco_joint_optimize_lengths(const uint64_t freq[PIVCO_MAX_SYMBOLS],
                                  uint8_t lengths[PIVCO_MAX_SYMBOLS])
 {
-    if (g_joint_lambda <= 0.0) return -1;
+    if (g_joint_lambda <= 0.0 && g_joint_time_target <= 0.0) return -1;
     jl_sf_t sf[PIVCO_MAX_SYMBOLS];
     int sigma = 0;
     for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++)
@@ -1030,7 +1142,7 @@ int pivco_joint_optimize_lengths_leaves(const pivco_huffman_leaf_t *leaf_asc,
                                         int n_used,
                                         uint8_t lengths[PIVCO_MAX_SYMBOLS])
 {
-    if (g_joint_lambda <= 0.0) return -1;
+    if (g_joint_lambda <= 0.0 && g_joint_time_target <= 0.0) return -1;
     if (n_used < 2 || n_used > PIVCO_MAX_SYMBOLS) return -1;
     jl_sf_t sf[PIVCO_MAX_SYMBOLS];
     uint64_t freq[PIVCO_MAX_SYMBOLS] = {0};
