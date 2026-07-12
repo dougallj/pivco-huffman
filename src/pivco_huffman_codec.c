@@ -324,6 +324,25 @@ static inline void codec_maybe_fse_attempt(uint8_t *marker_slot,
         g_pivco_fse_commit[0]++;
         return;
     }
+    /* Lambda-aware decode-tax gate: an FSE'd bitmap decodes ~tau
+     * full-merge passes per element slower, so when a decode-speed
+     * price lambda is in effect the commit must also SAVE at least
+     * lambda * tau bits per element to be J-positive.  Inert at
+     * lambda = 0 (and under PH), so all pre-joint behavior is
+     * unchanged.  The guard's commit predictor (jl_sim) mirrors this
+     * exact rule. */
+    {
+        const double lam = pivco_huffman_get_joint_lambda();
+        if (lam > 0.0) {
+            const double saved_bits =
+                ((double)nbytes - (double)(fse_len + 2)) * 8.0;
+            if (saved_bits < lam * pivco_huffman_get_joint_fse_tau()
+                                 * (double)n) {
+                g_pivco_fse_commit[0]++;
+                return;
+            }
+        }
+    }
 
     /* Commit: rewrite marker + bitmap region with [fse_len][payload],
      * adjust the wire cursor to one past the payload. */

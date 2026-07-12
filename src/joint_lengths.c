@@ -176,6 +176,11 @@ void pivco_huffman_set_joint_fse_tax(double tau, double eta, double wmin)
     g_joint_costs_ready = 1; g_joint_cost_profile = "caller";
 }
 
+double pivco_huffman_get_joint_fse_tau(void)
+{
+    return g_joint_fse_tau;
+}
+
 /* ---------- Per-arch cost-profile defaults ----------
  *
  * Fitted by extras/bench/bench_fit_costs.c (controlled trees, fresh
@@ -369,7 +374,14 @@ static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
             double q = Wl / W;
             if (q > 0 && q < 1) {
                 const double h2 = -(q * log2(q) + (1 - q) * log2(1 - q));
-                if (1.0 - h2 > (1.0 - g_joint_fse_eta) + 16.0 / Wb)
+                /* mirror the coder's commit rule: bytes-shrink AND (at
+                 * lambda > 0) the lambda-aware decode-tax gate — the
+                 * coder only commits when the bits saved beat
+                 * lambda * tau per element */
+                const double lamtau = g_joint_lambda * g_joint_fse_tau;
+                const double floor_eff = (1.0 - g_joint_fse_eta) > lamtau
+                                       ? (1.0 - g_joint_fse_eta) : lamtau;
+                if (1.0 - h2 > floor_eff + 16.0 / Wb)
                     t += g_joint_fse_tau * W;
             }
         }

@@ -80,7 +80,7 @@ int main(int argc, char **argv)
         uint64_t freq[256] = {0};
         for (int i = 0; i < N; i++) freq[sym[i]]++;
 
-        size_t elen[4]; int adopted[4]; double ratio[4];
+        size_t elen[4]; int adopted[4], sdiff[4] = {0}; double ratio[4];
         for (int m = 0; m < 4; m++) {
             pivco_huffman_set_joint_lambda(modes[m].lam);
             pivco_huffman_set_joint_granularity(modes[m].gran);
@@ -93,13 +93,14 @@ int main(int argc, char **argv)
                 off += el;
             }
             elen[m] = off; ratio[m] = (double)off / N;
-            if (m > 0 && !adopted[m]) {
-                ident_cells++;
-                if (elen[m] != elen[0] || memcmp(enc[m], enc[0], elen[0]) != 0) {
-                    printf("!! %s %s: lengths equal but STREAM DIFFERS\n",
-                           bench_dist_name(d), modes[m].name);
-                    ident_bad++;
-                }
+            if (m > 0) {
+                /* Under the lambda-aware FSE commit rule the stream can
+                 * differ even at identical lengths (lambda governs the
+                 * coder's commits); such cells time their own stream and
+                 * are marked '~'. */
+                sdiff[m] = elen[m] != elen[0]
+                        || memcmp(enc[m], enc[0], elen[0]) != 0;
+                if (!adopted[m]) { if (sdiff[m]) ident_bad++; else ident_cells++; }
             }
         }
 
@@ -125,7 +126,7 @@ int main(int argc, char **argv)
                  * the SAME objects as off.  Timing a separate copy only
                  * measures allocator placement (null-ladder-measured at
                  * up to +-1.7% between identical configs). */
-                int e = adopted[m] ? m : 0;
+                int e = (adopted[m] || sdiff[m]) ? m : 0;
                 /* untimed pass: refill caches with THIS mode's stream
                  * (the previous mode's distinct stream otherwise taxes
                  * the first timed pass ~1% -- always landing on "off",
@@ -156,15 +157,16 @@ int main(int argc, char **argv)
         printf("%-14s %9.2f |", bench_dist_name(d), best[0]);
         for (int m = 1; m < 4; m++)
             printf(" %6.2f (%+5.1f%%)%c", best[m], 100 * (best[m] / best[0] - 1),
-                   adopted[m] ? '*' : ' ');
+                   adopted[m] ? '*' : sdiff[m] ? '~' : ' ');
         printf("  ");
         for (int m = 1; m < 4; m++)
             if (adopted[m]) printf(" %s%+.2f", m == 1 ? "n" : m == 2 ? "a" : "e",
                                    100 * (ratio[m] - ratio[0]));
         printf("\n");
     }
-    printf("unadopted cells: %ld, streams byte-identical: %ld%s\n",
-           ident_cells, ident_cells - ident_bad, ident_bad ? "  << MISMATCHES ABOVE" : "");
+    printf("identical-stream null cells: %ld (of %ld unadopted)\n",
+           ident_cells, ident_bad + ident_cells);
+    (void)ident_bad;
     pivco_huffman_set_joint_lambda(0.0);
     pivco_huffman_set_joint_granularity(1);
     return 0;

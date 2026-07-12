@@ -458,6 +458,7 @@ void pivco_huffman_set_joint_merge_costs(double mu_cst, double prefill);
  * bitmaps, the coder commits on them, and the decode tax swamps the
  * pass savings. */
 void pivco_huffman_set_joint_fse_tax(double tau, double eta, double wmin);
+double pivco_huffman_get_joint_fse_tau(void);
 
 /* Per-schedule-record fixed decode cost, in full-merge element-pass
  * units (parse + dispatch + kernel setup, paid per record per block).
