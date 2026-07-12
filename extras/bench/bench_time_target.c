@@ -104,6 +104,14 @@ int main(int argc, char **argv)
         if (!strncmp(argv[argi], "--G=", 4)) G = (size_t)atoi(argv[argi] + 4) * 1024;
         else if (!strncmp(argv[argi], "--margin=", 9)) margin = atof(argv[argi] + 9);
         else if (!strncmp(argv[argi], "--reps=", 7)) reps = atoi(argv[argi] + 7);
+        else if (!strcmp(argv[argi], "--kappa=1")) {
+            /* M1-fitted per-depth flat-kernel costs (docs/KAPPA-COSTS.md
+             * gamma addendum), in merge-pass units */
+            static const double kap[9] = { 0, 0.83, 0.61, 0.71, 0.59,
+                                           0.83, 1.05, 1.88, 0.49 };
+            pivco_huffman_set_joint_kappa(kap);
+            printf("kappa: M1-fitted table enabled\n");
+        }
         else if (!strncmp(argv[argi], "--targets=", 10))
             for (const char *p = argv[argi] + 10; *p && ntgt < 16; ) {
                 targets[ntgt++] = strtod(p, NULL);

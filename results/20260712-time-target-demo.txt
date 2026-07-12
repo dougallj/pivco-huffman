@@ -36,3 +36,17 @@ target | base-hit  tgt-hit | adopted  capped |   dRatio |   p5 marg  med marg
   12GB |    7.5%    84.4% |   92.7%    7.7% |  +4.602pp |    0.938x    5.857x
   14GB |    7.3%    86.8% |   92.7%    8.7% |  +6.285pp |    0.905x    6.040x
   16GB |    7.3%    83.4% |   92.7%    8.7% |  +7.642pp |    0.811x    5.291x
+
+=== M1 Max, margin 0, M1-fitted kappa table (set_joint_kappa):
+windows 506  G=64K  PH  margin=0%  calibrated mu = 0.0472 ns/pass (p10 0.0455  p90 0.0483)
+target | base-hit  tgt-hit | adopted  capped |   dRatio |   p5 marg  med marg
+   6GB |   12.8%    94.1% |   88.3%    5.3% |  +1.030pp |    0.996x    1.113x
+   8GB |    7.3%    98.8% |   92.7%    1.8% |  +6.598pp |    1.044x    6.214x
+  10GB |    7.3%    92.1% |   92.7%   11.5% |  +7.918pp |    0.983x    4.940x
+  12GB |    7.3%    82.8% |   92.7%   16.8% |  +8.225pp |    0.820x    4.158x
+
+Verdict: measured kappa collapses the calibration spread p10-p90 from
++-30% to +-3% and lifts margin-0 in-band hit rates 43->94% / 52->99%
+-- the model is contract-grade on the fitting host once the flat
+kernels stop being priced free.  The kappa-defaults open item now has
+an acceptance metric (margin-0 target-hit rate).
