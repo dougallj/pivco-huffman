@@ -22,10 +22,22 @@ static double now_sec(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     bench_init();
-    pivco_huffman_set_fse_enabled(1);
+    int fse = 1;
+    for (int a = 1; a < argc; a++) {
+        if (!strncmp(argv[a], "--fse=", 6)) fse = atoi(argv[a] + 6);
+        else if (!strncmp(argv[a], "--guard=", 8)) {
+            double b = strtod(argv[a] + 8, NULL), pc = 0;
+            const char *c = strchr(argv[a] + 8, ',');
+            if (c) pc = strtod(c + 1, NULL);
+            pivco_huffman_set_joint_guard(b, pc);
+            printf("guard: bits %.3f pass %.2f\n", b, pc);
+        }
+    }
+    pivco_huffman_set_fse_enabled(fse);
+    printf("mode: %s\n", fse ? "PHA" : "PH");
     struct { const char *name; double lam; int gran; } modes[] = {
         { "off", 0.0, 1 }, { "nudge", 0.1, -1 }, { "auto", 0.1, 0 }, { "exact", 0.1, 1 },
     };
