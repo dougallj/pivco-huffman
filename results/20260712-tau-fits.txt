@@ -1,0 +1,26 @@
+Per-arch FSE decode-tax (tau) fits — bench_fit_costs tau section:
+skewed two-symbol trees (single root bitmap, commits under the plain
+bytes-shrink rule at lambda=0), decoded PH vs PHA with fresh blocks;
+tau = (ns_PHA - ns_PH) / mu_full = extra merge passes per element of
+committed coverage.  tau is TABLE-DEPENDENT (two bands by selected FSE
+table: moderate-skew p<=0.90 vs high-skew p>=0.95); profiles ship the
+mean.
+
+host        tau mean   band (p<=.90 / p>=.95)
+apple-m1    3.61       1.86 / 5.35
+apple-m4    4.13       1.99 / 6.28      <- the old M-class 4.0 estimate
+graviton4   2.65       1.41 / 3.88
+intel-gnr   11.73      6.64 / 16.85     <- FSE decode brutal vs fast merges
+amd-zen4    5.95       3.69 / 8.24
+
+Consequence for the lambda-aware commit gate (branch fse-lambda-commit)
+at lambda = 0.1: commits need > lambda*tau bits/elem saved -- ~0.41 on
+M-class (selective), ~0.27 Graviton, ~0.60 Zen4, ~1.17 GNR (i.e. FSE
+effectively off under a decode price on GNR, which the measurements
+say is correct).
+
+Second kernel-fit run per host also reconfirms kappa STABILITY
+(entries within +-0.15 of the shipped tables on every host) while
+gamma/prefill remain weakly identified (gamma rerun deltas: M1
+163->101, GNR 2412->2951, c8g 118->238) -- the KAPPA-COSTS 4.4
+experiment-design question is still the right next step for gamma.

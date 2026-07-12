@@ -245,3 +245,15 @@ depth guard (reachable via the public model on non-tiling freq/length
 combinations) fell out of the tool work.  Still open: per-arch tau
 (FSE tax, PHA), the GNR coarse-rung json_api regression, robust-box
 adoption (§4.3) for cross-device encoding.
+
+## tau fitted per arch (2026-07-12, autonomous follow-up)
+
+bench_fit_costs gained a tau section (PH-vs-PHA on committed root
+bitmaps at lambda = 0): apple-m1 3.6, apple-m4 4.1 (the old M-class
+4.0, vindicated), graviton4 2.7, amd-zen4 6.0, intel-gnr 11.7 — and
+tau is table-dependent (a ~2x band between the moderate- and
+high-skew FSE tables; means shipped in the arch profiles, which now
+autoload tau alongside kappa/gamma).  Caveat recorded: gamma/prefill
+are the weakly-identified fit parameters (rerun deltas up to ~2x)
+while kappa reproduces within +-0.15 everywhere; gamma wants the §4.4
+one-contraction experiment design.

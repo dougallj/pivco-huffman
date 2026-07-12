@@ -18,8 +18,11 @@
  * Output: per-design measured vs fitted ns/sym, the constants, and a
  * ready-to-paste jl_arch_costs_t initializer.
  *
- * PH (fse off): kernel constants only; the FSE tax tau is fitted
- * separately (PH-vs-PHA on committed-bitmap distributions).
+ * After the kernel fit, a tau section measures the FSE decode tax:
+ * skewed two-symbol trees whose single root bitmap commits under the
+ * bytes-shrink rule (lambda stays 0 here so the lambda-aware gate
+ * cannot suppress) are decoded PH vs PHA; tau = extra merge passes
+ * per element of committed coverage = (ns_PHA - ns_PH) / mu_full.
  *
  * cc -O2 -Iinclude extras/bench/bench_fit_costs.c \
  *    build/libpivco_huffman.a -o bfc -lm && ./bfc
@@ -87,16 +90,17 @@ static void extract_features(const uint64_t freq[256],
     pivco_huffman_set_joint_gamma(0.0);
 }
 
-/* one design: nsym symbols; lens[i]; prob[i] (sums ~1) */
-static void run(const char *name, int nsym, const uint8_t *lens,
-                const double *prob)
+/* one design: nsym symbols; lens[i]; prob[i] (sums ~1).  Returns the
+ * measured ns/sym (also recorded for the LSQ unless record == 0). */
+static double run2(const char *name, int nsym, const uint8_t *lens,
+                   const double *prob, int record)
 {
     uint8_t code_lens[256] = {0};
     uint64_t freq[256] = {0};
     for (int i = 0; i < nsym; i++) code_lens[i] = lens[i];
     static pivco_huffman_codec_table_t ct;
     if (pivco_huffman_build_codec_table_from_code_lens(code_lens, &ct) != PIVCO_OK) {
-        printf("%-6s BUILD FAIL\n", name); return;
+        printf("%-6s BUILD FAIL\n", name); return -1;
     }
     /* NBLK blocks of exact per-block counts, each freshly shuffled */
     static uint8_t sym[NBLK][N];
@@ -116,6 +120,7 @@ static void run(const char *name, int nsym, const uint8_t *lens,
             uint8_t t = sym[b][i]; sym[b][i] = sym[b][j]; sym[b][j] = t;
         }
     }
+    if (!record) for (int i = 0; i < 256; i++) freq[i] = 0;  /* unused */
     static uint8_t enc[NBLK][N * 2 + 64];
     static size_t  el[NBLK];
     for (int b = 0; b < NBLK; b++)
@@ -135,8 +140,9 @@ static void run(const char *name, int nsym, const uint8_t *lens,
     }
     for (int b = 0; b < NBLK; b++)
         if (memcmp(dec + (size_t)b * N, sym[b], N) != 0) {
-            printf("%-6s VERIFY FAIL\n", name); return;
+            printf("%-6s VERIFY FAIL\n", name); return -1;
         }
+    if (!record) return best;
 
     dsg_t *d = &g_dsg[g_ndsg++];
     snprintf(d->name, sizeof d->name, "%s", name);
@@ -149,7 +155,9 @@ static void run(const char *name, int nsym, const uint8_t *lens,
     for (int i = 0; i < nsym; i++)
         ffreq[i] = (uint64_t)(prob[i] * 16384.0 * 65536.0) + 1;
     extract_features(ffreq, code_lens, d->f);
+    return best;
 }
+#define run(name, nsym, lens, prob) (void)run2(name, nsym, lens, prob, 1)
 
 /* Solve (A^T A + ridge) x = A^T y for x[NF] by Gaussian elimination. */
 static void lsq(double x[NF])
@@ -275,5 +283,42 @@ int main(void)
     for (int D = 1; D <= 8; D++)
         printf("%.2f%s", x[2 + D] / muf, D < 8 ? ", " : " } },");
     printf("  /* mu_full %.4f ns */\n", muf);
+
+    /* ---- tau: FSE decode tax (PH vs PHA on committed root bitmaps).
+     * lambda is 0 throughout, so commits follow the plain bytes-shrink
+     * rule regardless of the lambda-aware gate. ---- */
+    printf("\ntau (FSE decode tax, extra passes/elem):\n");
+    double taus[8]; int ntau = 0;
+    double probs[4] = { 0.85, 0.90, 0.95, 0.97 };
+    for (int k = 0; k < 4; k++) {
+        uint8_t l[2] = { 1, 1 };
+        double p[2] = { probs[k], 1.0 - probs[k] };
+        char nm[8]; snprintf(nm, 8, "T%02d", (int)(probs[k] * 100));
+        pivco_huffman_set_fse_enabled(0);
+        double ph = run2(nm, 2, l, p, 0);
+        pivco_huffman_set_fse_enabled(1);
+        double pha = run2(nm, 2, l, p, 0);
+        pivco_huffman_set_fse_enabled(0);
+        if (ph < 0 || pha < 0) continue;
+        double tau = (pha - ph) / muf;
+        if (pha <= ph * 1.02) {
+            printf("  p=%.2f  PH %.4f  PHA %.4f  (no commit / no tax)\n",
+                   probs[k], ph, pha);
+            continue;
+        }
+        printf("  p=%.2f  PH %.4f  PHA %.4f  tau %.2f\n", probs[k], ph, pha, tau);
+        taus[ntau++] = tau;
+    }
+    if (ntau) {
+        double lo = 1e18, hi = 0, mean = 0;
+        for (int i = 0; i < ntau; i++) {
+            mean += taus[i];
+            if (taus[i] < lo) lo = taus[i];
+            if (taus[i] > hi) hi = taus[i];
+        }
+        mean /= ntau;
+        printf("  => tau mean %.2f (range %.2f..%.2f; table-dependent"
+               " -- profile ships the mean)\n", mean, lo, hi);
+    } else printf("  => no committed designs; tau not fitted\n");
     return 0;
 }

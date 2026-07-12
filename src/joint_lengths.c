@@ -173,6 +173,7 @@ void pivco_huffman_set_joint_fse_tax(double tau, double eta, double wmin)
     g_joint_fse_tau  = (tau >= 0 && tau < 1000) ? tau : 0.0;
     g_joint_fse_eta  = (eta > 0 && eta <= 1) ? eta : 0.85;
     g_joint_fse_wmin = wmin > 0 ? wmin : 64.0;
+    g_joint_costs_ready = 1; g_joint_cost_profile = "caller";
 }
 
 /* ---------- Per-arch cost-profile defaults ----------
@@ -193,20 +194,23 @@ void pivco_huffman_set_joint_fse_tax(double tau, double eta, double wmin)
 typedef struct {
     const char *name;
     double mu_cst, prefill, gamma;
+    double tau;          /* FSE decode tax, extra passes/elem (PHA);
+                          * table-dependent in reality (~2x band by
+                          * selected FSE table) — the mean is shipped */
     double kappa[9];
 } jl_arch_costs_t;
 
-static const jl_arch_costs_t JL_COSTS_APPLE_M1 = { "apple-m1", 0.898, 0.244, 163,
+static const jl_arch_costs_t JL_COSTS_APPLE_M1 = { "apple-m1", 0.898, 0.244, 163, 3.6,
     { 0, 0.63, 0.46, 0.52, 0.42, 0.60, 0.77, 1.55, 0.70 } };  /* mu_full 0.0469 ns */
-static const jl_arch_costs_t JL_COSTS_APPLE_M4 = { "apple-m4", 0.897, 0.235, 210,
+static const jl_arch_costs_t JL_COSTS_APPLE_M4 = { "apple-m4", 0.897, 0.235, 210, 4.1,
     { 0, 0.64, 0.49, 0.63, 0.53, 0.70, 0.91, 1.80, 0.41 } };  /* mu_full 0.0291 ns */
-static const jl_arch_costs_t JL_COSTS_GRAVITON4 = { "graviton4", 0.961, 0.117, 118,
+static const jl_arch_costs_t JL_COSTS_GRAVITON4 = { "graviton4", 0.961, 0.117, 118, 2.7,
     { 0, 0.77, 0.61, 0.71, 0.59, 0.90, 1.16, 2.32, 0.54 } };  /* mu_full 0.0746 ns */
-static const jl_arch_costs_t JL_COSTS_GNR = { "intel-gnr", 2.005, 0.303, 2412,
+static const jl_arch_costs_t JL_COSTS_GNR = { "intel-gnr", 2.005, 0.303, 2412, 11.7,
     { 0, 2.47, 2.59, 3.09, 3.39, 3.72, 3.99, 4.19, 4.42 } };  /* mu_full 0.0152 ns */
-static const jl_arch_costs_t JL_COSTS_ZEN4 = { "amd-zen4", 0.795, 0.607, 889,
+static const jl_arch_costs_t JL_COSTS_ZEN4 = { "amd-zen4", 0.795, 0.607, 889, 6.0,
     { 0, 0.49, 0.55, 0.57, 0.61, 0.68, 0.75, 0.81, 0.86 } };  /* mu_full 0.0271 ns */
-static const jl_arch_costs_t JL_COSTS_GENERIC = { "generic-legacy", 1.0, 0.0, 170,
+static const jl_arch_costs_t JL_COSTS_GENERIC = { "generic-legacy", 1.0, 0.0, 170, 4.0,
     { 0, 0, 0, 0, 0, 0, 0, 0, 0 } };  /* unfitted tiers: historical model */
 
 /* Per-flat-depth kernel costs kappa[b], b = 0..8, in merge-pass units
@@ -269,6 +273,7 @@ static void jl_costs_ensure(void)
     g_joint_mu_cst  = p->mu_cst;
     g_joint_prefill = p->prefill;
     g_joint_gamma   = p->gamma;
+    g_joint_fse_tau = p->tau;
     memcpy(g_joint_kappa, p->kappa, sizeof g_joint_kappa);
     g_joint_cost_profile = p->name;
     g_joint_costs_ready = 1;
