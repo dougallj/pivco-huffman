@@ -22,8 +22,14 @@
  * auto DP (gran 0), exact DP (gran 1), with deltas vs off.
  * Otherwise --joint=L runs the lambda-0 / lambda-L pair as before.
  *
+ * --lams=L1,L2,... runs a lambda sweep (off plus each L, back-to-back
+ * per file, exact solver unless --gran says otherwise) — for tracing
+ * the ratio-vs-decode-speed frontier.  --guard=off disables the
+ * adoption guard (or --guard=B,P sets the bits/pass caps) so the sweep
+ * shows the raw frontier rather than the guard's veto.
+ *
  * Usage: bench_lits_windows [--G=KB] [--joint=L] [--ladder] [--reps=N]
- *        [--fse=0|1] [--gran=N] file...
+ *        [--fse=0|1] [--gran=N] [--lams=L1,..] [--guard=off|B,P] file...
  * --fse=0 benches PH (no per-node FSE attempt); default 1 = PHA.
  */
 #include "pivco_huffman.h"
@@ -177,13 +183,17 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
     return 0;
 }
 
-typedef struct { const char *name; double lam; int gran; } cfg_t;
+typedef struct { char name[16]; double lam; int gran; } cfg_t;
+
+#define MAX_CFGS 16
 
 int main(int argc, char **argv)
 {
     size_t G = 64 * 1024;
     double lam = 0.0;
     int reps = 5, fse = 1, gran = 1, ladder = 0;
+    double lams[MAX_CFGS];
+    int nlams = 0;
     int argi = 1;
     for (; argi < argc && argv[argi][0] == '-'; argi++) {
         if (!strncmp(argv[argi], "--G=", 4)) G = (size_t)atoi(argv[argi] + 4) * 1024;
@@ -194,12 +204,36 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[argi], "--gamma=", 8))
             pivco_huffman_set_joint_gamma(atof(argv[argi] + 8));
         else if (!strcmp(argv[argi], "--ladder")) ladder = 1;
+        else if (!strncmp(argv[argi], "--lams=", 7)) {
+            for (const char *p = argv[argi] + 7; *p && nlams < MAX_CFGS - 1; ) {
+                lams[nlams++] = strtod(p, NULL);
+                p = strchr(p, ','); if (!p) break; p++;
+            }
+        }
+        else if (!strcmp(argv[argi], "--guard=off"))
+            pivco_huffman_set_joint_guard(1e9, 1e9);
+        else if (!strncmp(argv[argi], "--guard=", 8)) {
+            double bcap = strtod(argv[argi] + 8, NULL), pcap = 1e9;
+            const char *c = strchr(argv[argi] + 8, ',');
+            if (c) pcap = strtod(c + 1, NULL);
+            pivco_huffman_set_joint_guard(bcap, pcap);
+        }
     }
     pivco_huffman_set_fse_enabled(fse);
 
-    cfg_t cfgs[4];
+    cfg_t cfgs[MAX_CFGS];
     int ncfg;
-    if (ladder) {
+    if (nlams) {
+        cfgs[0] = (cfg_t){ "off", 0.0, gran };
+        for (int i = 0; i < nlams; i++) {
+            cfgs[i + 1].lam  = lams[i];
+            cfgs[i + 1].gran = gran;
+            snprintf(cfgs[i + 1].name, sizeof cfgs[0].name, "L%.3g", lams[i]);
+        }
+        ncfg = nlams + 1;
+        printf("LAMSWEEP G=%zuK reps=%d fse=%d (%s) gran=%d\n", G / 1024,
+               reps, fse, fse ? "PHA" : "PH", gran);
+    } else if (ladder) {
         cfgs[0] = (cfg_t){ "off",   0.0, 1 };
         cfgs[1] = (cfg_t){ "nudge", 0.1, -1 };
         cfgs[2] = (cfg_t){ "auto",  0.1, 0 };
@@ -218,8 +252,8 @@ int main(int argc, char **argv)
            "file", "cfg", "ratio", "enc-e2e", "dec-e2e", "enc-k", "dec-k",
            "build u/w", "adopted");
 
-    double gm[4][4] = {{0}};      /* [cfg][enc_e2e dec_e2e enc_k dec_k] */
-    double ratio_pp[4] = {0};
+    double gm[MAX_CFGS][4] = {{0}}; /* [cfg][enc_e2e dec_e2e enc_k dec_k] */
+    double ratio_pp[MAX_CFGS] = {0};
     int nfiles = 0;
     for (; argi < argc; argi++) {
         size_t n;
@@ -228,7 +262,7 @@ int main(int argc, char **argv)
         const char *base = strrchr(argv[argi], '/');
         base = base ? base + 1 : argv[argi];
 
-        res_t r[4];
+        res_t r[MAX_CFGS];
         int ok = 1;
         for (int j = 0; j < ncfg; j++) {
             int rc = run_file(data, n, G, reps, cfgs[j].lam, cfgs[j].gran, &r[j]);
