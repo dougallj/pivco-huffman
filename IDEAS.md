@@ -169,6 +169,59 @@ It also addresses a pathological "cursor stuck at a page boundary" case from #8.
 
 Probably not worth pursuing due to marginal applicability.
 
+### Lambda-aware FSE commit rule, 2026-07-12
+The whole PHA-vs-joint interaction reduces to one mispriced decision:
+the coder commits FSE on any bitmap that shrinks, but an FSE'd bitmap
+decodes ~tau (~4 on M-class) merge passes slower per element — the
+geometric -28% and the bell_s30 nudge regression (-10..-14% on BOTH
+M4 and GNR, PH-clean) are exactly this.  J-consistent fix: commit iff
+bits_saved >= lambda*tau*n (inert at lambda=0, so PH and all pre-joint
+paths unchanged), with the guard's commit predictor mirroring the same
+threshold (1 - H2(q) > max(1-eta, lambda*tau) + 16/W_block).  Being
+prototyped on branch fse-lambda-commit.  Per-arch tau still needs a
+fit (PH/PHA controlled-pair designs in bench_fit_costs).
+
+### GNR record cost: 36.8 ns/record (5-6x Apple) — dispatch suspect, 2026-07-12
+The per-arch cost fits (results/20260712-arch-cost-fits.txt) put
+gamma at 2412 pass-units on Granite Rapids vs 118-210 on ARM, and
+mu_cst at 2.005 (a cst merge pricier than a FULL merge — suspicious in
+itself; the cst kernels may be unoptimized on AVX-512).  36.8 ns per
+schedule record per block smells like walk overhead, not kernel work:
+codec_decode_subtree recurses with a per-call VLA (bm_scratch), checked
+wire reads, and scratch carving.  Candidates: iterative schedule
+interpreter (the sched is already a linear pre-order program; an
+explicit-stack loop kills call frames + VLAs), hoisting bm_scratch to
+a per-block arena, and a look at merge_cst_* codegen on GNR.  Payoff
+is GNR-wide (every record, every block) and would also shrink gamma
+itself — a win that compounds with the joint optimizer.
+
+### Coarse-rung hybrid granularity (pin the heavy head), 2026-07-12
+The g=2 coarse DP quantizes the tree TOP: the heaviest symbol gets
+welded to its neighbour (source_c: bits-cap veto of the whole win;
+json_api on GNR: adopted -7.3%).  Grouping is cheapest where symbols
+are light and dearest at the heavy head — so solve the top k (4-8)
+symbols at g=1 and group only the tail, or simply raise the auto
+schedule's exact cutoff (sigma <= 64 misses sigma=97 source_c; exact
+is 127 us worst-case now, so <= 128 may be affordable).
+
+### Target-speed mode productization, 2026-07-12
+set_joint_time_target ships (min bits s.t. modeled decode time <= T;
+94-99% margin-0 hit on fitted hosts).  Missing for production: a
+global-budget variant (one dual lambda tuned across windows — spend
+slowness where ratio pays, RDO-style), robust adoption over a kappa
+uncertainty box (KAPPA-COSTS 4.3: linearity means corner checks), and
+a backpressure-driven online controller for the streaming case
+(decoder starved -> lower lambda, input queue growing -> raise it).
+
+### Guard bits-cap misfires on near-incompressible windows, 2026-07-12
+The 1.5% relative bits cap vetoes store-collapses precisely where
+they are best (sao: 97.8% incompressible, wants +2.4pp for 8x decode;
+mozilla/samba windows over the ~0.987 baseline-ratio threshold sail
+through).  A cap in absolute terms (or waived when baseline ratio
+> ~0.95, or replaced by trusting lambda once the honest model is in)
+releases them.  Related: the guard has no adopt-for-ratio path at all
+— geometric-PH (-14% size, +6% decode) is skipped by the time floor.
+
 **NEON**
 
 ### 16-wide one-sided part_core (right16), 2026-06-28, parked
