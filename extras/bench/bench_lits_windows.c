@@ -31,8 +31,33 @@
  * Usage: bench_lits_windows [--G=KB] [--joint=L] [--ladder] [--reps=N]
  *        [--fse=0|1] [--gran=N] [--lams=L1,..] [--guard=off|B,P] file...
  * --fse=0 benches PH (no per-node FSE attempt); default 1 = PHA.
+ *
+ * -DBLW_LEGACY_API=1 compiles the SAME timing loops against the
+ * pre-rank-range explicit-tree API (pivco_huffman_build_table /
+ * encode / decode / build_table_from_code_lens), so before/after
+ * benches across the fast-tables rebase are apples-to-apples.  The
+ * joint knobs don't exist there, so legacy builds bench "off" only.
  */
 #include "pivco_huffman.h"
+
+/* API shim: identical harness, either table API. */
+#if BLW_LEGACY_API
+typedef pivco_huffman_table_t        blw_table_t;
+typedef pivco_huffman_table_t        blw_dtab_t;
+#define blw_build(freq, t)          pivco_huffman_build_table(freq, t)
+#define blw_encode(p, n, t, o, el)  pivco_huffman_encode(p, n, t, o, el)
+#define blw_dec_tab(t)              (t)
+#define blw_decode(in, l, d, o, c)  pivco_huffman_decode(in, l, d, o, c)
+#define blw_build_dt(lens, d)       pivco_huffman_build_table_from_code_lens(lens, d)
+#else
+typedef pivco_huffman_codec_table_t  blw_table_t;
+typedef pivco_huffman_decode_table_t blw_dtab_t;
+#define blw_build(freq, t)          pivco_huffman_build_codec_table(freq, t)
+#define blw_encode(p, n, t, o, el)  pivco_huffman_encode_ct(p, n, t, o, el)
+#define blw_dec_tab(t)              (&(t)->dec)
+#define blw_decode(in, l, d, o, c)  pivco_huffman_decode_dt(in, l, d, o, c)
+#define blw_build_dt(lens, d)       pivco_huffman_build_decode_table(lens, d)
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,11 +88,15 @@ typedef struct {
 static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
                     double lam, int gran, res_t *r)
 {
+#if !BLW_LEGACY_API
     pivco_huffman_set_joint_lambda(lam);
     pivco_huffman_set_joint_granularity(gran);
+#else
+    (void)lam; (void)gran;
+#endif
     size_t nwin = (n + G - 1) / G;
-    pivco_huffman_codec_table_t *tabs = malloc(nwin * sizeof(*tabs));
-    pivco_huffman_decode_table_t *dt = malloc(sizeof(*dt));
+    blw_table_t *tabs = malloc(nwin * sizeof(*tabs));
+    blw_dtab_t *dt = malloc(sizeof(*dt));
     uint8_t *enc = malloc(n * 2 + nwin * 1024 + 4096);
     uint8_t *dec = malloc(n + 64);
     size_t  *woff = malloc((nwin + 1) * sizeof(size_t));
@@ -80,12 +109,13 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
         uint64_t freq[256] = {0};
         const uint8_t *p = data + w * G;
         for (size_t i = 0; i < wlen; i++) freq[p[i]]++;
-        pivco_huffman_build_codec_table(freq, &tabs[w]);
+        blw_build(freq, &tabs[w]);
     }
     double build_s = now_sec() - t0;
 
     /* adoption count (untimed): rebuild with lambda off, compare lens */
     int adopted = 0;
+#if !BLW_LEGACY_API
     if (lam > 0) {
         pivco_huffman_set_joint_lambda(0.0);
         for (size_t w = 0; w < nwin; w++) {
@@ -93,12 +123,13 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
             uint64_t freq[256] = {0};
             const uint8_t *p = data + w * G;
             for (size_t i = 0; i < wlen; i++) freq[p[i]]++;
-            pivco_huffman_codec_table_t t;
-            pivco_huffman_build_codec_table(freq, &t);
+            blw_table_t t;
+            blw_build(freq, &t);
             if (memcmp(t.code_len, tabs[w].code_len, 256) != 0) adopted++;
         }
         pivco_huffman_set_joint_lambda(lam);
     }
+#endif
 
     /* ---- encode kernels (timed) ---- */
     /* Tiny files (Calgary-scale) finish a whole-file pass below the
@@ -118,7 +149,7 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
             for (size_t b = 0; b < wlen; b += PIVCO_BLOCK_SIZE) {
                 size_t bn = wlen - b < PIVCO_BLOCK_SIZE ? wlen - b : PIVCO_BLOCK_SIZE;
                 size_t el;
-                pivco_huffman_encode_ct(data + w * G + b, bn, &tabs[w], enc + off, &el);
+                blw_encode(data + w * G + b, bn, &tabs[w], enc + off, &el);
                 off += el;
             }
         }
@@ -138,8 +169,8 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
             size_t off = woff[w], dof = 0;
             while (dof < wlen) {
                 size_t consumed;
-                pivco_huffman_decode_dt(enc + off, woff[w + 1] - off + 16,
-                                        &tabs[w].dec, dec + w * G + dof, &consumed);
+                blw_decode(enc + off, woff[w + 1] - off + 16,
+                           blw_dec_tab(&tabs[w]), dec + w * G + dof, &consumed);
                 off += consumed;
                 dof += (wlen - dof < PIVCO_BLOCK_SIZE) ? wlen - dof : PIVCO_BLOCK_SIZE;
             }
@@ -156,12 +187,12 @@ static int run_file(const uint8_t *data, size_t n, size_t G, int reps,
         for (int ii = 0; ii < inner; ii++)
         for (size_t w = 0; w < nwin; w++) {
             size_t wlen = (w + 1) * G <= n ? G : n - w * G;
-            pivco_huffman_build_decode_table(tabs[w].code_len, dt);
+            blw_build_dt(tabs[w].code_len, dt);
             size_t off = woff[w], dof = 0;
             while (dof < wlen) {
                 size_t consumed;
-                pivco_huffman_decode_dt(enc + off, woff[w + 1] - off + 16,
-                                        dt, dec + w * G + dof, &consumed);
+                blw_decode(enc + off, woff[w + 1] - off + 16,
+                           dt, dec + w * G + dof, &consumed);
                 off += consumed;
                 dof += (wlen - dof < PIVCO_BLOCK_SIZE) ? wlen - dof : PIVCO_BLOCK_SIZE;
             }
@@ -208,6 +239,7 @@ int main(int argc, char **argv)
                 p = strchr(p, ','); if (!p) break; p++;
             }
         }
+#if !BLW_LEGACY_API
         else if (!strcmp(argv[argi], "--guard=off"))
             pivco_huffman_set_joint_guard(1e9, 1e9);
         else if (!strncmp(argv[argi], "--guard=", 8)) {
@@ -216,8 +248,16 @@ int main(int argc, char **argv)
             if (c) pcap = strtod(c + 1, NULL);
             pivco_huffman_set_joint_guard(bcap, pcap);
         }
+#endif
     }
     pivco_huffman_set_fse_enabled(fse);
+#if BLW_LEGACY_API
+    if (lam > 0 || ladder || nlams) {
+        fprintf(stderr, "legacy-API build: no joint knobs on this branch; "
+                        "benching \"off\" only\n");
+        lam = 0; ladder = 0; nlams = 0;
+    }
+#endif
 
     cfg_t cfgs[MAX_CFGS];
     int ncfg;
@@ -295,7 +335,9 @@ int main(int argc, char **argv)
                    exp(gm[j][2] / nfiles), exp(gm[j][3] / nfiles),
                    ratio_pp[j] / nfiles);
     }
+#if !BLW_LEGACY_API
     pivco_huffman_set_joint_lambda(0.0);
     pivco_huffman_set_joint_granularity(1);
+#endif
     return 0;
 }

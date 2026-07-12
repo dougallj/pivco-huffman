@@ -60,6 +60,22 @@ cc -O2 -Iinclude extras/bench/bench_lits_windows.c \
       --fse=0 --gran=1 --reps=8 testdata/silesia-lits/*.lits
 ```
 
+For the true before/after against pre-fast-tables `main`, the same
+file compiles against the old explicit-tree API — from any old
+checkout, pull the harness + corpus off this branch and build with the
+legacy flag:
+
+```sh
+git checkout <old-main-sha>
+git checkout silesia-lits -- testdata extras/bench/bench_lits_windows.c
+cc -O2 -DBLW_LEGACY_API=1 -Iinclude extras/bench/bench_lits_windows.c    build/libpivco_huffman.a -o blw-legacy -lm
+./blw-legacy --G=64 --fse=0 --reps=8 testdata/silesia-lits/*.lits
+```
+
+Identical timing loops and wire format on both sides (ratios match to
+the last digit); legacy builds bench the "off" config only, since the
+joint knobs don't exist there.
+
 `bench_prof_shares.c` needs the library built with `-DPIVCO_PROF=1`
 (build line in its header).  Raw captures of the published runs live
 in `results/m4-2026071*-lamsweep-*` / `-prof-shares-*` on the joint
