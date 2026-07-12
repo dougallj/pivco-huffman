@@ -32,11 +32,7 @@ static double now_sec(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* Placement-controlled objects: identical page-offset geometry for
- * every mode (a null-ladder experiment measured +-1.7% spread between
- * byte-identical configs from malloc placement alone -- 4K-aliasing /
- * cache-set geometry between stream reads and output writes). */
-static pivco_huffman_codec_table_t *g_ct[4];
+static pivco_huffman_codec_table_t g_ct[4];
 
 int main(int argc, char **argv)
 {
@@ -58,12 +54,7 @@ int main(int argc, char **argv)
         { "off", 0.0, 1 }, { "nudge", 0.1, -1 }, { "auto", 0.1, 0 }, { "exact", 0.1, 1 },
     };
     uint8_t *sym = malloc(N), *dec = malloc(N + 64), *enc[4];
-    for (int m = 0; m < 4; m++) {
-        size_t esz = ((size_t)N * 2 + 4096 + (1u << 21) - 1) & ~(((size_t)1 << 21) - 1);
-        enc[m] = aligned_alloc((size_t)1 << 21, esz);
-        size_t tsz = (sizeof(pivco_huffman_codec_table_t) + 4095) & ~(size_t)4095;
-        g_ct[m] = aligned_alloc(4096, tsz);
-    }
+    for (int m = 0; m < 4; m++) enc[m] = malloc((size_t)N * 2 + 4096);
 
     /* ~1 s of real work so the first measurement isn't on a cold clock */
     bench_generate_symbols(0, sym, N, 1);
@@ -84,12 +75,12 @@ int main(int argc, char **argv)
         for (int m = 0; m < 4; m++) {
             pivco_huffman_set_joint_lambda(modes[m].lam);
             pivco_huffman_set_joint_granularity(modes[m].gran);
-            pivco_huffman_build_codec_table(freq, g_ct[m]);
-            adopted[m] = m > 0 && memcmp(g_ct[0]->code_len, g_ct[m]->code_len, 256) != 0;
+            pivco_huffman_build_codec_table(freq, &g_ct[m]);
+            adopted[m] = m > 0 && memcmp(g_ct[0].code_len, g_ct[m].code_len, 256) != 0;
             size_t off = 0;
             for (int b = 0; b < N; b += PIVCO_BLOCK_SIZE) {
                 size_t el;
-                pivco_huffman_encode_ct(sym + b, PIVCO_BLOCK_SIZE, g_ct[m], enc[m] + off, &el);
+                pivco_huffman_encode_ct(sym + b, PIVCO_BLOCK_SIZE, &g_ct[m], enc[m] + off, &el);
                 off += el;
             }
             elen[m] = off; ratio[m] = (double)off / N;
@@ -110,7 +101,7 @@ int main(int argc, char **argv)
             size_t o = 0;
             for (int b = 0; b < N; b += PIVCO_BLOCK_SIZE) {
                 size_t consumed;
-                pivco_huffman_decode_dt(enc[m] + o, elen[m] - o + 16, &g_ct[m]->dec,
+                pivco_huffman_decode_dt(enc[m] + o, elen[m] - o + 16, &g_ct[m].dec,
                                         dec + b, &consumed);
                 o += consumed;
             }
@@ -121,30 +112,12 @@ int main(int argc, char **argv)
         }
         for (int r = 0; r < REPS; r++)
             for (int m = 0; m < 4; m++) {
-                /* Unadopted => stream verified byte-identical => measure
-                 * the SAME objects as off.  Timing a separate copy only
-                 * measures allocator placement (null-ladder-measured at
-                 * up to +-1.7% between identical configs). */
-                int e = adopted[m] ? m : 0;
-                /* untimed pass: refill caches with THIS mode's stream
-                 * (the previous mode's distinct stream otherwise taxes
-                 * the first timed pass ~1% -- always landing on "off",
-                 * which is timed right after "exact") */
-                {
-                    size_t o = 0;
-                    for (int b = 0; b < N; b += PIVCO_BLOCK_SIZE) {
-                        size_t consumed;
-                        pivco_huffman_decode_dt(enc[e] + o, elen[e] - o + 16, &g_ct[e]->dec,
-                                                dec + b, &consumed);
-                        o += consumed;
-                    }
-                }
                 double t0 = now_sec();
                 for (int ii = 0; ii < inner[m]; ii++) {
                     size_t o = 0;
                     for (int b = 0; b < N; b += PIVCO_BLOCK_SIZE) {
                         size_t consumed;
-                        pivco_huffman_decode_dt(enc[e] + o, elen[e] - o + 16, &g_ct[e]->dec,
+                        pivco_huffman_decode_dt(enc[m] + o, elen[m] - o + 16, &g_ct[m].dec,
                                                 dec + b, &consumed);
                         o += consumed;
                     }
