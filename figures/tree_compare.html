@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PIVCO-Huffman tree compare — base vs joint</title>
+<style>
+  html, body { margin: 0; height: 100%; font-family: -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 6px 10px; background: #f4f4f4; border-bottom: 1px solid #ccc;
+           display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+  header label { font-size: 13px; }
+  header h1 { font-size: 14px; margin: 0 0 0 auto; color: #555; font-weight: 600; }
+  .panes { display: flex; height: calc(100% - 37px); }
+  .pane { flex: 1 1 50%; display: flex; flex-direction: column; min-width: 0; }
+  .pane + .pane { border-left: 2px solid #999; }
+  .pane .cap { font-size: 12px; padding: 3px 8px; background: #fafafa;
+               border-bottom: 1px solid #ddd; color: #333; }
+  .pane iframe { flex: 1; border: 0; width: 100%; }
+  .muted { color: #888; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <label>Dataset:
+    <select id="ds"></select>
+  </label>
+  <label>left:
+    <select id="left">
+      <option value="base" selected>production base</option>
+      <option value="huffman">huffman (in-page)</option>
+      <option value="nudge">joint nudge</option>
+      <option value="auto">joint auto</option>
+      <option value="exact">joint exact</option>
+    </select>
+  </label>
+  <label>right:
+    <select id="right">
+      <option value="base">production base</option>
+      <option value="huffman">huffman (in-page)</option>
+      <option value="nudge">joint nudge</option>
+      <option value="auto">joint auto</option>
+      <option value="exact" selected>joint exact</option>
+    </select>
+  </label>
+  <span class="muted">● = at least one joint rung adopted; greyed rung = not adopted
+    (falls back to huffman in the pane).  Extra URL params are forwarded to both panes.</span>
+  <h1>PIVCO-Huffman tree compare</h1>
+</header>
+<div class="panes">
+  <div class="pane"><div class="cap" id="cap-l"></div><iframe id="fr-l"></iframe></div>
+  <div class="pane"><div class="cap" id="cap-r"></div><iframe id="fr-r"></iframe></div>
+</div>
+<script src="tree_viz_joint.js"></script>
+<script>
+/* Side-by-side wrapper around tree_viz.html: two iframes, one dataset,
+ * independently selectable code-length sources per pane (lengths= URL
+ * param added to tree_viz by the same change that added this page).
+ * View defaults follow the shape-comparison style (bottom-up, tree
+ * view, no bitmap labels, dense leaves, symbol key order); any extra
+ * query params on THIS page are forwarded to both panes so every
+ * tree_viz knob stays reachable. */
+const VIEW_DEFAULTS = {
+    'mode': 'bottom-up', 'no-overlap': '1', 'view': 'tree',
+    'bmlabel': 'nothing', 'leaf-details': '0', 'keys': 'symbol',
+};
+const OWN_PARAMS = ['dataset', 'left', 'right'];
+const JL = window.PIVCO_JOINT_LENGTHS || {};
+
+function adoptedMark(name) {
+    const j = JL[name];
+    return j && (j.nudge || j.auto || j.exact) ? '● ' : '   ';
+}
+
+function populate() {
+    const sel = document.getElementById('ds');
+    const names = Object.keys(JL).sort();
+    for (const n of names) {
+        const o = document.createElement('option');
+        o.value = n;
+        o.textContent = adoptedMark(n) + n;
+        sel.appendChild(o);
+    }
+}
+
+function paneUrl(name, lengths) {
+    const q = new URLSearchParams();
+    q.set('dataset', name);
+    for (const [k, v] of Object.entries(VIEW_DEFAULTS)) q.set(k, v);
+    /* forward any non-own params (may override the view defaults) */
+    for (const [k, v] of new URLSearchParams(window.location.search))
+        if (!OWN_PARAMS.includes(k)) q.set(k, v);
+    q.set('lengths', lengths);
+    return 'tree_viz.html?' + q.toString();
+}
+
+function refresh() {
+    const name = document.getElementById('ds').value;
+    const j = JL[name] || {};
+    for (const side of ['left', 'right']) {
+        const sel = document.getElementById(side);
+        for (const o of sel.options)
+            o.disabled = (o.value === 'nudge' || o.value === 'auto' || o.value === 'exact')
+                         && !j[o.value];
+        const lengths = sel.value;
+        const fr = document.getElementById(side === 'left' ? 'fr-l' : 'fr-r');
+        const cap = document.getElementById(side === 'left' ? 'cap-l' : 'cap-r');
+        const note = (lengths !== 'huffman' && lengths !== 'base' && !j[lengths])
+            ? ' — NOT ADOPTED (pane shows in-page huffman)' : '';
+        cap.textContent = name + ' / ' + lengths + note;
+        const url = paneUrl(name, lengths);
+        if (fr.getAttribute('src') !== url) fr.setAttribute('src', url);
+    }
+    const q = new URLSearchParams(window.location.search);
+    q.set('dataset', name);
+    q.set('left', document.getElementById('left').value);
+    q.set('right', document.getElementById('right').value);
+    history.replaceState(null, '', window.location.pathname + '?' + q.toString());
+}
+
+populate();
+{
+    const q = new URLSearchParams(window.location.search);
+    const ds = document.getElementById('ds');
+    if (q.get('dataset') && JL[q.get('dataset')]) ds.value = q.get('dataset');
+    else if (JL['source_c']) ds.value = 'source_c';
+    for (const side of ['left', 'right'])
+        if (q.get(side)) document.getElementById(side).value = q.get(side);
+}
+for (const id of ['ds', 'left', 'right'])
+    document.getElementById(id).addEventListener('change', refresh);
+refresh();
+</script>
+</body>
+</html>

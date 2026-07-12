@@ -216,6 +216,15 @@ table.node-table tr.in-flat { color: #b45309; }
         <label>Dataset:
             <select id="dataset-select"></select>
         </label>
+        <label>lengths:
+            <select id="lengths-select">
+                <option value="huffman">huffman (in-page)</option>
+                <option value="base">production base</option>
+                <option value="nudge">joint nudge</option>
+                <option value="auto">joint auto</option>
+                <option value="exact">joint exact</option>
+            </select>
+        </label>
         <label>or file: <input type="file" id="file-input"></label>
         <label>or text: <input type="text" id="text-input" size="24"
             placeholder="type or paste text"></label>
@@ -394,6 +403,7 @@ table.node-table tr.in-flat { color: #b45309; }
 <div class="tooltip" id="tooltip"></div>
 
 <script src="tree_viz_data.js"></script>
+<script src="tree_viz_joint.js"></script> <!-- optional: joint-optimizer lengths (extras/dump_joint_lens.c) -->
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
 // ============================================================
@@ -2749,6 +2759,10 @@ function renderStats(rootNode, meta, stats) {
     addRow('dataset', meta.name + (meta.isMain ? ' (MAIN)' : ''),
         "Source distribution name.  '(scaled X→Y)' means input was short " +
         "and we proportionally scaled to a standard 8K block for stable stats.");
+    addRow('lengths', (function () {
+        const el = document.getElementById('lengths-select');
+        return el ? el.value : 'huffman';
+    })(), 'Code-length source (lengths= URL param).');
     addRow('N (source bytes)', totalN.toString(),
         "Total symbol count.  8192 for built-in datasets and short inputs " +
         "scaled up to a standard block.");
@@ -2851,6 +2865,7 @@ function renderStats(rootNode, meta, stats) {
 // ============================================================
 
 let _freqs = null;
+let _plainName = null;   /* undecorated dataset name for joint-lengths lookup */
 let _name = '(none)';
 let _isMain = false;
 let _totalN = 0;
@@ -2898,7 +2913,20 @@ function refreshFromFreqs() {
             collect(n.right, (code << 1) | 1,   len + 1);
         })(tree, 0, 0);
     } else {
-        const lens = buildHuffmanLengths(_freqs, maxLen);
+        /* Code-length source: in-page Huffman, or precomputed lengths
+         * from tree_viz_joint.js (production base / joint rungs).  A
+         * missing rung (guard veto / solver no-op => same as base) falls
+         * back to the in-page Huffman with a status note. */
+        let lens = null;
+        const lenSel = document.getElementById('lengths-select');
+        if (lenSel && lenSel.value !== 'huffman') {
+            const jl = (window.PIVCO_JOINT_LENGTHS || {})[_plainName];
+            const jlens = jl ? jl[lenSel.value] : null;
+            if (jlens) lens = jlens.slice();
+            else status.textContent = 'no "' + lenSel.value +
+                '" lengths for this dataset (not adopted / no data) — showing in-page huffman';
+        }
+        if (!lens) lens = buildHuffmanLengths(_freqs, maxLen);
         codes = phOpt ?
             assignPhFlatCodes(lens, _freqs, keysSort) :
             assignCanonicalCodes(lens);
@@ -3012,6 +3040,7 @@ function scaleFreqsToBlock(freqs) {
 
 function setFreqs(freqs, name, isMain) {
     _flatOverride.clear();
+    _plainName = name;
     const sc = scaleFreqsToBlock(freqs);
     _freqs = sc.scaled;
     _totalN = sc.scaled_total;
@@ -3088,6 +3117,7 @@ function setupToggles() {
         _flatOverride.clear(); refreshFromFreqs(); updateUrlFromState();
     };
     document.getElementById('ph-opt').addEventListener('change', refreshClearAndUrl);
+    document.getElementById('lengths-select').addEventListener('change', refreshClearAndUrl);
     document.getElementById('max-skew').addEventListener('change', refreshClearAndUrl);
     document.getElementById('show-flat').addEventListener('change', refreshClearAndUrl);
     document.getElementById('condense-flat').addEventListener('change', refreshClearAndUrl);
@@ -3286,6 +3316,12 @@ const URL_PARAM_MAP = [
       desc: 'Label each branch with the bit it represents (0 = left child, 1 = right child).',
       values: '1 | 0' },
     /* selects + range: .value as a string */
+    { kind: 'str',  param: 'lengths',        id: 'lengths-select',
+      desc: 'Code-length source.  <b>huffman</b> = built in-page (max-len slider applies); ' +
+            '<b>base</b> = the production build lengths (two-queue + limit heuristic); ' +
+            '<b>nudge/auto/exact</b> = joint-optimizer rungs (lambda = 0.1, production guard, ' +
+            'from tree_viz_joint.js).  Rungs the guard vetoed fall back to in-page huffman with a note.',
+      values: 'huffman | base | nudge | auto | exact' },
     { kind: 'str',  param: 'keys',           id: 'keys-sort',
       desc: 'Within-tier ordering of leaves when building the flat-aware tree. Affects which symbols land in the deepest D-flat chunk per length tier.',
       values: 'freq_desc | freq_asc | symbol' },

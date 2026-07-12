@@ -60,6 +60,14 @@ add_executable(pivco_dump_distributions
 )
 target_link_libraries(pivco_dump_distributions pivco_huffman m)
 
+# Dump production-base + joint-rung code lengths for figures/tree_viz.html's
+# lengths= param and figures/tree_compare.html.
+add_executable(pivco_dump_joint_lens
+    ${CMAKE_SOURCE_DIR}/extras/dump_joint_lens.c
+    ${BENCH_DIST}
+)
+target_link_libraries(pivco_dump_joint_lens pivco_huffman m)
+
 # Dump the production C-built decode tree in the figure's "download tree text"
 # format so the two can be diff'd to confirm the figure matches the real codec.
 add_executable(pivco_dump_tree_text
