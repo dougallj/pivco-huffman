@@ -33,3 +33,35 @@ win in that case.
 This directory lives on its own branch (`silesia-lits`, off `main`) so
 the ~31 MB of binary data is easy to cull or rebase away if it ever
 becomes a burden.
+
+## Reproducing the per-window (chunked/strided) numbers
+
+The harnesses are included on this branch for reference —
+`extras/bench/bench_lits_windows.c` (windowed e2e encode/decode/ratio;
+`--ladder`, `--lams=` frontier sweep, `--guard=` override) and
+`extras/bench/bench_prof_shares.c` (decode-kernel time decomposition
+via `PIVCO_PROF`) — but they build against the codec-table API
+(`build_codec_table` / `encode_ct` / `decode_dt`), which lives on the
+`joint-flat-lengths-plus-fast-tables` branch, not on `main`.  So:
+
+```sh
+git checkout joint-flat-lengths-plus-fast-tables
+git checkout silesia-lits -- testdata            # the corpus
+rm -rf build && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
+cc -O2 -Iinclude extras/bench/bench_lits_windows.c \
+   build/libpivco_huffman.a -o blw -lm
+
+# ladder (off/nudge/auto/exact at lambda=0.1, production guard):
+./blw --G=64 --ladder --fse=0 --reps=8 testdata/silesia-lits/*.lits
+# candidate default, per-file:
+./blw --G=64 --joint=0.1 --fse=0 --gran=1 --reps=8 testdata/silesia-lits/*.lits
+# ratio-vs-decode-speed frontier (guard off; mass-DP fallback above 1/7):
+./blw --G=64 --lams=0.1,0.143,0.2,0.3,0.5,0.75,1,1.5,2.5,5 --guard=off \
+      --fse=0 --gran=1 --reps=8 testdata/silesia-lits/*.lits
+```
+
+`bench_prof_shares.c` needs the library built with `-DPIVCO_PROF=1`
+(build line in its header).  Raw captures of the published runs live
+in `results/m4-2026071*-lamsweep-*` / `-prof-shares-*` on the joint
+branch.  Numbers quoted in docs/JOINT-LENGTHS.md are Apple M4, PH
+(`--fse=0`); expect ~3 % run-to-run thermal grain between batches.
