@@ -216,3 +216,32 @@ wire also charges for, so the DP's new preference is win-win;
 kernels also gain at 4 K (fewer records to emit).  The measured
 kappa_hat table validates the slot DP's spread bound at lambda = 0.1
 but ships default-zero pending a per-arch defaults strategy.
+
+## Per-arch defaults shipped (2026-07-12): the section-5 plan executed
+
+extras/bench/bench_fit_costs.c makes the fit self-contained: fresh
+blocks (the branch-predictor trap), a clock warmup + QoS pin (the
+E-core trap), feature vectors probed from pivco_huffman_joint_model_time
+with one-hot cost settings (the features are BY CONSTRUCTION the
+model's own — no analysis-side drift), and an in-tool least-squares
+solve that prints a paste-ready profile.  Five hosts fitted (worst
+residuals 0.0014-0.0073 ns/sym): apple-m1, apple-m4, graviton4,
+intel-gnr, amd-zen4 — see results/20260712-arch-cost-fits.txt.  The
+cross-arch structure answers §4.3's premise: tables differ not by a
+scale factor but in SHAPE (ARM: flats far under merges, D7 spike; GNR:
+flats relatively dear at kappa 2.5-4.4 and gamma 2412 because
+vpexpandb merges are that fast; Zen 4: mild-monotone, prefill 0.61).
+
+Defaults load lazily at first joint-pass use, keyed at runtime (Apple
+brand string M1-vs-newer, aarch64-server, x86 CPUID vendor + VBMI2;
+unfitted SSE/AVX2 tier keeps the historical kappa=0/gamma=170 model);
+any explicit cost setter takes full control instead.
+pivco_huffman_get_joint_cost_profile() reports the active profile.
+
+Acceptance metric (the target-mode demo's margin-0 hit rate): M4 goes
+35-52% -> 94-99% in-band; M1 83-98%; GNR correctly no-ops easy targets
+and lifts the edge target 37->68% at -0.03pp.  Fixing jl_sim's missing
+depth guard (reachable via the public model on non-tiling freq/length
+combinations) fell out of the tool work.  Still open: per-arch tau
+(FSE tax, PHA), the GNR coarse-rung json_api regression, robust-box
+adoption (§4.3) for cross-device encoding.

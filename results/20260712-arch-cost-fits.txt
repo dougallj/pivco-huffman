@@ -1,0 +1,28 @@
+Per-arch cost-model fits (bench_fit_costs: controlled trees, fresh
+blocks, model-probed features, in-tool LSQ; worst residuals ns/sym in
+parens).  kappa/gamma in merge-pass units; mu_full = ns per
+element-pass.  Shipped as runtime-detected defaults in joint_lengths.c.
+
+host        mu_full  mu_cst  prefill  gamma(ns/rec)   kappa b1..b8               resid
+apple-m1    0.0469   0.898   0.244    163 (7.65)      .63 .46 .52 .42 .60 .77 1.55 .70   (.0018)
+apple-m4    0.0291   0.897   0.235    210 (6.12)      .64 .49 .63 .53 .70 .91 1.80 .41   (.0015)
+graviton4   0.0746   0.961   0.117    118 (8.80)      .77 .61 .71 .59 .90 1.16 2.32 .54   (.0073)
+intel-gnr   0.0152   2.005   0.303    2412 (36.77)    2.47 2.59 3.09 3.39 3.72 3.99 4.19 4.42  (.0038)
+amd-zen4    0.0271   0.795   0.607    889 (24.08)     .49 .55 .57 .61 .68 .75 .81 .86   (.0014)
+
+Structure: ARM prices flats far below merges (D7 spike, D8 cheap);
+GNR's vpexpandb merges are so fast that flats are RELATIVELY dear and
+records enormous; Zen 4 is mild-monotone with a big prefill win.
+
+Validation (bench_time_target, margin 0, arch defaults, G=64K PH lits):
+  M1 Max: T=6/8/10 GB/s hit 83.4/98.4/92.5%  (was 43/52/74% with kappa=0)
+  M4:     T=10/12/14    hit 93.9/97.0/98.6%  p5 margins 1.00/1.03/1.05
+  c8i:    T=6/8 no-op (baseline hits 99%+, adoption ~0, dRatio ~0);
+          T=10 edge: 37->68% hit at -0.03pp (fewer-records trees are
+          faster AND smaller under gamma=2412)
+Dist-ladder sanity under defaults (M4 + c8i): geometric/bell_s10 still
+vetoed; jpeg/bell_s80/chinese/log wins intact; c8i gains source_c-nudge
++25% and chinese-auto +35% (previously vetoed); known residuals:
+bell_s30-nudge FSE-commit gap (tau still M-class 4.0), json_api-auto on
+GNR adopted at -7.3% (coarse-rung mispricing, logged), SSE/AVX2 tier
+unfitted (generic-legacy = historical model).

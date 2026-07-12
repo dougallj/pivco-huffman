@@ -107,6 +107,12 @@ double pivco_huffman_get_joint_time_target(void)
     return g_joint_time_target;
 }
 
+/* Cost-profile state (tables + detection further down): 0 = per-arch
+ * defaults load on first joint-pass use; any explicit cost setter
+ * flips to "caller" and disables autoloading. */
+static int g_joint_costs_ready = 0;
+static const char *g_joint_cost_profile = "unset";
+
 /* Merge-kind costs for the kind-aware time model (guard side), in
  * units of a FULL merge pass (two internal children; mu_full == 1 by
  * definition): mu_cst = merge with a lone-leaf child (the cheap cst
@@ -124,6 +130,7 @@ void pivco_huffman_set_joint_merge_costs(double mu_cst, double prefill)
 {
     g_joint_mu_cst  = (mu_cst  > 0 && mu_cst  < 100) ? mu_cst  : 1.0;
     g_joint_prefill = (prefill >= 0 && prefill <= 1) ? prefill : 0.0;
+    g_joint_costs_ready = 1; g_joint_cost_profile = "caller";
 }
 
 /* FSE decode tax (PHA only): a merge whose bitmap the per-node FSE
@@ -152,6 +159,7 @@ static double g_joint_gamma = 170.0;
 void pivco_huffman_set_joint_gamma(double gamma_hat)
 {
     g_joint_gamma = (gamma_hat >= 0 && gamma_hat < 1e6) ? gamma_hat : 0.0;
+    g_joint_costs_ready = 1; g_joint_cost_profile = "caller";
 }
 
 static double g_joint_fse_tau  = 4.0;   /* measured M-class: FSE'd
@@ -167,6 +175,40 @@ void pivco_huffman_set_joint_fse_tax(double tau, double eta, double wmin)
     g_joint_fse_wmin = wmin > 0 ? wmin : 64.0;
 }
 
+/* ---------- Per-arch cost-profile defaults ----------
+ *
+ * Fitted by extras/bench/bench_fit_costs.c (controlled trees, fresh
+ * blocks, features probed from this very model; worst residuals
+ * 0.0014-0.0073 ns/sym).  Loaded lazily on first use unless the caller
+ * has explicitly set any cost knob (kappa / gamma / merge_costs) —
+ * explicit setters take full control and disable autoloading.
+ *
+ * Notable structure: the ARM family prices flats far below merges
+ * (kappa < ~1, D7 spike, D8 cheap) with gamma ~120-210 passes; Granite
+ * Rapids' vpexpandb merges are so fast (mu_full 0.015 ns) that flats
+ * are RELATIVELY dear (kappa 2.5-4.4) and records enormous (gamma
+ * 2412 = 36.8 ns); Zen 4 sits between, with a large prefill win.
+ * The FSE tax tau stays at its M-class 4.0 on all arches pending a
+ * per-arch PHA fit. */
+typedef struct {
+    const char *name;
+    double mu_cst, prefill, gamma;
+    double kappa[9];
+} jl_arch_costs_t;
+
+static const jl_arch_costs_t JL_COSTS_APPLE_M1 = { "apple-m1", 0.898, 0.244, 163,
+    { 0, 0.63, 0.46, 0.52, 0.42, 0.60, 0.77, 1.55, 0.70 } };  /* mu_full 0.0469 ns */
+static const jl_arch_costs_t JL_COSTS_APPLE_M4 = { "apple-m4", 0.897, 0.235, 210,
+    { 0, 0.64, 0.49, 0.63, 0.53, 0.70, 0.91, 1.80, 0.41 } };  /* mu_full 0.0291 ns */
+static const jl_arch_costs_t JL_COSTS_GRAVITON4 = { "graviton4", 0.961, 0.117, 118,
+    { 0, 0.77, 0.61, 0.71, 0.59, 0.90, 1.16, 2.32, 0.54 } };  /* mu_full 0.0746 ns */
+static const jl_arch_costs_t JL_COSTS_GNR = { "intel-gnr", 2.005, 0.303, 2412,
+    { 0, 2.47, 2.59, 3.09, 3.39, 3.72, 3.99, 4.19, 4.42 } };  /* mu_full 0.0152 ns */
+static const jl_arch_costs_t JL_COSTS_ZEN4 = { "amd-zen4", 0.795, 0.607, 889,
+    { 0, 0.49, 0.55, 0.57, 0.61, 0.68, 0.75, 0.81, 0.86 } };  /* mu_full 0.0271 ns */
+static const jl_arch_costs_t JL_COSTS_GENERIC = { "generic-legacy", 1.0, 0.0, 170,
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0 } };  /* unfitted tiers: historical model */
+
 /* Per-flat-depth kernel costs kappa[b], b = 0..8, in merge-pass units
  * (kappa_b = measured flat-kernel ns/sym at depth b divided by merge
  * ns/sym).  Default all-zero = the historical model.  Real tables are
@@ -181,6 +223,61 @@ void pivco_huffman_set_joint_kappa(const double kappa[9])
     for (int b = 0; b <= 8; b++)
         g_joint_kappa[b] = (kappa && kappa[b] >= 0.0 && kappa[b] < 100.0)
                          ? kappa[b] : 0.0;
+    g_joint_costs_ready = 1; g_joint_cost_profile = "caller";
+}
+
+/* Detect this host's cost profile and load it (first use only; any
+ * explicit cost setter beforehand wins and disables autoloading). */
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <sys/sysctl.h>
+static const jl_arch_costs_t *jl_detect_costs(void)
+{
+    char brand[64] = {0};
+    size_t len = sizeof brand - 1;
+    if (sysctlbyname("machdep.cpu.brand_string", brand, &len, NULL, 0) == 0
+        && strstr(brand, "M1"))
+        return &JL_COSTS_APPLE_M1;
+    return &JL_COSTS_APPLE_M4;      /* M2+ assumed nearer the M4 fit */
+}
+#elif defined(__aarch64__)
+static const jl_arch_costs_t *jl_detect_costs(void)
+{
+    return &JL_COSTS_GRAVITON4;     /* ARM servers: Neoverse fit */
+}
+#elif defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+static const jl_arch_costs_t *jl_detect_costs(void)
+{
+    unsigned a, b, c, d;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d) || !(c & (1u << 6)))
+        return &JL_COSTS_GENERIC;   /* no VBMI2: SSE/AVX2 tier, unfitted */
+    unsigned vb = 0, vc = 0, vd = 0;
+    __get_cpuid(0, &a, &vb, &vc, &vd);
+    return vb == 0x68747541 /* "Auth" */ ? &JL_COSTS_ZEN4 : &JL_COSTS_GNR;
+}
+#else
+static const jl_arch_costs_t *jl_detect_costs(void)
+{
+    return &JL_COSTS_GENERIC;
+}
+#endif
+
+static void jl_costs_ensure(void)
+{
+    if (g_joint_costs_ready) return;
+    const jl_arch_costs_t *p = jl_detect_costs();
+    g_joint_mu_cst  = p->mu_cst;
+    g_joint_prefill = p->prefill;
+    g_joint_gamma   = p->gamma;
+    memcpy(g_joint_kappa, p->kappa, sizeof g_joint_kappa);
+    g_joint_cost_profile = p->name;
+    g_joint_costs_ready = 1;
+}
+
+const char *pivco_huffman_get_joint_cost_profile(void)
+{
+    jl_costs_ensure();
+    return g_joint_cost_profile;
 }
 
 typedef struct {
@@ -228,6 +325,13 @@ static double jl_sim(const jl_ch_t *ch, int n, int *i, int d, int pre,
                      const double *kap, double scale, int *recs,
                      double *Wout, int *kind)
 {
+    if (d > JL_LMAX) {          /* non-tiling multiset (possible via the
+                                 * public model on inconsistent freq/
+                                 * lengths): cut the recursion; the
+                                 * caller's i != n check reports -1 */
+        *Wout = 0; *kind = 1;
+        return 0.0;
+    }
     if (*i < n && ch[*i].r == d) {
         const jl_ch_t *c = &ch[(*i)++];
         *Wout = c->W;
@@ -980,6 +1084,7 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
                             const uint64_t freq[PIVCO_MAX_SYMBOLS],
                             uint8_t lengths[PIVCO_MAX_SYMBOLS])
 {
+    jl_costs_ensure();
     const double lam = g_joint_lambda;
     const double *kap = g_joint_kappa;
     if (lam <= 0.0 && g_joint_time_target <= 0.0) return -1;
@@ -1092,6 +1197,7 @@ static int jl_optimize_core(jl_sf_t sf[PIVCO_MAX_SYMBOLS], int sigma,
 double pivco_huffman_joint_model_time(const uint64_t freq[PIVCO_MAX_SYMBOLS],
                                       const uint8_t lengths[PIVCO_MAX_SYMBOLS])
 {
+    jl_costs_ensure();
     double cls_w[JL_LMAX + 1] = {0};
     int cls_n[JL_LMAX + 1] = {0};
     double W = 0;

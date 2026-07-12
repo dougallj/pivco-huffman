@@ -420,6 +420,12 @@ void pivco_huffman_set_joint_guard(double bits_cap, double pass_cap);
 void   pivco_huffman_set_joint_time_target(double passes_per_elem);
 double pivco_huffman_get_joint_time_target(void);
 
+/* Active cost-profile name: per-arch fitted defaults ("apple-m1",
+ * "apple-m4", "graviton4", "intel-gnr", "amd-zen4", "generic-legacy")
+ * loaded lazily on first joint-pass use, or "caller" once any cost
+ * setter (kappa / gamma / merge_costs) has been called explicitly. */
+const char *pivco_huffman_get_joint_cost_profile(void);
+
 /* Modeled decode time of an arbitrary length assignment, in pass-units
  * per element under the current model settings; -1 on invalid input. */
 double pivco_huffman_joint_model_time(const uint64_t freq[PIVCO_MAX_SYMBOLS],
