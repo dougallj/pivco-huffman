@@ -417,9 +417,17 @@ static inline void pivcoh__merge16(uint8_t *dest, const uint8_t *l,
 }
 #endif
 
+/* SWAR byte popcount (keeps the scalar core free of compiler builtins). */
+static int pivcoh__pc8(unsigned m)
+{
+    m = m - ((m >> 1) & 0x55);
+    m = (m & 0x33) + ((m >> 2) & 0x33);
+    return (int)((m + (m >> 4)) & 0x0f);
+}
+
 /* Returns the advanced input pointer, or NULL on malformed input.  out
- * receives exactly K symbols; partner must have capacity floor(K/2)
- * (see the placement note at the merge below). */
+ * receives exactly K symbols; partner must have capacity K (see the
+ * placement note at the merge below). */
 static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t *out,
                                   const uint8_t *p, const uint8_t *end, uint8_t *partner)
 {
@@ -482,7 +490,26 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
             return NULL;
         uint8_t ls = t->rank_to_sym[rec->param];
         int r = 0;
-        for (j = 0; j < K; j++) {
+        j = 0;
+        /* Shift-register groups, one-sided: the left "register" is the
+         * constant.  The register snapshot makes the in-place overlap
+         * with out's tail harmless within a group; r + 8 <= KR bounds
+         * the load, and the checked tail + final r == KR keep hostile
+         * bitmaps memory-safe and rejected. */
+        while (j + 8 <= K && r + 8 <= KR) {
+            unsigned m = bm[j >> 3];
+            uint64_t rv;
+            memcpy(&rv, out + KL + r, 8);
+#define PIVCOH__STEP(k) do { unsigned b_ = (m >> (k)) & 1; \
+            out[j + (k)] = b_ ? (uint8_t)rv : ls;          \
+            rv >>= b_ << 3; } while (0)
+            PIVCOH__STEP(0); PIVCOH__STEP(1); PIVCOH__STEP(2); PIVCOH__STEP(3);
+            PIVCOH__STEP(4); PIVCOH__STEP(5); PIVCOH__STEP(6); PIVCOH__STEP(7);
+#undef PIVCOH__STEP
+            r += pivcoh__pc8(m);
+            j += 8;
+        }
+        for (; j < K; j++) {
             if (PIVCOH__BIT(j)) { if (r == KR) return NULL; out[j] = out[KL + r]; r++; }
             else out[j] = ls;
         }
@@ -530,7 +557,8 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
      * bitmaps, and faster than it even on fully predictable ones).
      * Same guard/tail contract as the NEON loop, at 8-byte grain. */
     while (j + 8 <= K && li + 8 <= KL && ri + 8 <= KR) {
-        unsigned m = bm[j >> 3], pc;
+        unsigned m = bm[j >> 3];
+        int pc = pivcoh__pc8(m);
         uint64_t lv, rv;
         memcpy(&lv, L + li, 8);
         memcpy(&rv, R + ri, 8);
@@ -540,11 +568,8 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         PIVCOH__STEP(0); PIVCOH__STEP(1); PIVCOH__STEP(2); PIVCOH__STEP(3);
         PIVCOH__STEP(4); PIVCOH__STEP(5); PIVCOH__STEP(6); PIVCOH__STEP(7);
 #undef PIVCOH__STEP
-        pc = m - ((m >> 1) & 0x55);                /* SWAR byte popcount */
-        pc = (pc & 0x33) + ((pc >> 2) & 0x33);
-        pc = (pc + (pc >> 4)) & 0x0f;
-        li += 8 - (int)pc;
-        ri += (int)pc;
+        li += 8 - pc;
+        ri += pc;
         j += 8;
     }
     for (; j < K; j++) {
