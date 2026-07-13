@@ -9,10 +9,11 @@
  * library rather than a portable-scalar floor.  ~53 KiB of static
  * shuffle tables build lazily on first use — the writes are idempotent,
  * so concurrent first calls are benign.
- * Streams are byte-identical to the full library's PH-only mode (raw
- * bitmaps — pivco_huffman_set_fse_enabled(0), which is also what the
- * pivcohuf tool's default non-ANS format uses; "optimized" tree shaping,
- * max code length 11).  FSE/ANS-coded blocks are not supported and are
+ * Streams are byte-identical to the full library's PH-only mode (wire
+ * v0.7 decode-order layout; raw bitmaps —
+ * pivco_huffman_set_fse_enabled(0), which is also what the pivcohuf
+ * tool's default non-ANS format uses; "optimized" tree shaping, max
+ * code length 11).  FSE/ANS-coded blocks are not supported and are
  * rejected on decode.
  *
  * Do this in ONE C file to create the implementation:
@@ -868,6 +869,19 @@ static void pivcoh__merge_flat(uint8_t *out, int n, const uint8_t *bm, int D,
 
 /* ---- decode tree walk ---- */
 
+/* Read a node's post-order marker + raw bitmap: sets *bm and returns the
+ * input pointer advanced past it, or NULL on truncation / a non-raw
+ * (FSE) marker. */
+static inline const uint8_t *pivcoh__read_bm(const uint8_t **bm, int K,
+                                             const uint8_t *p, const uint8_t *end)
+{
+    size_t nb = (size_t)((K + 7) >> 3);
+    if ((size_t)(end - p) < nb + 1) return NULL;
+    if (*p++ != 0) return NULL;                /* raw-bitmap marker only (no FSE) */
+    *bm = p;
+    return p + nb;
+}
+
 /* Returns the advanced input pointer, or NULL on truncated/structurally
  * invalid input.  out receives exactly K bytes.  `top` is the bump-arena
  * cursor for child buffers; both children of every node decode into
@@ -889,31 +903,41 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         pivcoh__merge_flat(out, K, p, D, t->rank_to_sym + rec->param);
         return p + nb;
     }
-    if (end - p < 3) return NULL;
+    /* Decode-order record (wire v0.7): K_right here at node entry, the
+     * children's regions next (larger-K first), the marker+bitmap at the
+     * node's post-order position — read right at merge time, so the
+     * input cursor moves strictly forward, single-touch. */
+    if (end - p < 2) return NULL;
     int KR = p[0] | p[1] << 8;
     if (KR > K) return NULL;
-    if (p[2] != 0) return NULL;                /* raw-bitmap marker only (no FSE) */
-    p += 3;
-    size_t nb = (size_t)((K + 7) >> 3);
-    if ((size_t)(end - p) < nb) return NULL;
-    const uint8_t *bm = p;
-    p += nb;
-
+    p += 2;
     int KL = K - KR;
+
     if (kind == PIVCOH__LEAFL) {               /* left = lone leaf */
         uint8_t *rbuf = top;
         top += KR;
         if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, p, end, top)))
             return NULL;
+        const uint8_t *bm;
+        if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
         pivcoh__merge_cst_vec(bm, K, t->rank_to_sym[rec->param], rbuf, out);
         return p;
     }
     uint8_t *lbuf = top, *rbuf = top + KL;     /* FULL: both children internal */
     top += K;
-    if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, lbuf, p, end, top)))
-        return NULL;
-    if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, p, end, top)))
-        return NULL;
+    if (KR > KL) {                             /* stream order: larger first */
+        if (!(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, p, end, top)))
+            return NULL;
+        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, lbuf, p, end, top)))
+            return NULL;
+    } else {
+        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, lbuf, p, end, top)))
+            return NULL;
+        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, p, end, top)))
+            return NULL;
+    }
+    const uint8_t *bm;
+    if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
     pivcoh__merge_vec_vec(bm, K, lbuf, rbuf, out);
     return p;
 }
@@ -1339,22 +1363,34 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
         *pp = p + ((n * D + 7) >> 3);
         return;
     }
-    uint8_t *kr = p;                           /* K_right, u16 LE */
-    p += 2;
-    *p++ = 0;                                  /* marker: raw bitmap */
-    uint8_t *bm = p;
-    p += (n + 7) >> 3;
+    /* Decode-order record (wire v0.7): the K_right header goes at the
+     * node's PRE-order position, the marker+bitmap at its POST-order
+     * position, the children's regions between, larger-K child first.
+     * The bitmap is staged on the stack across the child recursion (its
+     * stream position depends on the children's encoded sizes). */
+    int nbytes = (n + 7) >> 3;
+    uint8_t bm_stage[(size_t)nbytes];
     int n_right = (kind == PIVCOH__LEAFL)
-        ? pivcoh__part_core(ranks, n, rec->param, bm, tmp, 1)
-        : pivcoh__part_full(ranks, n, rec->param, bm, tmp);
-    kr[0] = (uint8_t)n_right;
-    kr[1] = (uint8_t)(n_right >> 8);
-    *pp = p;
+        ? pivcoh__part_core(ranks, n, rec->param, bm_stage, tmp, 1)
+        : pivcoh__part_full(ranks, n, rec->param, bm_stage, tmp);
     int n_left = n - n_right;
-    if (kind == PIVCOH__FULL && n_left > 0)
-        pivcoh__enc_node(t, idx + 1, ranks, n_left, pp, tmp + n_right);
-    if (n_right > 0)
+    *p++ = (uint8_t)n_right;                   /* K_right, u16 LE */
+    *p++ = (uint8_t)(n_right >> 8);
+    *pp = p;
+    if (kind == PIVCOH__FULL && n_right > n_left) {
         pivcoh__enc_node(t, idx + rec->right, tmp, n_right, pp, tmp + n_right);
+        if (n_left > 0)
+            pivcoh__enc_node(t, idx + 1, ranks, n_left, pp, tmp + n_right);
+    } else {
+        if (kind == PIVCOH__FULL && n_left > 0)
+            pivcoh__enc_node(t, idx + 1, ranks, n_left, pp, tmp + n_right);
+        if (n_right > 0)
+            pivcoh__enc_node(t, idx + rec->right, tmp, n_right, pp, tmp + n_right);
+    }
+    p = *pp;
+    *p++ = 0;                                  /* marker: raw bitmap */
+    memcpy(p, bm_stage, (size_t)nbytes);
+    *pp = p + nbytes;
 }
 
 PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,

@@ -6,7 +6,7 @@
  * which led to silent drift (scalar+NEON added the FSE marker byte in
  * 2026-05-13, x86+AVX-512 didn't — broke scalar↔SSE cross-decoding).
  *
- * Wire format (v0.5+):
+ * Wire format (v0.7+):
  *
  * Per-block header (once, at the very start of each encoded block):
  *   [block_N: uint16 LE, 2 bytes]                  symbol count N for this
@@ -17,18 +17,30 @@
  *                                                  65535 — no longer pinned
  *                                                  to PIVCO_BLOCK_SIZE.
  *
- * Per non-flat internal node (FULL / LEAF_LEFT; the former both-leaves
- * PAIR record is gone — sibling pairs are flat D=1 regions):
- *   [K_right_header:         uint16 LE, 2 bytes]   always
- *   [FSE marker byte:        uint8,    1 byte]    always
- *   [bitmap body]                                  marker == 0: raw n-bit
- *                                                  bitmap, ceil(n/8) bytes
- *                                                  marker != 0: 2-byte LE
- *                                                  fse_len + fse_len bytes
- *                                                  of FSE-compressed bytes
+ * The block body is an Euler walk of the tree in DECOMPRESSION ORDER
+ * (v0.6): a node's pieces land exactly where the BU decoder consumes
+ * them, so the input cursor moves strictly forward, single-touch.  Per
+ * non-flat internal node (FULL / LEAF_LEFT; the former both-leaves PAIR
+ * record is gone — sibling pairs are flat D=1 regions):
+ *
+ *   [K_right_header: uint16 LE, 2 bytes]   at the node's PRE-order
+ *                                          position — the decoder sizes
+ *                                          both children before their
+ *                                          regions arrive
+ *   ... the children's regions, LARGER-K child first (v0.7; strict >,
+ *       ties left-first — a leaf child emits nothing) ...
+ *   [FSE marker byte: uint8, 1 byte]       at the node's POST-order
+ *   [bitmap body]                          position, right where the
+ *                                          decoder merges.
+ *                                          marker == 0: raw n-bit
+ *                                          bitmap, ceil(n/8) bytes
+ *                                          marker != 0: 2-byte LE
+ *                                          fse_len + fse_len bytes
+ *                                          of FSE-compressed bytes
  *
  * Flat-subtree nodes do NOT use this header — they emit n·D packed bits
- * directly.  See pivco_huffman.h:flat_depth.
+ * directly at their (single) visit position.  See
+ * pivco_huffman.h:flat_depth.
  *
  * Internal header, not part of the public API.
  */
@@ -70,39 +82,23 @@ static inline int wire_read_block_n(const uint8_t **in_ptr)
     return (int)v;
 }
 
-/* ---------- Encode side: reserve / commit slots ----------
+/* ---------- Encode side ----------
  *
- * The encoder reserves the header slot(s) BEFORE knowing n_right, then
- * commits the value afterwards.  Returns pointer to where the K_right
- * uint16 should be written (NULL if no header was reserved).
+ * The encoder partitions BEFORE emitting anything for the node (the
+ * bitmap is staged across the child recursion), so K_right is known up
+ * front and written directly — the old reserve/commit pair is gone.
  *
  * Every non-flat schedule record (FULL / LEAF_LEFT) carries a K_right
  * header — the pair records that had none are flat D=1 regions now —
- * so the production codec calls the unconditional wire_reserve_kr /
- * wire_read_kr; the *_header variants keyed on the explicit tree
- * remain for legacy decoders. */
-static inline uint8_t *wire_reserve_kr(uint8_t **out_ptr)
+ * so the production codec calls the unconditional wire_write_kr /
+ * wire_read_kr; the read *_header variant keyed on the explicit tree
+ * remains for legacy decoders. */
+static inline void wire_write_kr(uint8_t **out_ptr, int n_right)
 {
     uint8_t *slot = *out_ptr;
-    *out_ptr += KR_HEADER_BYTES;
-    return slot;
-}
-
-static inline uint8_t *wire_reserve_kr_header(const pivco_huffman_table_t *table,
-                                               int16_t node_id,
-                                               uint8_t **out_ptr)
-{
-    if (!kr_header_needed(table, node_id)) return NULL;
-    return wire_reserve_kr(out_ptr);
-}
-
-/* Write the K_right value into a previously-reserved slot.  No-op if
- * `slot` is NULL (header wasn't reserved for this node). */
-static inline void wire_commit_kr_header(uint8_t *slot, int n_right)
-{
-    if (!slot) return;
     slot[0] = (uint8_t)(n_right & 0xFF);
     slot[1] = (uint8_t)((n_right >> 8) & 0xFF);
+    *out_ptr += KR_HEADER_BYTES;
 }
 
 /* Note: the FSE marker byte + bitmap (or FSE payload) is emitted by

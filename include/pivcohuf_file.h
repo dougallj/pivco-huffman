@@ -47,7 +47,11 @@ extern "C" {
 
 #define PIVCOHUF_MAGIC          "PIVCOHUF"
 #define PIVCOHUF_VERSION_MAJOR  0
-#define PIVCOHUF_VERSION_MINOR  4  /* 0.4: dropped within-tier ordering */
+#define PIVCOHUF_VERSION_MINOR  7  /* 0.7: decode-order wire (Euler layout,
+                                    * larger-K child first); 0.5/0.6 skipped
+                                    * (0.5 burned unbumped by the block-N
+                                    * header, 0.6+0.7 landed together);
+                                    * 0.4: dropped within-tier ordering */
 #define PIVCOHUF_HEADER_SIZE    26
 
 typedef enum {
