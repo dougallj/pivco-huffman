@@ -20,8 +20,8 @@
 
 #include "pivco_huffman.h"
 #include "pivco_huffman_common.h"
+#include "pivco_huffman_primitives.h"   /* before wire.h: defines PIVCO_PRIM_DEC_* */
 #include "pivco_huffman_wire.h"
-#include "pivco_huffman_primitives.h"
 #include "pivco_prof.h"
 #ifdef PIVCO_HAS_FSE
 #include "pivco_fse.h"
@@ -449,11 +449,60 @@ int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
  * is on.  The root call passes 0 -- the caller's output buffer has no
  * over-read slack. */
 
+/* Decode-walk I/O context: constant for a whole block's walk.
+ *   in_end     -- one past the last readable input byte (in + in_len).
+ *   in_bounce  -- N+16-byte arena slab for end-of-input flat tails.
+ * Reads, unlike writes, cannot be "restored", so input regions that
+ * end within SRC_SLACK of in_end are copied into padded scratch before
+ * the kernels read them (raw bitmaps -> each call's bm_scratch, see
+ * wire_read_bitmap; packed-flat regions -> codec_flat_region below).
+ * Exact backends (SRC_SLACK == 0) fold every check away. */
+typedef struct {
+    const uint8_t *in_end;
+    uint8_t       *in_bounce;
+} codec_dec_io_t;
+
+/* Flat region decode with end-of-input protection.  The packed-flat
+ * kernels read up to SRC_SLACK bytes past the region (except D == 8,
+ * which is an exact memcpy).  When a region ends within SRC_SLACK of
+ * in_end -- in practice the block's final region against a tight
+ * buffer -- decode the longest 16-code-aligned prefix straight from
+ * the stream (16 codes = 2*D bytes, so the split is byte-aligned, and
+ * the prefix call's reads stay at or under in_end) and only the
+ * remaining tail codes from a copy in `slab`: a small memcpy instead
+ * of bouncing the whole region. */
+static inline void codec_flat_region(uint8_t *out, int K,
+                                     const uint8_t *bm, int D,
+                                     const uint8_t *c2s,
+                                     const uint8_t *in_end,
+                                     uint8_t *slab)
+{
+    int total_bytes = (K * D + 7) >> 3;
+    if (PIVCO_PRIM_DEC_SRC_SLACK == 0 || D == 8
+        || bm + total_bytes + PIVCO_PRIM_DEC_SRC_SLACK <= in_end) {
+        prim_merge_flat(out, K, bm, D, c2s);
+        return;
+    }
+    size_t avail = (size_t)(in_end - bm);
+    size_t safe  = avail > (size_t)PIVCO_PRIM_DEC_SRC_SLACK
+                 ? avail - (size_t)PIVCO_PRIM_DEC_SRC_SLACK : 0;
+    int n1 = (int)((safe * 8 / (size_t)D) & ~(size_t)15);
+    if (n1 > K) n1 = K & ~15;
+    if (n1 > 0) prim_merge_flat(out, n1, bm, D, c2s);
+    int n2 = K - n1;
+    if (n2 > 0) {
+        size_t b1 = (size_t)n1 * (size_t)D / 8;
+        memcpy(slab, bm + b1, (size_t)total_bytes - b1);
+        prim_merge_flat(out + n1, n2, slab, D, c2s);
+    }
+}
+
 static void codec_decode_subtree(const pivco_huffman_table_t *table,
                                    int16_t node_id, int K,
                                    uint8_t *out_buf,
                                    const uint8_t **in_ptr,
-                                   uint8_t *scratch_top, int tail_ok)
+                                   uint8_t *scratch_top, int tail_ok,
+                                   const codec_dec_io_t *io)
 {
     if (K == 0) return;
 
@@ -474,14 +523,14 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
         *in_ptr += total_bytes;
         const uint8_t *c2s =
             &table->flat_code_to_sym[table->flat_offset[node_id]];
-        prim_merge_flat(out_buf, K, bm, D, c2s);
+        codec_flat_region(out_buf, K, bm, D, c2s, io->in_end, io->in_bounce);
         return;
     }
 
     case PIVCO_NODE_BOTH_LEAVES: {
         /* No K_right header (kr_header_needed returns false). */
         uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
-        const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch);
+        const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch, io->in_end);
         prim_merge_cst_cst(bm, K,
                            (uint8_t)table->tree[node->left].symbol,
                            (uint8_t)table->tree[node->right].symbol,
@@ -492,13 +541,13 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
     case PIVCO_NODE_LEAF_LEFT: {
         int K_right = wire_read_kr_header(table, node_id, in_ptr);
         uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
-        const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch);
+        const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch, io->in_end);
 
         uint8_t *right_buf = tail_ok
             ? place_tail(out_buf, K - K_right, K_right, &scratch_top)
             : scratch_carve(&scratch_top, K_right);
         codec_decode_subtree(table, node->right, K_right,
-                              right_buf, in_ptr, scratch_top, g_dec_inplace);
+                              right_buf, in_ptr, scratch_top, g_dec_inplace, io);
         prim_merge_cst_vec(bm, K,
                            (uint8_t)table->tree[node->left].symbol,
                            right_buf, out_buf);
@@ -511,7 +560,7 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
          * scratch slices, then merge. */
         int K_right = wire_read_kr_header(table, node_id, in_ptr);
         uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
-        const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch);
+        const uint8_t *bm = wire_read_bitmap(in_ptr, K, bm_scratch, io->in_end);
 
         int K_left = K - K_right;
         uint8_t *left_buf, *right_buf;
@@ -531,9 +580,9 @@ static void codec_decode_subtree(const pivco_huffman_table_t *table,
         }
 
         codec_decode_subtree(table, node->left,  K_left,
-                              left_buf,  in_ptr, scratch_top, g_dec_inplace);
+                              left_buf,  in_ptr, scratch_top, g_dec_inplace, io);
         codec_decode_subtree(table, node->right, K_right,
-                              right_buf, in_ptr, scratch_top, g_dec_inplace);
+                              right_buf, in_ptr, scratch_top, g_dec_inplace, io);
         prim_merge_vec_vec(bm, K, left_buf, right_buf, out_buf);
         return;
     }
@@ -545,14 +594,25 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
                        uint8_t *symbols, size_t *consumed)
 {
     if (!in || !table || !symbols || !consumed) return PIVCO_ERR_NULL;
-    (void)in_len;
+    if (in_len < PIVCO_BLOCK_N_BYTES) return PIVCO_ERR_CORRUPT;
     prim_codec_init();
 
     /* Block header: first 2 bytes are N (symbol count for this block). */
     const uint8_t *ptr = in;
+    const uint8_t *in_end = in + in_len;
     const int N = wire_read_block_n(&ptr);
     if (N <= 0 || N > PIVCO_WIRE_MAX_N) return PIVCO_ERR_CORRUPT;
     const pivco_tree_node_t *root = &table->tree[table->tree_root];
+
+    /* Tail-free backends write whole store quanta, and the guard that
+     * makes interior writes exact may not run against the caller's
+     * `symbols` (its end must not be touched even transiently).  Merges
+     * into `symbols` with N a quantum multiple spill nothing, so the
+     * common path is direct; an unaligned-N block instead decodes into
+     * the arena and is memcpy'd out.  Exact backends (Q == 1) fold to
+     * root_tail == 0. */
+    const int root_tail = PIVCO_PRIM_DEC_STORE_QUANTUM > 1
+        && (N % PIVCO_PRIM_DEC_STORE_QUANTUM) != 0;
 
     /* Root-is-leaf: fill everything with the single symbol. */
     if (root->symbol >= 0) {
@@ -572,13 +632,19 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
     if ((pivco_node_type_t)table->node_type[table->tree_root]
         == PIVCO_NODE_BOTH_LEAVES) {
         uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
-        const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch);
+        const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch, in_end);
         const pivco_tree_node_t *left_child  = &table->tree[root->left];
         const pivco_tree_node_t *right_child = &table->tree[root->right];
+        uint8_t *dst = symbols;
+        if (root_tail) {
+            dst = decode_scratch_ensure((size_t)N + MERGE_OVERREAD);
+            if (!dst) return PIVCO_ERR_NULL;
+        }
         prim_merge_cst_cst(bm, N,
                                (uint8_t)left_child->symbol,
                                (uint8_t)right_child->symbol,
-                               symbols);
+                               dst);
+        if (root_tail) memcpy(symbols, dst, (size_t)N);
         *consumed = (size_t)(ptr - in);
         return PIVCO_OK;
     }
@@ -595,12 +661,22 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
     size_t need = (size_t)N * (PIVCO_MAX_CODE_LEN + 2);
     if (g_dec_carve || g_dec_inplace)
         need = 2 * need + SCRATCH_PAGE + MERGE_OVERREAD;
+    /* Tail-free additions, all decoder-private: MERGE_OVERREAD read
+     * slack above the topmost carve (guard windows / source overreads
+     * at the arena top), the in_bounce slab, and — for unaligned-N
+     * roots — a bounce block the walk writes instead of `symbols`. */
+    const size_t walk_sz = need + MERGE_OVERREAD;
+    const size_t dst_off = walk_sz + ((size_t)N + 16);   /* after in_bounce */
+    need = dst_off + (root_tail ? (size_t)N + MERGE_OVERREAD : 0);
     uint8_t *scratch = decode_scratch_ensure(need);
     if (!scratch) return PIVCO_ERR_NULL;
     g_scratch_pad_left = PIVCO_SCRATCH_PAD_BUDGET;
 
+    codec_dec_io_t io = { in_end, scratch + walk_sz };
+    uint8_t *dst = root_tail ? scratch + dst_off : symbols;
     codec_decode_subtree(table, table->tree_root, N,
-                          symbols, &ptr, scratch, /*tail_ok=*/0);
+                          dst, &ptr, scratch, /*tail_ok=*/0, &io);
+    if (root_tail) memcpy(symbols, dst, (size_t)N);
 
     *consumed = (size_t)(ptr - in);
     return PIVCO_OK;

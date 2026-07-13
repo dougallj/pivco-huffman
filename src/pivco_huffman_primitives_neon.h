@@ -43,50 +43,18 @@ static inline void codec_init_neon(void)
     init_merge_tables();
 }
 
-/* ---------- Decode primitives (bottom-up) ---------- */
-
-/* popcount_K_right_neon — count "1" bits in the first K bits of bm.
- * Vectorised: 64-byte main path with 4-wide ILP, then 16-byte mop-up,
- * scalar tail for the trailing 0..15 full bytes + the optional partial
- * byte (K & 7).  `nbytes` is derivable from K; kept for signature
- * stability with the BU x86 backend. */
-static inline int popcount_K_right_neon(const uint8_t *bm, int nbytes, int K)
-{
-    (void)nbytes;
-    PROF_TIC();
-    int full_bytes = K >> 3;
-    int partial_bits = K & 7;
-
-    uint16x8_t acc_v = vdupq_n_u16(0);
-    int b = 0;
-    for (; b + 64 <= full_bytes; b += 64) {
-        uint8x16_t v0 = vld1q_u8(bm + b);
-        uint8x16_t v1 = vld1q_u8(bm + b + 16);
-        uint8x16_t v2 = vld1q_u8(bm + b + 32);
-        uint8x16_t v3 = vld1q_u8(bm + b + 48);
-        uint8x16_t c0 = vcntq_u8(v0);
-        uint8x16_t c1 = vcntq_u8(v1);
-        uint8x16_t c2 = vcntq_u8(v2);
-        uint8x16_t c3 = vcntq_u8(v3);
-        /* 3-level lane-wise add tree, all in u8 (max 32 at root). */
-        uint8x16_t s01 = vaddq_u8(c0, c1);
-        uint8x16_t s23 = vaddq_u8(c2, c3);
-        uint8x16_t s   = vaddq_u8(s01, s23);
-        acc_v = vaddq_u16(acc_v, vpaddlq_u8(s));
-    }
-    for (; b + 16 <= full_bytes; b += 16) {
-        uint8x16_t v = vld1q_u8(bm + b);
-        acc_v = vaddq_u16(acc_v, vpaddlq_u8(vcntq_u8(v)));
-    }
-    int K_right = (int)vaddvq_u16(acc_v);
-    for (; b < full_bytes; b++) K_right += __builtin_popcount(bm[b]);
-    if (partial_bits) {
-        uint8_t valid_mask = (uint8_t)((1u << partial_bits) - 1);
-        K_right += __builtin_popcount(bm[full_bytes] & valid_mask);
-    }
-    PROF_TOC(PROF_BU_POPCOUNT_K, K);
-    return K_right;
-}
+/* ---------- Decode primitives (bottom-up) ----------
+ *
+ * TAIL-FREE: every decode primitive runs its full-width loop straight
+ * past the end of the region.  A K-symbol output receives exactly
+ * ceil(K/16)*16 bytes of stores (garbage beyond K); loads read up to
+ * 16 B past the region's last input byte (and up to 64+16 B past a
+ * merge source list's live length — absorbed by the decode scratch
+ * arena's slack, see codec.c).  No narrower fallback loops, no scalar
+ * mop-up, no partial-tail branches.  codec.c keeps the caller-facing
+ * contract exact via the STORE_QUANTUM / SRC_SLACK constants below. */
+#define PIVCO_PRIM_DEC_STORE_QUANTUM 16
+#define PIVCO_PRIM_DEC_SRC_SLACK 16
 
 /* ---- merge_vec_vec_neon: two-table SABD merge, 64 bytes/iter ----
  *
@@ -95,12 +63,10 @@ static inline int popcount_K_right_neon(const uint8_t *bm, int nbytes, int K)
  * so no explicit add.  Four chunks per 64-byte iter share one vcnt + 64-bit
  * multiply prefix-sum for the per-chunk cursor splits and the L/R advance.  The
  * two 256x16 index tables (g_merge_shuf0/1, 8 KiB) are built once in
- * codec_init_neon.  Tail (K mod 64) runs the same SABD merge at 16- and
- * 8-wide on the same tables (the 8-wide form stores the low half only),
- * so the whole kernel touches only g_merge_shuf0/1 plus the 256-byte
- * expand_popcnt (tail cursor advance; aarch64 has no GPR popcount) --
- * the old expand_tab/expand_tab_pre ladder dragged up to 20 KiB of
- * cold table lines into L1 for at most two tail iterations per node. */
+ * codec_init_neon.  Tail (K mod 64): the same 16-byte kernel strides
+ * straight past K (tail-free contract), so the whole kernel touches
+ * only g_merge_shuf0/1 plus the 256-byte expand_popcnt (tail cursor
+ * advance; aarch64 has no GPR popcount). */
 static int8_t g_merge_shuf0[256 * 16] __attribute__((aligned(16)));
 static int8_t g_merge_shuf1[256 * 16] __attribute__((aligned(16)));
 static void init_merge_tables(void)
@@ -136,23 +102,6 @@ static inline void merge_neon_16B(uint8_t *dest, const uint8_t *l_list,
     src.val[1] = vld1q_u8(l_list);
     vst1q_u8(dest, vqtbl2q_u8(src, shuf));
 }
-/* 8-byte residue on the same tables: the 16-bit-mask path with the high
- * mask byte zero (tab1 row 0), storing only the low 8 output lanes.
- * Both sides consume <= 8 bytes and every lane index stays in its
- * half's low 8 lanes, so 8-byte D-register loads suffice (they
- * zero-extend for free) -- no over-read past cursor+8. */
-static inline void merge_neon_8B_lo(uint8_t *dest, const uint8_t *l_list,
-                                    const uint8_t *r_list, intptr_t m8,
-                                    const int8_t *tab0, const int8_t *tab1)
-{
-    int8x16_t shuf0 = vld1q_s8(&tab0[(m8 << 4) & 0xff0]);
-    int8x16_t shuf1 = vld1q_s8(&tab1[0]);
-    uint8x16_t shuf = vreinterpretq_u8_s8(vabdq_s8(shuf0, shuf1));
-    uint8x16x2_t src;
-    src.val[0] = vcombine_u8(vld1_u8(r_list), vdup_n_u8(0));
-    src.val[1] = vcombine_u8(vld1_u8(l_list), vdup_n_u8(0));
-    vst1_u8(dest, vget_low_u8(vqtbl2q_u8(src, shuf)));
-}
 static inline void merge_vec_vec_neon(const uint8_t *bm, int K,
                                      const uint8_t *left,
                                      const uint8_t *right,
@@ -182,32 +131,18 @@ static inline void merge_vec_vec_neon(const uint8_t *bm, int K,
         merge_neon_16B(out + i + 48, l_list + 48 - pop2, r_list + pop2, mask >> 48, g_merge_shuf0, g_merge_shuf1);
         r_list += pop3; l_list += 64 - pop3;
     }
-    int j = (int)i;
-
-    /* Residue on the main tables: 16-wide, then 8-wide (low half). */
-    for (; j + 16 <= K; j += 16) {
-        uint16_t m16; memcpy(&m16, bm + (j >> 3), 2);
-        merge_neon_16B(out + j, l_list, r_list, (intptr_t)m16,
+    /* Tail-free: the 16-byte kernel strides straight past K.  The final
+     * store spills <= 15 B past out+K; mask bits >= K are garbage but
+     * only steer lanes/cursors that are never consumed again.
+     * expand_popcnt, not __builtin_popcount: aarch64 has no GPR
+     * popcount (fmov+cnt+addv+fmov, ~7cy) and this sits on the
+     * serial cursor chain between tail iterations. */
+    for (; i < K; i += 16) {
+        uint16_t m16; memcpy(&m16, bm + (i >> 3), 2);
+        merge_neon_16B(out + i, l_list, r_list, (intptr_t)m16,
                        g_merge_shuf0, g_merge_shuf1);
-        /* expand_popcnt, not __builtin_popcount: aarch64 has no GPR
-         * popcount (fmov+cnt+addv+fmov, ~7cy) and this sits on the
-         * serial cursor chain between tail iterations. */
         int pop = expand_popcnt[m16 & 0xff] + expand_popcnt[m16 >> 8];
         r_list += pop; l_list += 16 - pop;
-    }
-    if (j + 8 <= K) {
-        intptr_t m8 = bm[j >> 3];
-        merge_neon_8B_lo(out + j, l_list, r_list, m8,
-                         g_merge_shuf0, g_merge_shuf1);
-        int pop = expand_popcnt[m8];
-        r_list += pop; l_list += 8 - pop;
-        j += 8;
-    }
-    /* Scalar tail (1..7 leftover). */
-    int lc = (int)(l_list - left), rc = (int)(r_list - right);
-    for (; j < K; j++) {
-        int mb = (bm[j >> 3] >> (j & 7)) & 1;
-        out[j] = mb ? right[rc++] : left[lc++];
     }
     PROF_TOC(PROF_BU_MERGE_VEC_VEC, K);
 }
@@ -247,7 +182,7 @@ static inline void merge_cst_vec_neon(const uint8_t *bm, int K,
         r_list += p3;
     }
     int j = (int)i;
-    for (; j + 16 <= K; j += 16) {   /* 16-byte ryg tail before the scalar mop-up */
+    for (; j < K; j += 16) {   /* tail-free 16-byte stride straight past K */
         uint16_t m16; memcpy(&m16, bm + (j >> 3), 2);
         int8x16_t s0 = vld1q_s8(&g_merge_shuf0[((intptr_t)m16 << 4) & 0xff0]);
         int8x16_t s1 = vld1q_s8(&g_merge_shuf1[((intptr_t)m16 >> 4) & 0xff0]);
@@ -256,22 +191,6 @@ static inline void merge_cst_vec_neon(const uint8_t *bm, int K,
         vst1q_u8(out + j, vqtbl2q_u8(src, sh));
         r_list += expand_popcnt[m16 & 0xff] + expand_popcnt[m16 >> 8];
     }
-    if (j + 8 <= K) {   /* 8-wide residue: high mask byte 0, store low half.
-                         * 8B D-load on R -- consumes <= 8, no wider
-                         * over-read than the scalar loop it replaces. */
-        intptr_t m8 = bm[j >> 3];
-        int8x16_t s0 = vld1q_s8(&g_merge_shuf0[(m8 << 4) & 0xff0]);
-        int8x16_t s1 = vld1q_s8(&g_merge_shuf1[0]);
-        uint8x16_t sh = vreinterpretq_u8_s8(vabdq_s8(s0, s1));
-        uint8x16x2_t src;
-        src.val[0] = vcombine_u8(vld1_u8(r_list), vdup_n_u8(0));
-        src.val[1] = Lb;
-        vst1_u8(out + j, vget_low_u8(vqtbl2q_u8(src, sh)));
-        r_list += expand_popcnt[m8];
-        j += 8;
-    }
-    int rc = (int)(r_list - right);
-    for (; j < K; j++) { int mb = (bm[j >> 3] >> (j & 7)) & 1; out[j] = mb ? right[rc++] : left_sym; }
     PROF_TOC(PROF_BU_MERGE_CST_VEC, K);
 }
 
@@ -297,8 +216,8 @@ static inline void merge_cst_cst_neon(const uint8_t *bm, int K,
     int8x16_t  shift_v = vld1q_s8(merge_two_shift_tab);
     uint8x16_t one_v   = vdupq_n_u8(1);
 
-    int j = 0;
-    for (; j + 16 <= K; j += 16) {
+    /* Tail-free: single 16-wide loop straight past K (<= 15 B spill). */
+    for (int j = 0; j < K; j += 16) {
         uint16_t bm_word; memcpy(&bm_word, bm + (j >> 3), 2);
         uint8x16_t bm_lo = vreinterpretq_u8_u16(
             vsetq_lane_u16(bm_word, vdupq_n_u16(0), 0));
@@ -306,17 +225,6 @@ static inline void merge_cst_cst_neon(const uint8_t *bm, int K,
         uint8x16_t shifted = vshlq_u8(dup, shift_v);
         uint8x16_t idx     = vandq_u8(shifted, one_v);
         vst1q_u8(out + j, vqtbl1q_u8(c2s_vec, idx));
-    }
-    for (; j + 8 <= K; j += 8) {
-        uint8x8_t bm_v = vdup_n_u8(bm[j >> 3]);
-        uint8x8_t dup     = vtbl1_u8(bm_v, vget_low_u8(dup_v));
-        uint8x8_t shifted = vshl_u8(dup, vget_low_s8(shift_v));
-        uint8x8_t idx     = vand_u8(shifted, vget_low_u8(one_v));
-        vst1_u8(out + j, vtbl1_u8(vget_low_u8(c2s_vec), idx));
-    }
-    for (; j < K; j++) {
-        int mb = (bm[j >> 3] >> (j & 7)) & 1;
-        out[j] = mb ? right_sym : left_sym;
     }
     PROF_TOC(PROF_BU_MERGE_CST_CST, K);
 }
@@ -332,8 +240,9 @@ static inline void merge_cst_cst_neon(const uint8_t *bm, int K,
  * (flat_d{2,3,4,5,6,7}_unpack) come from pivco_huffman_neon_flat.h.
  */
 
-/* Extract D bits at bit position `bit_pos` from `in`.  D <= 16.  Used
- * by each per-D function's non-aligned scalar tail. */
+/* Extract D bits at bit position `bit_pos` from `in`.  D <= 16.  Only
+ * used by merge_flat_neon's generic fallback (unreachable for the
+ * D = 2..8 range build_table can produce; kept as a safety net). */
 static inline uint32_t extract_D_bits_neon(const uint8_t *in,
                                              int bit_pos, int D)
 {
@@ -370,22 +279,11 @@ static inline void merge_flat_d2_neon(uint8_t *symbols, int n,
         }
     }
     uint8x16_t c2s_vec = vld1q_u8(c2s);
-    /* smaller inputs/tail => simpler 16-wide path with no extra prep. */
-    for (; i + 16 <= n; i += 16) {
+    /* smaller inputs/tail => 16-wide straight past n (tail-free). */
+    for (; i < n; i += 16) {
         uint8x16_t codes = flat_d2_unpack(bm + (i >> 2));
         uint8x16_t syms  = vqtbl1q_u8(c2s_vec, codes);
         vst1q_u8(symbols + i, syms);
-    }
-    for (; i + 4 <= n; i += 4) {
-        uint8_t b = bm[i >> 2];
-        symbols[i    ] = c2s[(b     ) & 3];
-        symbols[i + 1] = c2s[(b >> 2) & 3];
-        symbols[i + 2] = c2s[(b >> 4) & 3];
-        symbols[i + 3] = c2s[(b >> 6) & 3];
-    }
-    for (; i < n; i++) {
-        uint32_t code = extract_D_bits_neon(bm, i * 2, 2);
-        symbols[i] = c2s[code];
     }
 }
 
@@ -393,8 +291,8 @@ static inline void merge_flat_d2_neon(uint8_t *symbols, int n,
  * D=3 codes per byte (pair6 = c[2k] | c[2k+1]<<3) -- one gather+shift pass does
  * 32 codes -- then split lo=&7 (vqtbl1 over c2s16) / hi=>>3 (vqtbl2 over the
  * 32-byte repeated table, which ignores the high junk) and interleave with
- * vst2q.  A single 16-wide pair-gather block mops up the <32 remainder; the
- * trailing <=16 codes use the no-overread safe path (bounded by fast_end). */
+ * vst2q.  Tail-free: a 16-wide pair-gather loop strides straight past n
+ * (16-byte loads stay within the +16 src pad; <= 15 B store spill). */
 static inline void merge_flat_d3_neon(uint8_t *symbols, int n,
                                                 const uint8_t *bm,
                                                 const uint8_t *c2s)
@@ -403,9 +301,8 @@ static inline void merge_flat_d3_neon(uint8_t *symbols, int n,
     const uint8x16_t c2s16 = vcombine_u8(c2s8, c2s8);
     const uint8x16_t m7    = vdupq_n_u8(7);
     int i = 0;
-    int fast_end = n >= 16 ? n - 16 : 0;
     const uint8_t *bp = bm;
-    if (n >= 48) {
+    if (n >= 32) {
         uint8x16x2_t c2s32; c2s32.val[0] = c2s16; c2s32.val[1] = c2s16;
         static const uint8_t pair6_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
         static const int16_t hshift6_t[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
@@ -413,7 +310,7 @@ static inline void merge_flat_d3_neon(uint8_t *symbols, int n,
         const uint8x16_t pair6_shuf = vld1q_u8(pair6_shuf_t);
         const int16x8_t  hshift6    = vld1q_s16(hshift6_t);
         const int8x16_t  bshr6      = vld1q_s8(bshr6_t);
-        for (; i + 32 <= fast_end; i += 32, bp += 12) {
+        for (; i + 32 <= n; i += 32, bp += 12) {
             uint8x16_t packed = vld1q_u8(bp);
             uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair6_shuf));
             x = vshlq_u16(x, hshift6);
@@ -424,29 +321,21 @@ static inline void merge_flat_d3_neon(uint8_t *symbols, int n,
             vst2q_u8(symbols + i, out);
         }
     }
-    if (i + 16 <= fast_end) {   /* one 16-wide pair-gather block for the <32 remainder */
-        static const uint8_t pair_shuf_t[16] = { 0,1, 0,1, 1,2, 2,3, 3,4, 3,4, 4,5, 5,6 };
-        static const int16_t hshift_t[8]     = { 5,-1, 1, 3, 5,-1, 1, 3 };
-        static const int8_t  bshr_t[16]      = { -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0 };
+    /* 16-wide pair-gather, straight past n. */
+    static const uint8_t pair_shuf_t[16] = { 0,1, 0,1, 1,2, 2,3, 3,4, 3,4, 4,5, 5,6 };
+    static const int16_t hshift_t[8]     = { 5,-1, 1, 3, 5,-1, 1, 3 };
+    static const int8_t  bshr_t[16]      = { -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0 };
+    for (; i < n; i += 16, bp += 6) {
         uint8x16_t packed = vld1q_u8(bp);
         uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, vld1q_u8(pair_shuf_t)));
         x = vshlq_u16(x, vld1q_s16(hshift_t));
         uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), vld1q_s8(bshr_t));
         vst1q_u8(symbols + i, vqtbl1q_u8(c2s16, vandq_u8(y, m7)));
-        i += 16; bp += 6;
-    }
-    for (; i + 8 <= n; i += 8) {
-        uint8x8_t codes = flat_d3_unpack_safe(bm + ((i * 3) >> 3));
-        vst1_u8(symbols + i, vqtbl1_u8(c2s16, codes));
-    }
-    for (; i < n; i++) {
-        uint32_t code = extract_D_bits_neon(bm, i * 3, 3);
-        symbols[i] = c2s[code];
     }
 }
 
 /* D=4: codes are nibbles (2/byte), so &0xF / >>4 index the plain c2s directly
- * (no dup-shuffle TBL); 32/iter via vzip + plain vst1q.  Stock 16-wide tail. */
+ * (no dup-shuffle TBL); 32/iter via vzip + plain vst1q.  Tail-free 16-wide tail. */
 static inline void merge_flat_d4_neon(uint8_t *symbols, int n,
                                                 const uint8_t *bm,
                                                 const uint8_t *c2s)
@@ -461,26 +350,17 @@ static inline void merge_flat_d4_neon(uint8_t *symbols, int n,
         vst1q_u8(symbols + i,      vzip1q_u8(a, b));
         vst1q_u8(symbols + i + 16, vzip2q_u8(a, b));
     }
-    for (; i + 16 <= n; i += 16) {
+    for (; i < n; i += 16) {   /* tail-free: 16-wide straight past n */
         uint8x16_t codes = flat_d4_unpack(bm + (i >> 1));
         uint8x16_t syms  = vqtbl1q_u8(c2s_vec, codes);
         vst1q_u8(symbols + i, syms);
-    }
-    for (; i + 2 <= n; i += 2) {
-        uint8_t b = bm[i >> 1];
-        symbols[i    ] = c2s[b & 0x0F];
-        symbols[i + 1] = c2s[b >> 4];
-    }
-    for (; i < n; i++) {
-        uint32_t code = extract_D_bits_neon(bm, i * 4, 4);
-        symbols[i] = c2s[code];
     }
 }
 
 /* D=5 (byte-crossing): pair-gather puts two adjacent codes in one u16 lane,
  * positioned so a byte reinterpret interleaves even/odd for free (no vtrn1);
- * vshr.u8(even lanes) + vand clean to 0..31; vqtbl2 scatter.  Setup is gated on the
- * block condition; the stock safe path handles the remainder. */
+ * vshr.u8(even lanes) + vand clean to 0..31; vqtbl2 scatter.  Tail-free: one
+ * loop, 16 codes / 10 bytes per iter, straight past n. */
 static inline void merge_flat_d5_neon(uint8_t *symbols, int n,
                                                 const uint8_t *bm,
                                                 const uint8_t *c2s)
@@ -488,39 +368,26 @@ static inline void merge_flat_d5_neon(uint8_t *symbols, int n,
     uint8x16x2_t c2s_vec;
     c2s_vec.val[0] = vld1q_u8(c2s);
     c2s_vec.val[1] = vld1q_u8(c2s + 16);
-    int i = 0;
-    if (n >= 25) {
-        static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 2,3, 3,4, 5,6, 6,7, 7,8, 8,9 };
-        static const int16_t hshift_t[8]     = { 3, 1, -1, -3, 3, 1, -1, -3 };
-        static const int8_t  bshr_t[16]      = { -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0 };
-        const uint8x16_t pair_shuf = vld1q_u8(pair_shuf_t);
-        const int16x8_t  hshift    = vld1q_s16(hshift_t);
-        const int8x16_t  bshr      = vld1q_s8(bshr_t);
-        const uint8x16_t m31       = vdupq_n_u8(0x1f);
-        int blocks = (n - 9) >> 4;
-        for (int b = 0; b < blocks; ++b) {
-            uint8x16_t packed = vld1q_u8(bm + b * 10);
-            uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair_shuf));
-            x = vshlq_u16(x, hshift);
-            uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), bshr);
-            uint8x16_t idx = vandq_u8(y, m31);
-            vst1q_u8(symbols + (b << 4), vqtbl2q_u8(c2s_vec, idx));
-        }
-        i = blocks << 4;
-    }
-    for (; i + 8 <= n; i += 8) {
-        uint8x8_t codes = flat_d5_unpack_safe(bm + ((i * 5) >> 3));
-        uint8x8_t syms  = vqtbl2_u8(c2s_vec, codes);
-        vst1_u8(symbols + i, syms);
-    }
-    for (; i < n; i++) {
-        uint32_t code = extract_D_bits_neon(bm, i * 5, 5);
-        symbols[i] = c2s[code];
+    static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 2,3, 3,4, 5,6, 6,7, 7,8, 8,9 };
+    static const int16_t hshift_t[8]     = { 3, 1, -1, -3, 3, 1, -1, -3 };
+    static const int8_t  bshr_t[16]      = { -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0 };
+    const uint8x16_t pair_shuf = vld1q_u8(pair_shuf_t);
+    const int16x8_t  hshift    = vld1q_s16(hshift_t);
+    const int8x16_t  bshr      = vld1q_s8(bshr_t);
+    const uint8x16_t m31       = vdupq_n_u8(0x1f);
+    for (int i = 0; i < n; i += 16) {
+        uint8x16_t packed = vld1q_u8(bm + ((i * 5) >> 3));
+        uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair_shuf));
+        x = vshlq_u16(x, hshift);
+        uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), bshr);
+        uint8x16_t idx = vandq_u8(y, m31);
+        vst1q_u8(symbols + i, vqtbl2q_u8(c2s_vec, idx));
     }
 }
 
 /* D=6: same pair-gather as D=5 (12-bit pairs, even/odd in one u16 lane), but
- * the c2s is 64 bytes so the scatter is vqtbl4q.  Setup gated; stock safe tail. */
+ * the c2s is 64 bytes so the scatter is vqtbl4q.  Tail-free: one loop,
+ * 16 codes / 12 bytes per iter, straight past n. */
 static inline void merge_flat_d6_neon(uint8_t *symbols, int n,
                                                 const uint8_t *bm,
                                                 const uint8_t *c2s)
@@ -530,40 +397,36 @@ static inline void merge_flat_d6_neon(uint8_t *symbols, int n,
     c2s_vec.val[1] = vld1q_u8(c2s + 16);
     c2s_vec.val[2] = vld1q_u8(c2s + 32);
     c2s_vec.val[3] = vld1q_u8(c2s + 48);
-    int i = 0;
-    if (n >= 24) {
-        static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
-        static const int16_t hshift_t[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
-        static const int8_t  bshr_t[16]      = { -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0 };
-        const uint8x16_t pair_shuf = vld1q_u8(pair_shuf_t);
-        const int16x8_t  hshift    = vld1q_s16(hshift_t);
-        const int8x16_t  bshr      = vld1q_s8(bshr_t);
-        const uint8x16_t m63       = vdupq_n_u8(0x3f);
-        int blocks = (n - 8) >> 4;
-        for (int b = 0; b < blocks; ++b) {
-            uint8x16_t packed = vld1q_u8(bm + b * 12);
-            uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair_shuf));
-            x = vshlq_u16(x, hshift);
-            uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), bshr);
-            uint8x16_t idx = vandq_u8(y, m63);
-            vst1q_u8(symbols + (b << 4), vqtbl4q_u8(c2s_vec, idx));
-        }
-        i = blocks << 4;
-    }
-    for (; i + 8 <= n; i += 8) {
-        uint8x8_t codes = flat_d6_unpack_safe(bm + ((i * 6) >> 3));
-        uint8x8_t syms  = vqtbl4_u8(c2s_vec, codes);
-        vst1_u8(symbols + i, syms);
-    }
-    for (; i < n; i++) {
-        uint32_t code = extract_D_bits_neon(bm, i * 6, 6);
-        symbols[i] = c2s[code];
+    static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
+    static const int16_t hshift_t[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
+    static const int8_t  bshr_t[16]      = { -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0 };
+    const uint8x16_t pair_shuf = vld1q_u8(pair_shuf_t);
+    const int16x8_t  hshift    = vld1q_s16(hshift_t);
+    const int8x16_t  bshr      = vld1q_s8(bshr_t);
+    const uint8x16_t m63       = vdupq_n_u8(0x3f);
+    for (int i = 0; i < n; i += 16) {
+        uint8x16_t packed = vld1q_u8(bm + ((i * 6) >> 3));
+        uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair_shuf));
+        x = vshlq_u16(x, hshift);
+        uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), bshr);
+        uint8x16_t idx = vandq_u8(y, m63);
+        vst1q_u8(symbols + i, vqtbl4q_u8(c2s_vec, idx));
     }
 }
 
 /* D=7: 128-entry c2s = 2 * vqtbl4 (= 64).  vqtbl4 on the low half +
  * vqtbx4 on the high half (with code-64 indexing) — vqtbx keeps the
- * first result for out-of-range lanes, so no OR-merge needed. */
+ * first result for out-of-range lanes, so no OR-merge needed.
+ *
+ * Tail-free single loop, 16 codes / 14 bytes per iter: codes 8..15 span
+ * bytes 7..13 of the SAME 16-byte load (7 bytes per 8 codes), so a
+ * second shuffle table (flat_d7_shuf_tab + 7 on every index) replaces
+ * the former second load; the per-code shifts are periodic so the u16
+ * shift vector is shared.  vuzp1 takes each u16 lane's low byte,
+ * interleaving the two halves back into code order. */
+static const uint8_t flat_d7_shuf_hi_tab[16] = {
+    7,8,  7,8,  8,9,  9,10,  10,11,  11,12,  12,13,  13,13
+};
 static inline void merge_flat_d7_neon(uint8_t *symbols, int n,
                                                 const uint8_t *bm,
                                                 const uint8_t *c2s)
@@ -573,33 +436,23 @@ static inline void merge_flat_d7_neon(uint8_t *symbols, int n,
     lo.val[2] = vld1q_u8(c2s + 32);  lo.val[3] = vld1q_u8(c2s + 48);
     hi.val[0] = vld1q_u8(c2s + 64);  hi.val[1] = vld1q_u8(c2s + 80);
     hi.val[2] = vld1q_u8(c2s + 96);  hi.val[3] = vld1q_u8(c2s + 112);
-    uint8x16_t sub64q = vdupq_n_u8(64);
-    uint8x8_t  sub64  = vdup_n_u8(64);
-    int i = 0;
-    int fast_end = n >= 24 ? n - 24 : 0;
-    for (; i + 16 <= fast_end; i += 16) {
-        uint8x8_t cl = flat_d7_unpack_fast(bm + ((i      * 7) >> 3));
-        uint8x8_t ch = flat_d7_unpack_fast(bm + (((i + 8) * 7) >> 3));
-        uint8x16_t codes = vcombine_u8(cl, ch);
+    const uint8x16_t sub64q  = vdupq_n_u8(64);
+    const uint8x16_t shuf_lo = vld1q_u8(flat_d7_shuf_tab);
+    const uint8x16_t shuf_hi = vld1q_u8(flat_d7_shuf_hi_tab);
+    const int16x8_t  shifts  = vld1q_s16(flat_d7_shift_tab);
+    const uint8x16_t m127    = vdupq_n_u8(0x7f);
+    for (int i = 0; i < n; i += 16) {
+        uint8x16_t v = vld1q_u8(bm + ((i * 7) >> 3));
+        uint16x8_t wl = vreinterpretq_u16_u8(vqtbl1q_u8(v, shuf_lo));
+        uint16x8_t wh = vreinterpretq_u16_u8(vqtbl1q_u8(v, shuf_hi));
+        wl = vshlq_u16(wl, shifts);
+        wh = vshlq_u16(wh, shifts);
+        uint8x16_t codes = vandq_u8(
+            vuzp1q_u8(vreinterpretq_u8_u16(wl), vreinterpretq_u8_u16(wh)),
+            m127);
         uint8x16_t s = vqtbl4q_u8(lo, codes);
         s = vqtbx4q_u8(s, hi, vsubq_u8(codes, sub64q));
         vst1q_u8(symbols + i, s);
-    }
-    for (; i + 8 <= fast_end; i += 8) {
-        uint8x8_t codes = flat_d7_unpack_fast(bm + ((i * 7) >> 3));
-        uint8x8_t s = vqtbl4_u8(lo, codes);
-        s = vqtbx4_u8(s, hi, vsub_u8(codes, sub64));
-        vst1_u8(symbols + i, s);
-    }
-    for (; i + 8 <= n; i += 8) {
-        uint8x8_t codes = flat_d7_unpack_safe(bm + ((i * 7) >> 3));
-        uint8x8_t s = vqtbl4_u8(lo, codes);
-        s = vqtbx4_u8(s, hi, vsub_u8(codes, sub64));
-        vst1_u8(symbols + i, s);
-    }
-    for (; i < n; i++) {
-        uint32_t code = extract_D_bits_neon(bm, i * 7, 7);
-        symbols[i] = c2s[code];
     }
 }
 
@@ -1065,27 +918,76 @@ PIVCO_PRIM_ALWAYS_INLINE void prim_enc_pack_dN(const uint8_t *ranks,
                                              int n, int D, uint8_t base, uint8_t *out_packed)
 { pack_dN_neon(out_packed, ranks, n, D, base); }
 
+/* ---- Decode aliases: tail-free kernels behind a save/restore guard ----
+ *
+ * The kernels store ceil(K/16)*16 bytes, spilling up to 15 garbage
+ * bytes past out+K when K isn't chunk-aligned.  Instead of a padding
+ * contract on every buffer, the alias saves the 16 bytes at out+K
+ * before the kernel and restores them after — the net effect is an
+ * EXACT K-byte write into any buffer whose next 16 bytes are merely
+ * mapped and owned by us (all decode scratch).
+ *
+ * Aligned calls (K % 16 == 0) spill nothing and SKIP the guard — that
+ * is a correctness requirement, not an optimization: the root merge
+ * targets the caller's `symbols` with K == N aligned, where even a
+ * transient touch of symbols[N..N+16) would be out of bounds (and a
+ * data race under concurrent neighbors).  Unaligned-N roots bounce the
+ * whole block through the arena instead (see codec.c).  The kernels'
+ * SOURCE overreads are unaffected (reads need mapped memory only —
+ * arena slack / in_end bouncing). */
 PIVCO_PRIM_ALWAYS_INLINE void prim_merge_flat(uint8_t *out, int n,
                                                           const uint8_t *bm, int D,
                                                           const uint8_t *c2s)
-{ merge_flat_neon(out, n, bm, D, c2s); }
+{
+    if (n & 15) {
+        uint8x16_t saved = vld1q_u8(out + n);
+        merge_flat_neon(out, n, bm, D, c2s);
+        vst1q_u8(out + n, saved);
+    } else {
+        merge_flat_neon(out, n, bm, D, c2s);
+    }
+}
 
 PIVCO_PRIM_ALWAYS_INLINE void prim_merge_cst_cst(const uint8_t *bm, int K,
                                                       uint8_t left_sym,
                                                       uint8_t right_sym,
                                                       uint8_t *out)
-{ merge_cst_cst_neon(bm, K, left_sym, right_sym, out); }
+{
+    if (K & 15) {
+        uint8x16_t saved = vld1q_u8(out + K);
+        merge_cst_cst_neon(bm, K, left_sym, right_sym, out);
+        vst1q_u8(out + K, saved);
+    } else {
+        merge_cst_cst_neon(bm, K, left_sym, right_sym, out);
+    }
+}
 
 PIVCO_PRIM_ALWAYS_INLINE void prim_merge_cst_vec(const uint8_t *bm, int K,
                                                           uint8_t left_sym,
                                                           const uint8_t *right_buf,
                                                           uint8_t *out)
-{ merge_cst_vec_neon(bm, K, left_sym, right_buf, out); }
+{
+    if (K & 15) {
+        uint8x16_t saved = vld1q_u8(out + K);
+        merge_cst_vec_neon(bm, K, left_sym, right_buf, out);
+        vst1q_u8(out + K, saved);
+    } else {
+        merge_cst_vec_neon(bm, K, left_sym, right_buf, out);
+    }
+}
 
 PIVCO_PRIM_ALWAYS_INLINE void prim_merge_vec_vec(const uint8_t *bm, int K,
                                                const uint8_t *left_buf,
                                                const uint8_t *right_buf,
                                                uint8_t *out)
-{ merge_vec_vec_neon(bm, K, left_buf, right_buf, out); }
+{
+    if (K & 15) {
+        uint8x16_t saved = vld1q_u8(out + K);
+        merge_vec_vec_neon(bm, K, left_buf, right_buf, out);
+        vst1q_u8(out + K, saved);
+    } else {
+        merge_vec_vec_neon(bm, K, left_buf, right_buf, out);
+    }
+}
 
 #endif  /* PIVCO_HUFFMAN_PRIMITIVES_NEON_H */
