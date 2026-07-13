@@ -431,11 +431,30 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         size_t nb = ((size_t)K * (size_t)D + 7) >> 3;
         if ((size_t)(end - p) < nb) return NULL;
         const uint8_t *c2s = t->rank_to_sym + rec->param;
-        for (j = 0; j < K; j++) {
+        /* 8 codes consume exactly D whole bytes, so the bit phase repeats
+         * per group: one unaligned 64-bit load covers all 8 (8D <= 64)
+         * and the cursor steps D bytes — no per-D dispatch.  The load
+         * reads 8 bytes but consumes D, so run while 8 bytes remain in
+         * the INPUT (not the region); the bit-cursor loop finishes. */
+        const uint8_t *q = p;
+        unsigned msk = (1u << D) - 1;
+        for (j = 0; j + 8 <= K && end - q >= 8; j += 8, q += D) {
+            uint64_t v;
+            memcpy(&v, q, 8);
+            out[j]     = c2s[ v            & msk];
+            out[j + 1] = c2s[(v >> D)      & msk];
+            out[j + 2] = c2s[(v >> (2*D))  & msk];
+            out[j + 3] = c2s[(v >> (3*D))  & msk];
+            out[j + 4] = c2s[(v >> (4*D))  & msk];
+            out[j + 5] = c2s[(v >> (5*D))  & msk];
+            out[j + 6] = c2s[(v >> (6*D))  & msk];
+            out[j + 7] = c2s[(v >> (7*D))  & msk];
+        }
+        for (; j < K; j++) {
             int bit = j * D, off = bit & 7;
             unsigned v = p[bit >> 3];
             if (off + D > 8) v |= (unsigned)p[(bit >> 3) + 1] << 8;
-            out[j] = c2s[(v >> off) & ((1u << D) - 1)];
+            out[j] = c2s[(v >> off) & msk];
         }
         return p + nb;
     }
