@@ -39,7 +39,7 @@ static int cmp_d(const void *a, const void *b)
 static uint8_t buf[TOTAL], dec[TOTAL + 64];
 static uint8_t enc[(TOTAL / BLK) * (2 * BLK)];
 static size_t  off[TOTAL / BLK + 1];
-static uint8_t mscratch[PIVCOH_SCRATCH_SIZE(BLK)];
+static uint8_t mscratch[PIVCOH_DECODE_SCRATCH_SIZE(BLK)];
 
 typedef void (*sweep_fn)(const pivco_huffman_table_t *, const pivcoh_table *,
                          int nblk);

@@ -37,10 +37,12 @@
  * concatenated; pivcoh_decode reports the consumed byte count.
  *
  * The trailing `scratch` parameter of encode/decode may be NULL (malloc
- * is used internally) or a caller buffer of PIVCOH_SCRATCH_SIZE(max_n)
- * bytes for allocation-free operation.  Tables and scratch are plain
- * memory: no cleanup calls, safe to copy, const tables are shareable
- * across threads (encode/decode themselves touch only their arguments).
+ * is used internally) or a caller buffer for allocation-free operation:
+ * PIVCOH_SCRATCH_SIZE(max_n) bytes always suffices, and decode-only
+ * callers can pass the smaller PIVCOH_DECODE_SCRATCH_SIZE(max_n).
+ * Tables and scratch are plain memory: no cleanup calls, safe to copy,
+ * const tables are shareable across threads (encode/decode themselves
+ * touch only their arguments).
  *
  * Encoding a symbol whose frequency/length was zero produces a valid but
  * meaningless stream (never memory-unsafe).  Encode's SIMD packers may
@@ -71,12 +73,21 @@
  * bits/symbol plus per-node headers and byte rounding). */
 #define PIVCOH_ENCODE_BOUND(n)  ((11 * (size_t)(n) + 7) / 8 + 1024)
 
-/* Scratch bytes for encode or decode of blocks up to n symbols.  Sized
- * like the production arenas: the decoder carves both children of every
- * node from a bump arena (<= n bytes per tree level, max 11 levels, plus
- * read-ahead slack for the unguarded merge kernels); the encoder needs a
- * ranks buffer (n + 64) plus one right-half per recursion level. */
+/* Scratch bytes for encode or decode of blocks up to n symbols.  The
+ * encoder dominates: a ranks buffer (n + 64) plus one right-half per
+ * recursion level (max 11 levels), like the production arena. */
 #define PIVCOH_SCRATCH_SIZE(n)  (13 * (size_t)(n) + 128)
+
+/* Scratch bytes for DECODE ONLY of blocks up to n symbols.  The decode
+ * walk ping-pongs children through (out, partner) buffer pairs instead
+ * of growing an arena, so a valid stream touches at most 1.5n + 128
+ * bytes (the root's children plus the largest partner).  The other
+ * 0.5n is hostile-input headroom: a bitmap that lies about its K_right
+ * can walk a merge cursor up to K bytes past its side before the
+ * end-of-merge check rejects the stream, and keeping that in-bounds by
+ * padding is free where in-loop cursor guards would cost ~2% decode
+ * speed.  PIVCOH_SCRATCH_SIZE also always suffices. */
+#define PIVCOH_DECODE_SCRATCH_SIZE(n)  (2 * (size_t)(n) + 128)
 
 typedef struct { uint8_t kd, param, right; } pivcoh__rec;
 
@@ -915,16 +926,36 @@ static inline const uint8_t *pivcoh__read_bm(const uint8_t **bm, int K,
     return p + nb;
 }
 
-/* Returns the advanced input pointer, or NULL on truncated/structurally
- * invalid input.  out receives exactly K bytes.  `top` is the bump-arena
- * cursor for child buffers; both children of every node decode into
- * disjoint carves and the merge writes them back to out — the production
- * placement.  Along any recursion path the carves total <= 10*N, plus
- * the merge kernels' bounded read/scribble slack (see the kernel section
- * comment), all absorbed by PIVCOH_SCRATCH_SIZE's 13n + 128.  A FLAT
- * node never touches the arena (so a flat root runs scratch-free). */
-static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t *out,
-                                  const uint8_t *p, const uint8_t *end, uint8_t *top)
+/* Interior walk: decodes a subtree's K symbols into out[0,K), returning
+ * the advanced input pointer or NULL on invalid input.  The wire is in
+ * decode order (K_right at node entry, children larger-K first, the
+ * marker+bitmap at the node's post-order position, read right at merge
+ * time), so the input cursor moves strictly forward, single-touch.
+ *
+ * Scratch placement is a two-buffer ping-pong (out, tmp):
+ *
+ *   - the LARGER child decodes IN PLACE into out's tail out[K_small, K):
+ *     safe under the merge, whose write cursor cannot overtake its
+ *     tail-side read cursor — by the time it writes out[i] it has
+ *     consumed at least i - K_small tail bytes (on a bitmap that lies,
+ *     the merge's memory use stays inside the arena bound and the r_end
+ *     check reports -1; whatever garbage was written is discarded);
+ *   - the SMALLER child decodes into tmp[0, K_small), and its own
+ *     recursion uses out's still-empty prefix out[0, K_small) as ITS
+ *     partner — the pair (tmp, out-prefix) ping-pongs down the
+ *     smaller-child spine instead of growing an arena.
+ *
+ * The caller guarantees tmp capacity floor(K/2): a smaller child is at
+ * most floor(K/2), and everything its subtree puts in ITS partner stays
+ * inside out[0, K_small), by induction.  A subtree's whole valid-stream
+ * footprint is out[0,K) plus at most floor(K/2) partner bytes plus the
+ * kernels' read/scribble slack; PIVCOH_DECODE_SCRATCH_SIZE's extra pad
+ * absorbs a lying bitmap's bounded pre-detection strays (kernel section
+ * comment).  A FLAT node never touches tmp (so a flat root runs
+ * scratch-free). */
+static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K,
+                                  uint8_t *out, uint8_t *tmp,
+                                  const uint8_t *p, const uint8_t *end)
 {
     const pivcoh__rec *rec = &t->sched[idx];
     int kind = rec->kd & 3;
@@ -936,10 +967,6 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         pivcoh__merge_flat(out, K, p, D, t->rank_to_sym + rec->param);
         return p + nb;
     }
-    /* Decode-order record (wire v0.7): K_right here at node entry, the
-     * children's regions next (larger-K first), the marker+bitmap at the
-     * node's post-order position — read right at merge time, so the
-     * input cursor moves strictly forward, single-touch. */
     if (end - p < 2) return NULL;
     int KR = p[0] | p[1] << 8;
     if (KR > K) return NULL;
@@ -947,9 +974,8 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
     int KL = K - KR;
 
     if (kind == PIVCOH__LEAFL) {               /* left = lone leaf */
-        uint8_t *rbuf = top;
-        top += KR;
-        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, p, end, top)))
+        uint8_t *rbuf = out + KL;              /* the one child, in place */
+        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, tmp, p, end)))
             return NULL;
         const uint8_t *bm;
         if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
@@ -957,22 +983,24 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
             return NULL;
         return p;
     }
-    uint8_t *lbuf = top, *rbuf = top + KL;     /* FULL: both children internal */
-    top += K;
-    if (KR > KL) {                             /* stream order: larger first */
-        if (!(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, p, end, top)))
+    /* FULL: both children internal, larger first on the wire. */
+    if (KR > KL) {
+        if (!(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, tmp, p, end)))
             return NULL;
-        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, lbuf, p, end, top)))
+        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, tmp, out, p, end)))
             return NULL;
+        const uint8_t *bm;
+        if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
+        if (pivcoh__merge_vec_vec(bm, K, tmp, KL, out + KL, KR, out)) return NULL;
     } else {
-        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, lbuf, p, end, top)))
+        if (!(p = pivcoh__dec(t, idx + 1, KL, out + KR, tmp, p, end)))
             return NULL;
-        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, p, end, top)))
+        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, tmp, out, p, end)))
             return NULL;
+        const uint8_t *bm;
+        if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
+        if (pivcoh__merge_vec_vec(bm, K, out + KR, KL, tmp, KR, out)) return NULL;
     }
-    const uint8_t *bm;
-    if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
-    if (pivcoh__merge_vec_vec(bm, K, lbuf, KL, rbuf, KR, out)) return NULL;
     return p;
 }
 
@@ -1010,23 +1038,33 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
     p += 2;
     int KL = N - KR;
     uint8_t *sc = scratch ? (uint8_t *)scratch
-                          : (uint8_t *)malloc(PIVCOH_SCRATCH_SIZE(N));
+                          : (uint8_t *)malloc(PIVCOH_DECODE_SCRATCH_SIZE(N));
     if (!sc) return -1;
     const uint8_t *bm;
 
     if (kind == PIVCOH__LEAFL) {
-        if (KR > 0) p = pivcoh__dec(t, root->right, KR, sc, p, end, sc + KR);
+        /* One internal child: it decodes at the arena base with the
+         * space after it as ping-pong partner. */
+        if (KR > 0) p = pivcoh__dec(t, root->right, KR, sc, sc + KR, p, end);
         if (p && (p = pivcoh__read_bm(&bm, N, p, end)) != NULL &&
             pivcoh__merge_cst_vec_x(bm, N, t->rank_to_sym[root->param], sc, KR, out))
             p = NULL;
     } else {
-        uint8_t *lbuf = sc, *rbuf = sc + KL, *top = sc + N;
+        /* FULL root, hybrid hole-reuse: both children decode into the
+         * arena's first N bytes, [larger | smaller].  The larger child
+         * (first on the wire) borrows the smaller sibling's still-empty
+         * slot as its partner — spilling past N only when a spine
+         * smaller-child outgrows it — and the smaller child follows
+         * with a fresh partner beyond N. */
+        uint8_t *lbuf, *rbuf;
         if (KR > KL) {
-            p = pivcoh__dec(t, root->right, KR, rbuf, p, end, top);
-            if (p && KL > 0) p = pivcoh__dec(t, 1, KL, lbuf, p, end, top);
+            rbuf = sc; lbuf = sc + KR;
+            p = pivcoh__dec(t, root->right, KR, rbuf, lbuf, p, end);
+            if (p && KL > 0) p = pivcoh__dec(t, 1, KL, lbuf, sc + N, p, end);
         } else {
-            p = pivcoh__dec(t, 1, KL, lbuf, p, end, top);
-            if (p && KR > 0) p = pivcoh__dec(t, root->right, KR, rbuf, p, end, top);
+            lbuf = sc; rbuf = sc + KL;
+            p = pivcoh__dec(t, 1, KL, lbuf, rbuf, p, end);
+            if (p && KR > 0) p = pivcoh__dec(t, root->right, KR, rbuf, sc + N, p, end);
         }
         if (p && (p = pivcoh__read_bm(&bm, N, p, end)) != NULL &&
             pivcoh__merge_vec_vec_x(bm, N, lbuf, KL, rbuf, KR, out))

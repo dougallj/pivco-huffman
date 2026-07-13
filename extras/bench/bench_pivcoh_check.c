@@ -24,7 +24,10 @@ static uint64_t rng(void)
 static pivco_huffman_table_t ref_table;
 static pivcoh_table mini, mini2;
 static uint8_t blk[8192], enc_ref[65536], enc_mini[65536], dec_buf[8192];
-static uint8_t scratch[PIVCOH_SCRATCH_SIZE(8192)];
+static uint8_t scratch[PIVCOH_SCRATCH_SIZE(8192)];         /* encode */
+static uint8_t dscratch[PIVCOH_DECODE_SCRATCH_SIZE(8192)]; /* decode: the tight
+                                                              bound, so ASan
+                                                              enforces it */
 static int n_tables, n_blocks, n_fuzz;
 
 #define FAIL(...) do { fprintf(stderr, "FAIL %s/%d: ", tag, id); \
@@ -72,7 +75,7 @@ static void one_case(const uint64_t freq[256], const char *tag, int id)
         /* mini decodes ref stream; ref decodes mini stream; consumed exact */
         size_t cons = 0;
         memset(dec_buf, 0xAA, N);
-        ptrdiff_t dn = pivcoh_decode(&mini, enc_ref, ref_len, dec_buf, sizeof(dec_buf), &cons, scratch);
+        ptrdiff_t dn = pivcoh_decode(&mini, enc_ref, ref_len, dec_buf, sizeof(dec_buf), &cons, dscratch);
         if (dn != (ptrdiff_t)N || cons != ref_len || memcmp(dec_buf, blk, N)) {
             size_t mm = 0;
             while (mm < N && dec_buf[mm] == blk[mm]) mm++;
@@ -89,9 +92,9 @@ static void one_case(const uint64_t freq[256], const char *tag, int id)
         for (int f = 0; f < 40; f++) {
             memcpy(enc_mini, enc_ref, ref_len);
             enc_mini[rng() % ref_len] ^= (uint8_t)(1u << (rng() & 7));
-            (void)pivcoh_decode(&mini, enc_mini, ref_len, dec_buf, sizeof(dec_buf), NULL, scratch);
+            (void)pivcoh_decode(&mini, enc_mini, ref_len, dec_buf, sizeof(dec_buf), NULL, dscratch);
             (void)pivcoh_decode(&mini, enc_ref, rng() % (ref_len + 1), dec_buf,
-                                sizeof(dec_buf), NULL, scratch);
+                                sizeof(dec_buf), NULL, dscratch);
             n_fuzz += 2;
         }
     }
