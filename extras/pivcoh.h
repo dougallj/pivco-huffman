@@ -378,8 +378,8 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
 /* ---- decode ---- */
 
 #ifdef PIVCOH__NEON
-/* Port of the production merge_vec_vec_neon 64 B/iter core: one 2-source
- * vqtbl2q over {R16, L16} per 16-byte chunk, cross-half cursor offset
+/* Port of the production merge_vec_vec_neon 16-byte kernel: one 2-source
+ * vqtbl2q over {R16, L16} per 16 outputs, cross-half cursor offset
  * folded into the index by SABD (|shuf0 - shuf1|).  The two 256x16 index
  * tables (8 KiB) build lazily on first decode; the writes are idempotent,
  * so concurrent first decodes are benign. */
@@ -486,27 +486,22 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
     int li = 0, ri = 0;
     j = 0;
 #ifdef PIVCOH__NEON
-    /* The entry guard bounds every 16-byte load to the cursors' next 64
-     * bytes (chunk c reads at most cursor + 63), covers the in-place
-     * overlap the same way the scalar argument does (the store never
-     * passes the still-unread tail while cursor + 64 <= side count),
-     * and keeps li/ri <= KL/KR so hostile-bitmap validation still lands
-     * in the scalar tail.  No slack bytes needed anywhere. */
-    while (j + 64 <= K && li + 64 <= KL && ri + 64 <= KR) {
-        uint64_t mask;
-        memcpy(&mask, bm + (j >> 3), 8);
-        uint64_t pfx = vget_lane_u64(vreinterpret_u64_u8(
-                           vcnt_u8(vcreate_u8(mask))), 0)
-                       * 0x0101010101010101ull;
-        int p0 = (int)((pfx >> 8) & 0xff), p1 = (int)((pfx >> 24) & 0xff);
-        int p2 = (int)((pfx >> 40) & 0xff), p3 = (int)(pfx >> 56);
-        pivcoh__merge16(out + j,      L + li,           R + ri,      mask);
-        pivcoh__merge16(out + j + 16, L + li + 16 - p0, R + ri + p0, mask >> 16);
-        pivcoh__merge16(out + j + 32, L + li + 32 - p1, R + ri + p1, mask >> 32);
-        pivcoh__merge16(out + j + 48, L + li + 48 - p2, R + ri + p2, mask >> 48);
-        li += 64 - p3;
-        ri += p3;
-        j += 64;
+    /* The entry guard bounds the two 16-byte loads to the cursors' next
+     * 16 bytes, covers the in-place overlap the same way the scalar
+     * argument does (the store never passes the still-unread tail while
+     * cursor + 16 <= side count), and keeps li/ri <= KL/KR so hostile-
+     * bitmap validation still lands in the scalar tail.  No slack bytes
+     * needed anywhere.  16 bits/iter measured FASTER than 32/64-bit
+     * unrolls of the same kernel on M4 (the finer guard keeps more
+     * skewed and small nodes on the vector path), and smaller. */
+    while (j + 16 <= K && li + 16 <= KL && ri + 16 <= KR) {
+        uint16_t mask;
+        memcpy(&mask, bm + (j >> 3), 2);
+        int pt = __builtin_popcount(mask);
+        pivcoh__merge16(out + j, L + li, R + ri, mask);
+        li += 16 - pt;
+        ri += pt;
+        j += 16;
     }
 #endif
     for (; j < K; j++) {
