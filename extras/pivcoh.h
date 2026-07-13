@@ -485,38 +485,25 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
      * can never pass its tail-side read cursor (j = li+ri <= tail0+ti, with
      * equality a self-copy; the li/ri guards keep hostile bitmaps inside). */
     int KL = K - KR;
-    if (kind == PIVCOH__LEAFL) {               /* left = KL copies of one leaf */
-        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, p, end, partner)))
-            return NULL;
-        uint8_t ls = t->rank_to_sym[rec->param];
-        int r = 0;
-        j = 0;
-        /* Shift-register groups, one-sided: the left "register" is the
-         * constant.  The register snapshot makes the in-place overlap
-         * with out's tail harmless within a group; r + 8 <= KR bounds
-         * the load, and the checked tail + final r == KR keep hostile
-         * bitmaps memory-safe and rejected. */
-        while (j + 8 <= K && r + 8 <= KR) {
-            unsigned m = bm[j >> 3];
-            uint64_t rv;
-            memcpy(&rv, out + KL + r, 8);
-#define PIVCOH__STEP(k) do { unsigned b_ = (m >> (k)) & 1; \
-            out[j + (k)] = b_ ? (uint8_t)rv : ls;          \
-            rv >>= b_ << 3; } while (0)
-            PIVCOH__STEP(0); PIVCOH__STEP(1); PIVCOH__STEP(2); PIVCOH__STEP(3);
-            PIVCOH__STEP(4); PIVCOH__STEP(5); PIVCOH__STEP(6); PIVCOH__STEP(7);
-#undef PIVCOH__STEP
-            r += pivcoh__pc8(m);
-            j += 8;
-        }
-        for (; j < K; j++) {
-            if (PIVCOH__BIT(j)) { if (r == KR) return NULL; out[j] = out[KL + r]; r++; }
-            else out[j] = ls;
-        }
-        return r == KR ? p : NULL;             /* bitmap must match K_right */
-    }
     const uint8_t *L, *R;
-    if (KL >= KR) {
+    if (kind == PIVCOH__LEAFL) {               /* left = KL copies of one leaf */
+        /* memset the run exactly where a decoded left child would land,
+         * then share the ordinary merge below — smaller than a dedicated
+         * constant-side merge, and LEAF_LEFT nodes get the optimized
+         * merge kernels for free. */
+        uint8_t ls = t->rank_to_sym[rec->param];
+        if (KL >= KR) {
+            if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, partner, p, end, out)))
+                return NULL;
+            memset(out + KR, ls, (size_t)KL);
+            L = out + KR; R = partner;
+        } else {
+            if (!(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, p, end, partner + KL)))
+                return NULL;
+            memset(partner, ls, (size_t)KL);
+            L = partner; R = out + KL;
+        }
+    } else if (KL >= KR) {
         if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, out + KR, p, end, partner)))
             return NULL;
         if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, partner, p, end, out)))
