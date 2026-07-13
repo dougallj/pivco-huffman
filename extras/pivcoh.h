@@ -523,6 +523,30 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         j += 16;
     }
 #endif
+    /* Branch-free scalar groups: 8 elements off one mask byte.  Both
+     * sides load 8 bytes into shift registers; each element selects the
+     * low byte of one and shifts the consumed side by 8 — conditional
+     * moves, no data-dependent branches (8x the branchy loop on random
+     * bitmaps, and faster than it even on fully predictable ones).
+     * Same guard/tail contract as the NEON loop, at 8-byte grain. */
+    while (j + 8 <= K && li + 8 <= KL && ri + 8 <= KR) {
+        unsigned m = bm[j >> 3], pc;
+        uint64_t lv, rv;
+        memcpy(&lv, L + li, 8);
+        memcpy(&rv, R + ri, 8);
+#define PIVCOH__STEP(k) do { unsigned b_ = (m >> (k)) & 1; \
+        out[j + (k)] = (uint8_t)(b_ ? rv : lv);            \
+        rv >>= b_ << 3; lv >>= (b_ ^ 1) << 3; } while (0)
+        PIVCOH__STEP(0); PIVCOH__STEP(1); PIVCOH__STEP(2); PIVCOH__STEP(3);
+        PIVCOH__STEP(4); PIVCOH__STEP(5); PIVCOH__STEP(6); PIVCOH__STEP(7);
+#undef PIVCOH__STEP
+        pc = m - ((m >> 1) & 0x55);                /* SWAR byte popcount */
+        pc = (pc & 0x33) + ((pc >> 2) & 0x33);
+        pc = (pc + (pc >> 4)) & 0x0f;
+        li += 8 - (int)pc;
+        ri += (int)pc;
+        j += 8;
+    }
     for (; j < K; j++) {
         if (PIVCOH__BIT(j)) { if (ri == KR) return NULL; out[j] = R[ri++]; }
         else               { if (li == KL) return NULL; out[j] = L[li++]; }
