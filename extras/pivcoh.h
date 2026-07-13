@@ -1,7 +1,11 @@
-/* pivcoh.h - v1.3 - minimal single-file PIVCO-Huffman block codec
+/* pivcoh.h - v1.4 - minimal single-file PIVCO-Huffman block codec
  *
- * A tiny, scalar, allocation-free-capable implementation of the
+ * A tiny, allocation-free-capable implementation of the
  * PIVCO-Huffman wire format (https://github.com/MarcinZukowski/pivco-huffman).
+ * Scalar throughout, except that on AArch64 the hot decode merge uses a
+ * NEON kernel (define PIVCOH_NO_NEON for pure scalar); the first decode
+ * then lazily builds an 8 KiB static shuffle table — the writes are
+ * idempotent, so concurrent first decodes are benign.
  * Streams are byte-identical to the full library's PH-only mode (raw
  * bitmaps — pivco_huffman_set_fse_enabled(0), which is also what the
  * pivcohuf tool's default non-ANS format uses; "optimized" tree shaping,
@@ -114,6 +118,11 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
 
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__aarch64__) && !defined(PIVCOH_NO_NEON)
+#define PIVCOH__NEON 1
+#include <arm_neon.h>
+#endif
 
 #define PIVCOH__MAXLEN 11
 enum { PIVCOH__FULL = 0, PIVCOH__FLAT = 1, PIVCOH__LEAFL = 3 };
@@ -398,6 +407,46 @@ static const uint8_t *pivcoh__skip(const pivcoh_table *t, int idx, int K,
     return KR > 0 ? pivcoh__skip(t, idx + rec->right, KR, p, end) : p;
 }
 
+#ifdef PIVCOH__NEON
+/* Port of the production merge_vec_vec_neon 64 B/iter core: one 2-source
+ * vqtbl2q over {R16, L16} per 16-byte chunk, cross-half cursor offset
+ * folded into the index by SABD (|shuf0 - shuf1|).  The two 256x16 index
+ * tables (8 KiB) build lazily on first decode; the writes are idempotent,
+ * so concurrent first decodes are benign. */
+static int8_t pivcoh__shuf0[256 * 16] __attribute__((aligned(16)));
+static int8_t pivcoh__shuf1[256 * 16] __attribute__((aligned(16)));
+static void pivcoh__merge_tabs(void)
+{
+    static int built = 0;
+    if (built) return;
+    for (int m = 0; m < 256; m++) {
+        int8_t pop = 0;
+        int8_t *o0 = &pivcoh__shuf0[m * 16], *o1 = &pivcoh__shuf1[m * 16];
+        for (int k = 0; k < 8; k++) {
+            if ((m >> k) & 1) {
+                o0[k] = pop; o1[k + 8] = (int8_t)(-pop); pop++;
+            } else {
+                int8_t v = (int8_t)(-16 - k + pop);
+                o0[k] = v; o1[k + 8] = (int8_t)(8 - v);
+            }
+        }
+        for (int k = 0; k < 8; k++) { o0[k + 8] = pop; o1[k] = 0; }
+    }
+    built = 1;
+}
+static inline void pivcoh__merge16(uint8_t *dest, const uint8_t *l,
+                                   const uint8_t *r, uint64_t mask)
+{
+    int8x16_t s0 = vld1q_s8(&pivcoh__shuf0[(mask << 4) & 0xff0]);
+    int8x16_t s1 = vld1q_s8(&pivcoh__shuf1[(mask >> 4) & 0xff0]);
+    uint8x16_t shuf = vreinterpretq_u8_s8(vabdq_s8(s0, s1));
+    uint8x16x2_t src;
+    src.val[0] = vld1q_u8(r);
+    src.val[1] = vld1q_u8(l);
+    vst1q_u8(dest, vqtbl2q_u8(src, shuf));
+}
+#endif
+
 /* Returns the advanced input pointer, or NULL on malformed input.  out
  * receives exactly K symbols; partner must have capacity floor(K/2)
  * (see the placement note at the merge below). */
@@ -470,7 +519,32 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         L = partner; R = out + KL;
     }
     int li = 0, ri = 0;
-    for (j = 0; j < K; j++) {
+    j = 0;
+#ifdef PIVCOH__NEON
+    /* The entry guard bounds every 16-byte load to the cursors' next 64
+     * bytes (chunk c reads at most cursor + 63), covers the in-place
+     * overlap the same way the scalar argument does (the store never
+     * passes the still-unread tail while cursor + 64 <= side count),
+     * and keeps li/ri <= KL/KR so hostile-bitmap validation still lands
+     * in the scalar tail.  No slack bytes needed anywhere. */
+    while (j + 64 <= K && li + 64 <= KL && ri + 64 <= KR) {
+        uint64_t mask;
+        memcpy(&mask, bm + (j >> 3), 8);
+        uint64_t pfx = vget_lane_u64(vreinterpret_u64_u8(
+                           vcnt_u8(vcreate_u8(mask))), 0)
+                       * 0x0101010101010101ull;
+        int p0 = (int)((pfx >> 8) & 0xff), p1 = (int)((pfx >> 24) & 0xff);
+        int p2 = (int)((pfx >> 40) & 0xff), p3 = (int)(pfx >> 56);
+        pivcoh__merge16(out + j,      L + li,           R + ri,      mask);
+        pivcoh__merge16(out + j + 16, L + li + 16 - p0, R + ri + p0, mask >> 16);
+        pivcoh__merge16(out + j + 32, L + li + 32 - p1, R + ri + p1, mask >> 32);
+        pivcoh__merge16(out + j + 48, L + li + 48 - p2, R + ri + p2, mask >> 48);
+        li += 64 - p3;
+        ri += p3;
+        j += 64;
+    }
+#endif
+    for (; j < K; j++) {
         if (PIVCOH__BIT(j)) { if (ri == KR) return NULL; out[j] = R[ri++]; }
         else               { if (li == KL) return NULL; out[j] = L[li++]; }
     }
@@ -484,6 +558,9 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
                                   size_t *consumed, void *scratch)
 {
     if (!t || !in || !out || !t->num_ranks || in_len < 2) return -1;
+#ifdef PIVCOH__NEON
+    pivcoh__merge_tabs();
+#endif
     int N = in[0] | in[1] << 8;
     if (N < 1 || (size_t)N > out_cap) return -1;
     uint8_t *sc = scratch ? (uint8_t *)scratch : (uint8_t *)malloc(PIVCOH_DECODE_SCRATCH_SIZE(N));

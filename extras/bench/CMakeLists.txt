@@ -545,3 +545,8 @@ endif()
 add_executable(pivco_bench_pivcoh_check bench_pivcoh_check.c)
 target_include_directories(pivco_bench_pivcoh_check PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pivco_bench_pivcoh_check pivco_huffman)
+
+# Decode throughput of extras/pivcoh.h vs the production dispatch decoder.
+add_executable(pivco_bench_pivcoh_speed bench_pivcoh_speed.c ${BENCH_DIST})
+target_include_directories(pivco_bench_pivcoh_speed PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(pivco_bench_pivcoh_speed pivco_huffman m)
