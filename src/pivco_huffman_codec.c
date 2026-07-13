@@ -203,17 +203,25 @@ extern uint64_t g_pivco_fse_bytes_out[PIVCO_FSE_STATS_SLOTS];
 /* ---------- Backend → entry-point name ---------- */
 
 #if defined(PIVCO_BACKEND_SCALAR)
-#  define CODEC_ENCODE_ENTRY pivco_huffman_encode_scalar
-#  define CODEC_DECODE_ENTRY pivco_huffman_decode_scalar
+#  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_scalar
+#  define CODEC_ENCODE_CT_ENTRY pivco_huffman_encode_scalar_ct
+#  define CODEC_DECODE_ENTRY    pivco_huffman_decode_scalar
+#  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_scalar_dt
 #elif defined(PIVCO_BACKEND_NEON)
-#  define CODEC_ENCODE_ENTRY pivco_huffman_encode_neon
-#  define CODEC_DECODE_ENTRY pivco_huffman_decode_bu_neon
+#  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_neon
+#  define CODEC_ENCODE_CT_ENTRY pivco_huffman_encode_neon_ct
+#  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_neon
+#  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_neon_dt
 #elif defined(PIVCO_BACKEND_X86)
-#  define CODEC_ENCODE_ENTRY pivco_huffman_encode_x86
-#  define CODEC_DECODE_ENTRY pivco_huffman_decode_bu_x86
+#  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_x86
+#  define CODEC_ENCODE_CT_ENTRY pivco_huffman_encode_x86_ct
+#  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_x86
+#  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_x86_dt
 #elif defined(PIVCO_BACKEND_AVX512)
-#  define CODEC_ENCODE_ENTRY pivco_huffman_encode_avx512
-#  define CODEC_DECODE_ENTRY pivco_huffman_decode_bu_avx512
+#  define CODEC_ENCODE_ENTRY    pivco_huffman_encode_avx512
+#  define CODEC_ENCODE_CT_ENTRY pivco_huffman_encode_avx512_ct
+#  define CODEC_DECODE_ENTRY    pivco_huffman_decode_bu_avx512
+#  define CODEC_DECODE_DT_ENTRY pivco_huffman_decode_bu_avx512_dt
 #else
 #  error "pivco_huffman_codec.c needs PIVCO_BACKEND_{SCALAR,NEON,X86,AVX512}"
 #endif
@@ -385,11 +393,14 @@ static void codec_encode_node(const pivco_huffman_decode_table_t *table,
                        out_ptr, tmp + n_right);
 }
 
-int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
-                       const pivco_huffman_table_t *table,
-                       uint8_t *out, size_t *out_len)
+/* Shared encode body; the two public entries below differ only in where
+ * the three table pieces live. */
+static int codec_encode_core(const uint8_t *symbols, size_t n,
+                             const pivco_huffman_decode_table_t *table,
+                             const uint8_t *sym_to_rank,
+                             const pivco_huffman_enc_init_aux_t *aux,
+                             uint8_t *out, size_t *out_len)
 {
-    if (!symbols || !table || !out || !out_len) return PIVCO_ERR_NULL;
     if (n == 0 || n > PIVCO_WIRE_MAX_N) return PIVCO_ERR_OVERFLOW;
     prim_codec_init();
 
@@ -414,13 +425,31 @@ int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
     /* ranks[i] = in-order rank of symbols[i] (gather table->sym_to_rank). */
     PROF_COUNT_ONLY(PROF_ENC_ENTRY, N);
     PROF_TIC();
-    prim_enc_init(ranks, N, symbols, table->sym_to_rank, &table->enc_init_aux);
+    prim_enc_init(ranks, N, symbols, sym_to_rank, aux);
     PROF_TOC(PROF_ENC_INIT, N);
 
-    codec_encode_node(&table->dec, table->dec.tree_root, ranks, N, 0, &ptr, tmp);
+    codec_encode_node(table, table->tree_root, ranks, N, 0, &ptr, tmp);
 
     *out_len = (size_t)(ptr - out);
     return PIVCO_OK;
+}
+
+int CODEC_ENCODE_ENTRY(const uint8_t *symbols, size_t n,
+                       const pivco_huffman_table_t *table,
+                       uint8_t *out, size_t *out_len)
+{
+    if (!symbols || !table || !out || !out_len) return PIVCO_ERR_NULL;
+    return codec_encode_core(symbols, n, &table->dec, table->sym_to_rank,
+                             &table->enc_init_aux, out, out_len);
+}
+
+int CODEC_ENCODE_CT_ENTRY(const uint8_t *symbols, size_t n,
+                          const pivco_huffman_codec_table_t *ct,
+                          uint8_t *out, size_t *out_len)
+{
+    if (!symbols || !ct || !out || !out_len) return PIVCO_ERR_NULL;
+    return codec_encode_core(symbols, n, &ct->dec, ct->sym_to_rank,
+                             &ct->enc_init_aux, out, out_len);
 }
 
 /* ---------- Bottom-up decode tree walk ---------- *
@@ -540,9 +569,9 @@ static void codec_decode_subtree(const pivco_huffman_decode_table_t *table,
     }
 }
 
-int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
-                       const pivco_huffman_table_t *table,
-                       uint8_t *symbols, size_t *consumed)
+int CODEC_DECODE_DT_ENTRY(const uint8_t *in, size_t in_len,
+                          const pivco_huffman_decode_table_t *table,
+                          uint8_t *symbols, size_t *consumed)
 {
     if (!in || !table || !symbols || !consumed) return PIVCO_ERR_NULL;
     (void)in_len;
@@ -552,7 +581,7 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
     const uint8_t *ptr = in;
     const int N = wire_read_block_n(&ptr);
     if (N <= 0 || N > PIVCO_WIRE_MAX_N) return PIVCO_ERR_CORRUPT;
-    const pivco_tree_node_t *root = &table->dec.tree[table->dec.tree_root];
+    const pivco_tree_node_t *root = &table->tree[table->tree_root];
 
     /* Root-is-leaf: fill everything with the single symbol. */
     if (root->symbol >= 0) {
@@ -569,12 +598,12 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
      * on two_sym decode on older narrow x86 (IvyBridge), noise on
      * modern hosts.  TODO: consider removing this extreme-case
      * optimization. */
-    if ((pivco_node_type_t)table->dec.node_type[table->dec.tree_root]
+    if ((pivco_node_type_t)table->node_type[table->tree_root]
         == PIVCO_NODE_BOTH_LEAVES) {
         uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
         const uint8_t *bm = wire_read_bitmap(&ptr, N, bm_scratch);
-        const pivco_tree_node_t *left_child  = &table->dec.tree[root->left];
-        const pivco_tree_node_t *right_child = &table->dec.tree[root->right];
+        const pivco_tree_node_t *left_child  = &table->tree[root->left];
+        const pivco_tree_node_t *right_child = &table->tree[root->right];
         prim_merge_cst_cst(bm, N,
                                (uint8_t)left_child->symbol,
                                (uint8_t)right_child->symbol,
@@ -599,9 +628,18 @@ int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
     if (!scratch) return PIVCO_ERR_NULL;
     g_scratch_pad_left = PIVCO_SCRATCH_PAD_BUDGET;
 
-    codec_decode_subtree(&table->dec, table->dec.tree_root, N,
+    codec_decode_subtree(table, table->tree_root, N,
                           symbols, &ptr, scratch, /*tail_ok=*/0);
 
     *consumed = (size_t)(ptr - in);
     return PIVCO_OK;
+}
+
+/* Full-table shim: the decode core is embedded as table->dec. */
+int CODEC_DECODE_ENTRY(const uint8_t *in, size_t in_len,
+                       const pivco_huffman_table_t *table,
+                       uint8_t *symbols, size_t *consumed)
+{
+    if (!table) return PIVCO_ERR_NULL;
+    return CODEC_DECODE_DT_ENTRY(in, in_len, &table->dec, symbols, consumed);
 }

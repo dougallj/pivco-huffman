@@ -182,27 +182,32 @@ static int pivcohuf_compress_impl(const uint8_t *in, size_t in_len,
       if (in_len == 0) real_freq[0] = 1;
       PROF_TOC(PROF_FILE_HISTOGRAM, in_len); TOC(tm, freq_ns, _t); }
 
-    pivco_huffman_table_t real_table;
+    /* Minimal codec table straight from the frequencies (~7 KB; the
+     * old path built TWO full 13 KB tables — one from freqs, one rebuilt
+     * from the lengths "so encode uses the exact table the decoder
+     * reconstructs").  The rebuild is unnecessary since wire v0.4: the
+     * table is fully determined by the code lengths (within-tier order is
+     * symbol-value), and the codec-table build derives the lengths and
+     * then runs the SAME lengths->tree core the decoder runs, so
+     * encoder and decoder agree by construction. */
+    pivco_huffman_codec_table_t table;
     { PROF_TIC(); double _t = TIC(tm);
-      if (pivco_huffman_build_table(real_freq, &real_table) != PIVCO_OK)
+      if (pivco_huffman_build_codec_table(real_freq, &table) != PIVCO_OK)
           return PIVCOHUF_ERR_INTERNAL;
       PROF_TOC(PROF_FILE_BUILD_TABLE_REAL, 1); TOC(tm, build_ns, _t); }
 
-    /* Rebuild the encode-time table via the code-lens builder, so encode
-     * uses the exact table the decoder reconstructs from the wire.  The tree
-     * is fully determined by the code lengths (within-tier order is symbol-
-     * value), so nothing beyond the lengths is transmitted. */
-    pivco_huffman_table_t table;
-    { PROF_TIC(); double _t = TIC(tm);
-      if (pivco_huffman_build_table_from_code_lens(real_table.code_len,
-                                                    &table) != PIVCO_OK)
-          return PIVCOHUF_ERR_INTERNAL;
-      PROF_TOC(PROF_FILE_BUILD_TABLE_SYN, 1); TOC(tm, build_ns, _t); }
-
-    /* Pad with the most-frequent symbol (sorted_symbols[0] -- always has
-     * the shortest code).  Padding with arbitrary bytes can hit pathological
-     * deep-recursion paths in the encoder when blk_in << B. */
-    const uint8_t pad_byte = table.sorted_symbols[0];
+    /* Pad with the most-frequent symbol (the shortest code).  Padding
+     * with arbitrary bytes can hit pathological deep-recursion paths in
+     * the encoder when blk_in << B. */
+    uint8_t pad_byte = 0;
+    {
+        int best = PIVCO_MAX_CODE_LEN + 1;
+        for (int s = 0; s < 256; s++)
+            if (table.code_len[s] && table.code_len[s] < best) {
+                best = table.code_len[s];
+                pad_byte = (uint8_t)s;
+            }
+    }
 
     uint8_t *p = out;
     /* === Reserve HEADER bytes; fill at end. === */
@@ -258,7 +263,7 @@ static int pivcohuf_compress_impl(const uint8_t *in, size_t in_len,
 
         { PROF_TIC();
           size_t enc_len = 0;
-          if (pivco_huffman_encode(blk_src, this_n, &table, p, &enc_len) != PIVCO_OK) {
+          if (pivco_huffman_encode_ct(blk_src, this_n, &table, p, &enc_len) != PIVCO_OK) {
               free(block_buf);
               return PIVCOHUF_ERR_INTERNAL;
           }
@@ -395,17 +400,13 @@ static int pivcohuf_decompress_impl(const uint8_t *in, size_t in_len,
         code_lens[2*i + 1] = (nibbles[i] >> 4) & 0x0F;
     }
 
-    pivco_huffman_table_t table;
+    /* Minimal decode-side setup: only the ~1 KB decode table is built
+     * (no explicit tree, no encode/trad fields -- issue #7). */
+    pivco_huffman_decode_table_t table;
     { PROF_TIC(); double _t = TIC(tm);
-      if (pivco_huffman_build_table_from_code_lens(code_lens, &table) != PIVCO_OK)
+      if (pivco_huffman_build_decode_table(code_lens, &table) != PIVCO_OK)
           return PIVCOHUF_ERR_INTERNAL;
       PROF_TOC(PROF_FILE_BUILD_TABLE_SYN, 1); TOC(tm, build_ns, _t); }
-    /* Sanity check: rebuilt code lengths must match. */
-    for (int s = 0; s < 256; s++) {
-        if (table.code_len[s] != code_lens[s]) {
-            return PIVCOHUF_ERR_INTERNAL;
-        }
-    }
 
     /* Decode blocks.  block_buf is on heap (avoids large stack frames; also
      * sized B which is read from the file). */
@@ -432,8 +433,8 @@ static int pivcohuf_decompress_impl(const uint8_t *in, size_t in_len,
 
         { PROF_TIC();
           size_t consumed = 0;
-          if (pivco_huffman_decode(p, blk_enc_len, &table,
-                                   blk_out, &consumed) != PIVCO_OK) {
+          if (pivco_huffman_decode_dt(p, blk_enc_len, &table,
+                                      blk_out, &consumed) != PIVCO_OK) {
               err = PIVCOHUF_ERR_INTERNAL; break;
           }
           PROF_TOC(PROF_FILE_BLOCK_DECODE, (uint64_t)B); }

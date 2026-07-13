@@ -147,9 +147,37 @@ int pivco_huffman_encode(const uint8_t *symbols, size_t n,
     }
 }
 
+int pivco_huffman_encode_ct(const uint8_t *symbols, size_t n,
+                            const pivco_huffman_codec_table_t *ct,
+                            uint8_t *out, size_t *out_len)
+{
+    /* Mirrors pivco_huffman_decode_dt's backend order; each *_ct entry
+     * comes from codec.c compiled with the matching PIVCO_BACKEND_*. */
+    switch (resolve_impl()) {
+    case PIVCO_IMPL_NEON:
+#ifdef PIVCO_HAS_AVX512
+        return pivco_huffman_encode_avx512_ct(symbols, n, ct, out, out_len);
+#elif defined(PIVCO_HAS_SSE4)
+        return pivco_huffman_encode_x86_ct(symbols, n, ct, out, out_len);
+#elif defined(PIVCO_HAS_NEON)
+        return pivco_huffman_encode_neon_ct(symbols, n, ct, out, out_len);
+#endif
+    default:
+        return pivco_huffman_encode_scalar_ct(symbols, n, ct, out, out_len);
+    }
+}
+
 int pivco_huffman_decode(const uint8_t *in, size_t in_len,
                          const pivco_huffman_table_t *table,
                          uint8_t *symbols, size_t *consumed)
+{
+    if (!table) return PIVCO_ERR_NULL;
+    return pivco_huffman_decode_dt(in, in_len, &table->dec, symbols, consumed);
+}
+
+int pivco_huffman_decode_dt(const uint8_t *in, size_t in_len,
+                            const pivco_huffman_decode_table_t *dt,
+                            uint8_t *symbols, size_t *consumed)
 {
     /* Bottom-up merge is the production decode path (since 2026-05-12
      * K_right landing).  Each backend's BU entry comes from codec.c
@@ -157,13 +185,13 @@ int pivco_huffman_decode(const uint8_t *in, size_t in_len,
     switch (resolve_impl()) {
     case PIVCO_IMPL_NEON:
 #ifdef PIVCO_HAS_AVX512
-        return pivco_huffman_decode_bu_avx512(in, in_len, table, symbols, consumed);
+        return pivco_huffman_decode_bu_avx512_dt(in, in_len, dt, symbols, consumed);
 #elif defined(PIVCO_HAS_SSE4)
-        return pivco_huffman_decode_bu_x86(in, in_len, table, symbols, consumed);
+        return pivco_huffman_decode_bu_x86_dt(in, in_len, dt, symbols, consumed);
 #elif defined(PIVCO_HAS_NEON)
-        return pivco_huffman_decode_bu_neon(in, in_len, table, symbols, consumed);
+        return pivco_huffman_decode_bu_neon_dt(in, in_len, dt, symbols, consumed);
 #endif
     default:
-        return pivco_huffman_decode_scalar(in, in_len, table, symbols, consumed);
+        return pivco_huffman_decode_scalar_dt(in, in_len, dt, symbols, consumed);
     }
 }
