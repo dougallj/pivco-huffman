@@ -8,7 +8,7 @@ strong wins on skewed distributions (proba80 3.4×, two_sym_eq 4.9×,
 uniform 2.4×) are preserved.
 
 The flat-subtree path detects at `build_table` time every maximal
-internal node whose subtree is flat with depth D ≥ 2 (all 2^D leaves at
+internal node whose subtree is flat with depth D ≥ 1 (all 2^D leaves at
 the same relative depth), replaces D levels of bitmap-per-level with a
 single N·D-bit packed region in the stream, and decodes via direct
 `code_to_sym[local_code]` lookup + scatter — the same mechanism that
@@ -37,7 +37,7 @@ cmake --build build
 - **Backends**: scalar, NEON (ARM), x86 (SSE4.1 / AVX2), AVX-512 VBMI2 (Intel).  SVE is disabled (svcompact at 128-bit isn't competitive with NEON TBL).
 - **Codec framework**: one `pivco_huffman_codec.c` compiled per backend as an OBJECT library, each pulling in `primitives_<backend>.h` (the only file with SIMD intrinsics).  Runtime dispatcher in `src/pivco_huffman.c::resolve_impl` picks the best backend per host.
 - **Block size**: 8192 (ARM/AVX-512), 4096 (x86 SSE/AVX2) — auto-detected per backend at compile time
-- **Wire format**: see `src/pivco_huffman_wire.h` for the canonical doc.  Per-node record: `[optional K_right:u16 LE][FSE marker:u8][bitmap or FSE payload]`.  Flat subtrees (D ≥ 2) skip the header and emit one N·D-bit packed region.
+- **Wire format**: see `src/pivco_huffman_wire.h` for the canonical doc.  Per-node record: `[K_right:u16 LE][FSE marker:u8][bitmap or FSE payload]`.  Flat subtrees (D ≥ 1; D=1 is the former sibling-pair node) skip the header and emit one N·D-bit packed region.
 - **Key data structures**:
   - `compress_tab[256][32]` combined shuffle table (TBL/pshufb partition; per-arch in `pivco_huffman_{neon,x86}_tables.c`)
   - `expand_tab[256][8]` BU tree_merge shuffle table (same files)

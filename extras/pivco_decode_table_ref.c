@@ -19,8 +19,8 @@
  *   2. Decompose each length's count c_L by its binary representation
  *      into "chunks": every set bit b gives 2^b same-length leaves
  *      grouped under one ancestor at depth L-b (a flat subtree for
- *      b >= 2, a sibling pair for b == 1, a bare leaf for b == 0).
- *      Kraft: the chunk depths tile the code space exactly.
+ *      b >= 1 — b == 1 is the former sibling pair — a bare leaf for
+ *      b == 0).  Kraft: the chunk depths tile the code space exactly.
  *   3. Stable-sort chunks by root depth (insertion sort on purpose:
  *      the generation order is already nearly sorted).
  *   4. The depth-sorted chunk list is the tree's left-to-right
@@ -197,8 +197,7 @@ static uint8_t ref_sched_gen(ref_gen_t *g, int depth)
         g->rank += 1u << b;
         if (b == 0) return 0;
         pivco_sched_rec_t *rec = &g->dt->sched[g->dt->sched_len++];
-        rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
-                              : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
+        rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
         rec->param = (uint8_t)rank0;
         rec->right = 0;                     /* no child records */
         return 1;
@@ -214,14 +213,19 @@ static uint8_t ref_sched_gen(ref_gen_t *g, int depth)
     int right_lone = (nr == 0 && g->rank == thr + 2);
 
     pivco_sched_rec_t *rec = &g->dt->sched[my];
-    if (left_lone && right_lone)  rec->kd = (uint8_t)PIVCO_SCHED_PAIR;
-    else if (left_lone)           rec->kd = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
-    else if (right_lone)          { g->err = 1; return 0; }
-    else                          rec->kd = (uint8_t)PIVCO_SCHED_FULL;
+    if (left_lone && right_lone) {  /* sibling singletons -> flat D=1 */
+        rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (1u << 2));
+        rec->param = (uint8_t)rank0;
+        rec->right = 0;
+        return (uint8_t)(1 + nl + nr);
+    }
+    if (right_lone) { g->err = 1; return 0; }
+    rec->kd = left_lone ? (uint8_t)PIVCO_SCHED_LEAF_LEFT
+                        : (uint8_t)PIVCO_SCHED_FULL;
     rec->param = (uint8_t)thr;
     /* right child record = 1 + left subtree's record count (1 for
-     * LEAF_LEFT: nl == 0); unused for PAIR */
-    rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR) ? 0 : (uint8_t)(1 + nl);
+     * LEAF_LEFT: nl == 0) */
+    rec->right = (uint8_t)(1 + nl);
     return (uint8_t)(1 + nl + nr);
 }
 
@@ -281,8 +285,7 @@ static int ref_run_sched(pivco_huffman_decode_table_t *dt,
             rank += 1u << b;
             if (b != 0) {
                 pivco_sched_rec_t *rec = &dt->sched[dt->sched_len++];
-                rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
-                                      : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
+                rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
                 rec->param = (uint8_t)rank0;
                 rec->right = 0;             /* no child records */
             }
@@ -308,14 +311,17 @@ static int ref_run_sched(pivco_huffman_decode_table_t *dt,
             int right_lone = (dt->sched_len == f->mid_sched) &&
                              (rank == (unsigned)f->mid_rank + 1);
             pivco_sched_rec_t *rec = &dt->sched[f->my];
-            if (left_lone && right_lone)  rec->kd = (uint8_t)PIVCO_SCHED_PAIR;
-            else if (left_lone)           rec->kd = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
-            else if (right_lone)          return -1;
-            else                          rec->kd = (uint8_t)PIVCO_SCHED_FULL;
-            rec->param = (uint8_t)(f->mid_rank - 1);
-            rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR)
-                             ? 0
-                             : (uint8_t)(f->mid_sched - f->my);
+            if (left_lone && right_lone) {  /* sibling singletons -> flat D=1 */
+                rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (1u << 2));
+                rec->param = f->rank0;
+                rec->right = 0;
+            } else {
+                if (right_lone) return -1;
+                rec->kd    = left_lone ? (uint8_t)PIVCO_SCHED_LEAF_LEFT
+                                       : (uint8_t)PIVCO_SCHED_FULL;
+                rec->param = (uint8_t)(f->mid_rank - 1);
+                rec->right = (uint8_t)(f->mid_sched - f->my);
+            }
             sp--;
         }
     }
@@ -338,13 +344,13 @@ int pivco_huffman_build_decode_table_ref(
     if (n_used == 0) return PIVCO_ERR_EMPTY;
 
     if (n_used == 1) {
-        /* Degenerate table: two ranks of the same symbol, one PAIR record,
-         * so the walk needs no special case. */
+        /* Degenerate table: two ranks of the same symbol, one flat D=1
+         * record, so the walk needs no special case. */
         uint8_t sym = items[0];
         dt->rank_to_sym[0] = sym;
         dt->rank_to_sym[1] = sym;
         dt->num_ranks = 2;
-        dt->sched[0].kd    = (uint8_t)PIVCO_SCHED_PAIR;
+        dt->sched[0].kd    = (uint8_t)(PIVCO_SCHED_FLAT | (1u << 2));
         dt->sched[0].param = 0;
         dt->sched[0].right = 0;
         dt->sched_len = 1;
@@ -363,12 +369,8 @@ int pivco_huffman_build_decode_table_ref(
         int cur = per_len_start[L];
         for (int bit = PIVCO_MAX_CODE_LEN; bit >= 0; bit--) {
             if (c & (1 << bit)) {
-                int depth;
-                if      (bit >= 2) depth = L - bit;
-                else if (bit == 1) depth = L - 1;
-                else               depth = L;
                 chunks[n_chunks].bit     = (uint8_t)bit;
-                chunks[n_chunks].depth   = (uint8_t)depth;
+                chunks[n_chunks].depth   = (uint8_t)(L - bit);
                 chunks[n_chunks].sym_idx = (uint8_t)cur;
                 cur += 1 << bit;
                 n_chunks++;

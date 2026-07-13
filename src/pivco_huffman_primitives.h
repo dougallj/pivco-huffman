@@ -81,14 +81,15 @@
  *      INTERNAL_FULL    prim_enc_partition_full        both       left in place,
  *                                                                 right->right_out
  *      LEAF_LEFT        prim_enc_partition_right       right only right->right_out
- *      BOTH_LEAVES      prim_enc_partition_none        neither    (bitmap only)
  *
  *    SUFFIX CONVENTION: the suffix names the NON-TRIVIAL child subtree —
  *    the side whose ranks are emitted for further recursion (LEAF_LEFT's
  *    right child is the subtree, left is a leaf, so
  *    prim_enc_partition_right emits the right ranks).  `_none` = zero
- *    outputs (both children leaves); it still writes the bitmap, so it
- *    is exactly the bitmap-build step.
+ *    outputs; it still writes the bitmap, so it is exactly the
+ *    bitmap-build step.  No sched kind maps to it anymore (the former
+ *    both-leaves PAIR is a D=1 flat region); it survives as the D=1
+ *    body of prim_enc_pack_dN and for bench_prim.
  *
  *    Common contract (all four):
  *      Writes ceil(n/8) bytes into bm.  Bit j (j in [0..n)) is

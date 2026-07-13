@@ -99,8 +99,10 @@ typedef struct {
  */
 typedef enum {
     PIVCO_NODE_INTERNAL_FULL = 0,  /* both children internal — general partition/merge */
-    PIVCO_NODE_INTERNAL_FLAT,      /* flat_depth[i] >= 2 — flat-subtree fast path */
-    PIVCO_NODE_BOTH_LEAVES,        /* both children leaves — merge_cst_cst, partition_none */
+    PIVCO_NODE_INTERNAL_FLAT,      /* flat_depth[i] >= 1 — flat-subtree fast path.
+                                    * D=1 covers what used to be a dedicated
+                                    * BOTH_LEAVES ("pair") type: a sibling leaf
+                                    * pair is just a flat subtree of depth 1. */
     PIVCO_NODE_LEAF_LEFT,          /* left child leaf, right internal — merge_cst_vec, partition_right */
     PIVCO_NODE_LEAF,               /* leaf — consumed by the parent merge, never dispatched */
 } pivco_node_type_t;
@@ -125,17 +127,20 @@ typedef enum {
  *   param  FULL: thr (max rank of the left subtree, the partition
  *          threshold).  Otherwise rank_begin — the flat c2s slice base
  *          for FLAT (symbols are rank_to_sym[param..]), the leaf
- *          symbol(s) rank_to_sym[param] (+ [param+1] for PAIR), and
- *          numerically == thr for PAIR / LEAF_LEFT.
+ *          symbol rank_to_sym[param] and numerically == thr for
+ *          LEAF_LEFT.
  *   right  offset from this record to the right child's record:
  *          1 + the left subtree's record count for FULL, 1 for
  *          LEAF_LEFT (the lone left leaf has no record), 0 (unused)
- *          for FLAT / PAIR.
+ *          for FLAT.
  */
 typedef enum {
     PIVCO_SCHED_FULL      = 0,  /* both children internal — K_right header */
-    PIVCO_SCHED_FLAT      = 1,  /* flat subtree, D = kd >> 2 — no header  */
-    PIVCO_SCHED_PAIR      = 2,  /* both children leaves — no K_right      */
+    PIVCO_SCHED_FLAT      = 1,  /* flat subtree, D = kd >> 2 — no header.
+                                   D=1 is the former both-leaves PAIR kind:
+                                   a sibling leaf pair is the smallest flat
+                                   subtree (same packed bits as the old pair
+                                   bitmap, minus the FSE-marker record). */
     PIVCO_SCHED_LEAF_LEFT = 3,  /* left child lone leaf — K_right header  */
 } pivco_sched_kind_t;
 
@@ -262,12 +267,15 @@ typedef struct {
     uint8_t  split_rank[PIVCO_MAX_TREE_NODES];      /* max rank in node's left subtree */
     uint8_t  flat_base_rank[PIVCO_MAX_TREE_NODES];  /* min rank in a flat subtree */
 
-    /* Flat-subtree fast path: per-node, if flat_depth[i] >= 2 then node i
+    /* Flat-subtree fast path: per-node, if flat_depth[i] >= 1 then node i
        is the root of a MAXIMAL flat subtree of depth D = flat_depth[i]
        (all 2^D leaves at the same relative depth).  Encoder emits N*D
        packed bits at this node instead of D levels of bitmaps; decoder
        reads N*D bits and uses flat_code_to_sym[flat_offset[i] + code]
-       per element.  Pool sum of 2^D across flat subtrees <= num_symbols. */
+       per element.  D=1 is the former BOTH_LEAVES sibling pair.  Pool
+       sum of 2^D across flat subtrees <= num_symbols (except the
+       degenerate single-symbol table, which pools 2 entries of the
+       same symbol). */
     uint8_t  flat_depth[PIVCO_MAX_TREE_NODES];
     uint16_t flat_offset[PIVCO_MAX_TREE_NODES];
     uint8_t  flat_code_to_sym[PIVCO_MAX_SYMBOLS];
@@ -319,9 +327,8 @@ int  pivco_huffman_get_fse_enabled(void);
  *                  pure canonical Huffman; no leaf fusion, no flat
  *                  subtrees.  Slowest decode; best baseline for "ph
  *                  without any tree optimizations vs Huff0".
- *   FUSED          allow D=1 sibling pairs but no D>=2 flats.  Tree
- *                  shape == canonical with `scatter_two` / `merge_two`
- *                  leaf fusion only.
+ *   FUSED          allow D=1 flats (sibling pairs) but no D>=2 flats.
+ *                  Tree shape == canonical with pair fusion only.
  *   CANONICAL_FLAT chunks are derived from canonical code positions:
  *                  greedy peel the largest 2^k chunk such that the
  *                  canonical start code is 2^k-aligned and 2^k <=

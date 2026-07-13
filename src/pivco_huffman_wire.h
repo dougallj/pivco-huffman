@@ -17,8 +17,9 @@
  *                                                  65535 — no longer pinned
  *                                                  to PIVCO_BLOCK_SIZE.
  *
- * Per non-flat internal node:
- *   [optional K_right_header: uint16 LE, 2 bytes]   if kr_header_needed()
+ * Per non-flat internal node (FULL / LEAF_LEFT; the former both-leaves
+ * PAIR record is gone — sibling pairs are flat D=1 regions):
+ *   [K_right_header:         uint16 LE, 2 bytes]   always
  *   [FSE marker byte:        uint8,    1 byte]    always
  *   [bitmap body]                                  marker == 0: raw n-bit
  *                                                  bitmap, ceil(n/8) bytes
@@ -75,11 +76,11 @@ static inline int wire_read_block_n(const uint8_t **in_ptr)
  * commits the value afterwards.  Returns pointer to where the K_right
  * uint16 should be written (NULL if no header was reserved).
  *
- * A K_right header exists iff the node recurses into at least one
- * non-leaf child.  The rank-range walk knows that at dispatch time
- * (internal node with range length > 2), so the production codec calls
- * the unconditional wire_reserve_kr / wire_read_kr; the *_header
- * variants keyed on the explicit tree remain for legacy decoders. */
+ * Every non-flat schedule record (FULL / LEAF_LEFT) carries a K_right
+ * header — the pair records that had none are flat D=1 regions now —
+ * so the production codec calls the unconditional wire_reserve_kr /
+ * wire_read_kr; the *_header variants keyed on the explicit tree
+ * remain for legacy decoders. */
 static inline uint8_t *wire_reserve_kr(uint8_t **out_ptr)
 {
     uint8_t *slot = *out_ptr;

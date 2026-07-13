@@ -75,7 +75,7 @@ static void walk_partition(const pivco_huffman_table_t *t,
     if (n == 0) return;
     const pivco_tree_node_t *node = &t->tree[node_id];
     if (node->symbol >= 0) return;
-    if (t->flat_depth[node_id] >= 2) return;  /* skipped by partition_8 path */
+    if (t->flat_depth[node_id] >= 1) return;  /* skipped by partition_8 path */
 
     int n_left = 0, n_right = 0;
     int j = 0;

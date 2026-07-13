@@ -1,4 +1,4 @@
-/* pivcoh.h - v1.2 - minimal single-file PIVCO-Huffman block codec
+/* pivcoh.h - v1.3 - minimal single-file PIVCO-Huffman block codec
  *
  * A tiny, scalar, allocation-free-capable implementation of the
  * PIVCO-Huffman wire format (https://github.com/MarcinZukowski/pivco-huffman).
@@ -114,7 +114,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
 #include <string.h>
 
 #define PIVCOH__MAXLEN 11
-enum { PIVCOH__FULL = 0, PIVCOH__FLAT = 1, PIVCOH__PAIR = 2, PIVCOH__LEAFL = 3 };
+enum { PIVCOH__FULL = 0, PIVCOH__FLAT = 1, PIVCOH__LEAFL = 3 };
 
 /* ---- table build ---- */
 
@@ -134,8 +134,7 @@ static int pivcoh__gen(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
         *rank += n;
         if (c->bit) {
             pivcoh__rec *r = &t->sched[t->sched_len++];
-            r->kd = c->bit == 1 ? PIVCOH__PAIR
-                                : (uint8_t)(PIVCOH__FLAT | c->bit << 2);
+            r->kd = (uint8_t)(PIVCOH__FLAT | c->bit << 2);
             r->param = (uint8_t)r0;
             r->right = 0;
         }
@@ -146,12 +145,10 @@ static int pivcoh__gen(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
     int mid_s = t->sched_len, mid_r = *rank;
     if (!pivcoh__gen(t, ch, nch, ci, rank, depth + 1, items)) return 0;
     int ll = (mid_s == my + 1 && mid_r == r0 + 1);
-    int rl = (t->sched_len == mid_s && *rank == mid_r + 1);
     pivcoh__rec *r = &t->sched[my];
-    if (rl && !ll) return 0;                   /* lone leaf is always LEFT */
-    r->kd    = (uint8_t)(ll ? (rl ? PIVCOH__PAIR : PIVCOH__LEAFL) : PIVCOH__FULL);
+    r->kd    = (uint8_t)(ll ? PIVCOH__LEAFL : PIVCOH__FULL);
     r->param = (uint8_t)(mid_r - 1);           /* thr / rank_begin */
-    r->right = (uint8_t)(r->kd == PIVCOH__PAIR ? 0 : mid_s - my);
+    r->right = (uint8_t)(mid_s - my);
     return 1;
 }
 
@@ -172,7 +169,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         t->code_len[s] = 1;
         t->rank_to_sym[0] = t->rank_to_sym[1] = (uint8_t)s;
         t->num_ranks = 2;
-        t->sched[0].kd = PIVCOH__PAIR;
+        t->sched[0].kd = PIVCOH__FLAT | 1 << 2;
         t->sched[0].param = t->sched[0].right = 0;
         t->sched_len = 1;
     } else {
@@ -315,8 +312,8 @@ static void pivcoh__enc(const pivcoh_table *t, int idx, uint8_t *ranks, int K,
         *pp = p;
         return;
     }
-    uint8_t *kr = NULL;
-    if (kind != PIVCOH__PAIR) { kr = p; p += 2; }   /* K_right, u16 LE */
+    uint8_t *kr = p;                                /* K_right, u16 LE */
+    p += 2;
     *p++ = 0;                                       /* marker: raw bitmap */
     uint8_t *bm = p;
     p += (K + 7) >> 3;
@@ -324,9 +321,9 @@ static void pivcoh__enc(const pivcoh_table *t, int idx, uint8_t *ranks, int K,
     int KR = 0;                                /* bit j = 1: rank > thr (right) */
     for (j = 0; j < K; j++)
         if (ranks[j] > rec->param) { bm[j >> 3] |= (uint8_t)(1u << (j & 7)); KR++; }
-    if (kr) { kr[0] = (uint8_t)KR; kr[1] = (uint8_t)(KR >> 8); }
+    kr[0] = (uint8_t)KR;
+    kr[1] = (uint8_t)(KR >> 8);
     *pp = p;
-    if (kind == PIVCOH__PAIR) return;
     /* Mirror of the decode placement: the larger side compacts IN PLACE in
      * the rank slab (stable: write cursor <= read cursor), the smaller side
      * is extracted to the pool, and the first child's slab — dead once it
@@ -389,20 +386,16 @@ static const uint8_t *pivcoh__skip(const pivcoh_table *t, int idx, int K,
         size_t nb = ((size_t)K * (size_t)(rec->kd >> 2) + 7) >> 3;
         return (size_t)(end - p) < nb ? NULL : p + nb;
     }
-    int KR = 0;
-    if (kind != PIVCOH__PAIR) {
-        if (end - p < 2) return NULL;
-        KR = p[0] | p[1] << 8;
-        p += 2;
-        if (KR > K) return NULL;
-    }
+    if (end - p < 2) return NULL;
+    int KR = p[0] | p[1] << 8;
+    p += 2;
+    if (KR > K) return NULL;
     size_t nb = 1 + (size_t)((K + 7) >> 3);    /* marker + bitmap */
     if ((size_t)(end - p) < nb || *p != 0) return NULL;
     p += nb;
     if (kind == PIVCOH__FULL && K - KR > 0 &&
         !(p = pivcoh__skip(t, idx + 1, K - KR, p, end))) return NULL;
-    return (kind != PIVCOH__PAIR && KR > 0)
-               ? pivcoh__skip(t, idx + rec->right, KR, p, end) : p;
+    return KR > 0 ? pivcoh__skip(t, idx + rec->right, KR, p, end) : p;
 }
 
 /* Returns the advanced input pointer, or NULL on malformed input.  out
@@ -427,13 +420,10 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
         }
         return p + nb;
     }
-    int KR = 0;
-    if (kind != PIVCOH__PAIR) {
-        if (end - p < 2) return NULL;
-        KR = p[0] | p[1] << 8;
-        p += 2;
-        if (KR > K) return NULL;
-    }
+    if (end - p < 2) return NULL;
+    int KR = p[0] | p[1] << 8;
+    p += 2;
+    if (KR > K) return NULL;
     if (end - p < 1 || *p++ != 0) return NULL; /* raw-bitmap marker only (no FSE) */
     size_t nb = (size_t)((K + 7) >> 3);
     if ((size_t)(end - p) < nb) return NULL;
@@ -441,10 +431,6 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K, uint8_t
     p += nb;
 #define PIVCOH__BIT(j) ((bm[(j) >> 3] >> ((j) & 7)) & 1)
 
-    if (kind == PIVCOH__PAIR) {
-        for (j = 0; j < K; j++) out[j] = t->rank_to_sym[rec->param + PIVCOH__BIT(j)];
-        return p;
-    }
     /* The larger child always decodes FIRST, IN PLACE into out's tail —
      * when that child is the right one, pivcoh__skip jumps the wire cursor
      * over the left subtree's bytes and the left decodes second.  The

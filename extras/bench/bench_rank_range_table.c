@@ -57,7 +57,7 @@ extern void        bench_generate_symbols(int dist_idx, uint8_t *symbols,
 typedef struct {
     uint8_t  sym_to_rank[PIVCO_MAX_SYMBOLS];
     uint8_t  rank_to_sym[PIVCO_MAX_SYMBOLS];
-    uint8_t  rank_to_flat_depth[PIVCO_MAX_SYMBOLS]; /* 0 = plain leaf; D>=2 = flat */
+    uint8_t  rank_to_flat_depth[PIVCO_MAX_SYMBOLS]; /* 0 = plain leaf; D>=1 = flat */
     uint16_t rank_to_codeword[PIVCO_MAX_SYMBOLS];   /* MSB-aligned into 16 bits */
     uint16_t code[PIVCO_MAX_SYMBOLS];               /* encode side, same as table->code */
     uint8_t  code_len[PIVCO_MAX_SYMBOLS];
@@ -212,7 +212,7 @@ static int rr_build_from_code_lens(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                 rt->sym_to_rank[sym]  = (uint8_t)rank;
                 rt->rank_to_sym[rank] = sym;
                 rt->rank_to_codeword[rank]   = (uint16_t)(c16 << (16 - L));
-                rt->rank_to_flat_depth[rank] = (uint8_t)(bit >= 2 ? bit : 0);
+                rt->rank_to_flat_depth[rank] = (uint8_t)(bit >= 1 ? bit : 0);
                 rank++;
             }
             code += 1;
@@ -264,7 +264,7 @@ static void verify_walk(const pivco_huffman_table_t *t, const rr_table_t *rt,
         return;
     }
 
-    if (t->flat_depth[node] >= 2) {                        /* flat subtree */
+    if (t->flat_depth[node] >= 1) {                        /* flat subtree */
         unsigned D = t->flat_depth[node];
         if (rt->rank_to_flat_depth[rb] != D)
             FAIL("flat node %d: flat_depth %u != %u",
@@ -310,9 +310,13 @@ static void verify_walk(const pivco_huffman_table_t *t, const rr_table_t *rt,
                      rt->rank_to_flat_depth[rb] == 0;
     int right_leaf = rr_range_is_leaf(rt, split, re) &&
                      rt->rank_to_flat_depth[split] == 0;
-    uint8_t want_type = (left_leaf && right_leaf) ? PIVCO_NODE_BOTH_LEAVES
-                       : left_leaf                ? PIVCO_NODE_LEAF_LEFT
-                                                  : PIVCO_NODE_INTERNAL_FULL;
+    /* A both-lone-leaves node can't reach here: it's a flat D=1 range
+     * (its ranks carry flat_depth 1), handled by the flat branch above. */
+    if (left_leaf && right_leaf)
+        FAIL("internal node %d: both-lone range [%u,%u) not flat D=1",
+             node, rb, re);
+    uint8_t want_type = left_leaf ? PIVCO_NODE_LEAF_LEFT
+                                  : PIVCO_NODE_INTERNAL_FULL;
     if (t->node_type[node] != want_type)
         FAIL("internal node %d: node_type %u != range-derived %u",
              node, t->node_type[node], want_type);

@@ -139,7 +139,6 @@ int main(int argc, char **argv)
         int    n_internal_full;     /* PIVCO_NODE_INTERNAL_FULL */
         int    n_internal_flat;     /* PIVCO_NODE_INTERNAL_FLAT */
         int    n_half;              /* PIVCO_NODE_LEAF_LEFT (one-leaf nodes) */
-        int    n_both_leaves;       /* PIVCO_NODE_BOTH_LEAVES */
         /* Flat-aware counts: subtract internals/leaves buried inside
          * maximal flat subtrees, since they don't need separate
          * communication in the header (flat root + 2^D leaves does it). */
@@ -513,32 +512,24 @@ int main(int argc, char **argv)
                 case PIVCO_NODE_INTERNAL_FULL: comp_stats[d].n_internal_full++; break;
                 case PIVCO_NODE_INTERNAL_FLAT: comp_stats[d].n_internal_flat++; break;
                 case PIVCO_NODE_LEAF_LEFT:     comp_stats[d].n_half++; break;
-                case PIVCO_NODE_BOTH_LEAVES:   comp_stats[d].n_both_leaves++; break;
                 default: break; /* LEAF / SKIP */
             }
         }
-        /* Flat-aware visible counts: subtract internals & leaves that
-         * live INSIDE flat subtrees (the flat root + 2^D leaves
-         * suffices to communicate them in a header). */
+        /* Flat-aware visible counts: leaves buried INSIDE flat subtrees
+         * are free (the flat root + 2^D leaves suffices to communicate
+         * them in a header).  The on-demand explicit tree never
+         * materializes nodes below a flat root, so every counted
+         * internal is already visible — n_leaves (== num_symbols) is
+         * the only count that still includes buried entries. */
         {
-            int internals_inside_flat = 0;
-            int leaves_inside_flat    = 0;
+            int leaves_inside_flat = 0;
             for (int16_t i = 0; i < table->tree_node_count; i++) {
-                if (table->node_type[i] == (uint8_t)PIVCO_NODE_INTERNAL_FLAT) {
-                    int D = table->flat_depth[i];
-                    /* A flat subtree of depth D has 2^D - 1 internal
-                     * nodes below the flat root and 2^D leaves below it. */
-                    int n_subtree_internals = (1 << D) - 1;
-                    int n_subtree_leaves    = 1 << D;
-                    internals_inside_flat += n_subtree_internals;
-                    leaves_inside_flat    += n_subtree_leaves;
-                }
+                if (table->node_type[i] == (uint8_t)PIVCO_NODE_INTERNAL_FLAT)
+                    leaves_inside_flat += 1 << table->flat_depth[i];
             }
-            int total_internals = comp_stats[d].n_internal_full
-                                + comp_stats[d].n_internal_flat
-                                + comp_stats[d].n_half
-                                + comp_stats[d].n_both_leaves;
-            comp_stats[d].n_internal_visible = total_internals - internals_inside_flat;
+            comp_stats[d].n_internal_visible = comp_stats[d].n_internal_full
+                                             + comp_stats[d].n_internal_flat
+                                             + comp_stats[d].n_half;
             comp_stats[d].n_leaves_visible   = comp_stats[d].n_leaves - leaves_inside_flat;
         }
         comp_stats[d].pivco_bytes   = pivco_enc_off[NBLOCKS];
@@ -571,13 +562,13 @@ cleanup:
     if (!quick) {
         const size_t orig = (size_t)TOTAL_SYMBOLS;
         printf("\n=== Compression sizes (bytes for 4M input) ===\n");
-        printf("%-13s | %5s %4s %4s %4s %4s %4s | %4s %4s | %10s %10s | %10s %10s %10s\n",
+        printf("%-13s | %5s %4s %4s %4s %4s | %4s %4s | %10s %10s | %10s %10s %10s\n",
                "DIST",
-               "Dmax", "Lvs", "Ful", "Flt", "Hal", "B2L",
+               "Dmax", "Lvs", "Ful", "Flt", "Hal",
                "vIN", "vLv",
                "pivco_raw", "+hdr_est",
                "trad_4s", "huf0_1s", "huf0_x2");
-        printf("--------------|-----------------------------|"
+        printf("--------------|------------------------|"
                "-----------|"
                "----------------------|"
                "------------------------------------\n");
@@ -593,14 +584,13 @@ cleanup:
                 (size_t)(s->n_internal_visible * 7 + s->n_leaves_visible * 9);
             size_t hdr_total = hdr_bits_per_block * NBLOCKS / 8;
             size_t pivco_total = s->pivco_bytes + hdr_total;
-            printf("%-13s | %5.0f %4d %4d %4d %4d %4d | %4d %4d | %10zu %10zu | %10zu %10zu %10zu\n",
+            printf("%-13s | %5.0f %4d %4d %4d %4d | %4d %4d | %10zu %10zu | %10zu %10zu %10zu\n",
                    s->name,
                    s->max_code_len,
                    s->n_leaves,
                    s->n_internal_full,
                    s->n_internal_flat,
                    s->n_half,
-                   s->n_both_leaves,
                    s->n_internal_visible,
                    s->n_leaves_visible,
                    s->pivco_bytes,
@@ -611,7 +601,8 @@ cleanup:
             (void)orig;
         }
         printf("  Dmax=max Huffman code length; Lvs=# leaves; "
-               "Ful/Flt/Hal/B2L=internal-node-type counts\n");
+               "Ful/Flt/Hal=internal-node-type counts "
+               "(Flt includes D=1 pairs)\n");
         printf("  vIN/vLv = flat-aware VISIBLE internals/leaves "
                "(excludes nodes buried inside flat subtrees)\n");
         printf("  +hdr_est = pivco_raw + (vIN*7 + vLv*9) * NBLOCKS/8 "

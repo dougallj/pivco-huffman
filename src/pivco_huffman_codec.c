@@ -359,7 +359,9 @@ static void codec_encode_node(const pivco_huffman_decode_table_t *dt,
     const pivco_sched_rec_t *rec = &dt->sched[idx];
     const unsigned kind = rec->kd & 3u;
 
-    /* Flat-subtree fast path: pack n*D bits, no marker, no K_right. */
+    /* Flat-subtree fast path: pack n*D bits, no marker, no K_right.
+     * D=1 (the former PAIR kind) packs the same bits the old pair
+     * bitmap held, minus the marker byte and the FSE option. */
     if (kind == PIVCO_SCHED_FLAT) {
         int D = rec->kd >> 2;
         int total_bytes = (n * D + 7) >> 3;
@@ -370,12 +372,11 @@ static void codec_encode_node(const pivco_huffman_decode_table_t *dt,
         return;
     }
 
-    /* Non-flat internal node.  codec.c owns: K_right header reservation
-     * (absent on a both-leaves node), FSE marker byte, optional FSE-attempt
-     * on the raw bitmap.  The arch-specific primitive does only the
-     * SIMD-bound work: build the raw bitmap and partition the ranks. */
-    uint8_t *kr_slot = (kind == PIVCO_SCHED_PAIR) ? NULL
-                                                  : wire_reserve_kr(out_ptr);
+    /* Non-flat internal node.  codec.c owns: K_right header reservation,
+     * FSE marker byte, optional FSE-attempt on the raw bitmap.  The
+     * arch-specific primitive does only the SIMD-bound work: build the
+     * raw bitmap and partition the ranks. */
+    uint8_t *kr_slot = wire_reserve_kr(out_ptr);
 
     /* Reserve marker (default = 0, raw bitmap). */
     uint8_t *marker_slot = *out_ptr;
@@ -388,18 +389,17 @@ static void codec_encode_node(const pivco_huffman_decode_table_t *dt,
     *out_ptr += nbytes;
 
     /* Partition against thr (== rec->param for every non-flat kind; for
-     * PAIR / LEAF_LEFT it doubles as rank_begin).  The variant choice
+     * LEAF_LEFT it doubles as rank_begin).  The variant choice
      * mirrors the decode-side dispatch.  The bitmap (and thus the wire
      * bytes) is identical across variants; only the encode-internal
      * scatter work differs — a leaf child never reads its scattered side,
-     * so that side's scatter is skipped: both-leaves stores nothing,
-     * leaf-left only the right (compacted into tmp), full both. */
+     * so that side's scatter is skipped: leaf-left only stores the right
+     * (compacted into tmp), full both.  (The former PAIR/partition_none
+     * case is now the flat D=1 path above.) */
     const uint8_t thr = rec->param;
     int n_right;
     PROF_TIC();
-    if (kind == PIVCO_SCHED_PAIR)
-        n_right = prim_enc_partition_none(ranks, n, thr, bm);
-    else if (kind == PIVCO_SCHED_LEAF_LEFT)
+    if (kind == PIVCO_SCHED_LEAF_LEFT)
         n_right = prim_enc_partition_right(ranks, n, thr, bm, tmp);
     else
         n_right = prim_enc_partition_full(ranks, n, thr, bm, tmp);
@@ -415,13 +415,13 @@ static void codec_encode_node(const pivco_huffman_decode_table_t *dt,
 
     wire_commit_kr_header(kr_slot, n_right);
 
-    /* Recurse into the non-leaf children.  PAIR has none; LEAF_LEFT's
-     * left child is a leaf (no record, nothing on the wire); an empty
-     * child is simply not visited. */
+    /* Recurse into the non-leaf children.  LEAF_LEFT's left child is a
+     * leaf (no record, nothing on the wire); an empty child is simply
+     * not visited. */
     if (kind == PIVCO_SCHED_FULL && n_left > 0)
         codec_encode_node(dt, idx + 1, ranks, n_left, depth + 1,
                            out_ptr, tmp + n_right);
-    if (kind != PIVCO_SCHED_PAIR && n_right > 0)
+    if (n_right > 0)
         codec_encode_node(dt, idx + rec->right, tmp, n_right, depth + 1,
                            out_ptr, tmp + n_right);
 }
@@ -496,8 +496,8 @@ int CODEC_ENCODE_CT_ENTRY(const uint8_t *symbols, size_t n,
  * above); a leaf child's symbol goes straight into the parent's merge,
  * so leaves have no records and the walk never visits them:
  *
- *   FLAT      — packed-bits flat decode into out_buf
- *   PAIR      — both children leaves, merge_cst_cst directly
+ *   FLAT      — packed-bits flat decode into out_buf (D=1 is the former
+ *               PAIR kind; merge_flat routes it to the cst_cst kernel)
  *   LEAF_LEFT — left child lone leaf, recurse right, merge_cst_vec
  *   FULL      — both children internal: recurse both, merge_vec_vec
  *
@@ -563,19 +563,6 @@ static int codec_decode_subtree(const pivco_huffman_decode_table_t *dt,
         const uint8_t *bm = *in_ptr;
         *in_ptr += total_bytes;
         prim_merge_flat(out_buf, K, bm, D, &dt->rank_to_sym[rec->param]);
-        return 0;
-    }
-
-    case PIVCO_SCHED_PAIR: {
-        /* Both children leaves; no K_right header. */
-        uint8_t bm_scratch[(size_t)bitmap_bytes(K) + 16];
-        const uint8_t *bm = wire_read_bitmap_checked(in_ptr, in_end, K,
-                                                     bm_scratch);
-        if (!bm) return -1;
-        prim_merge_cst_cst(bm, K,
-                           dt->rank_to_sym[rec->param],
-                           dt->rank_to_sym[rec->param + 1],
-                           out_buf);
         return 0;
     }
 
@@ -663,23 +650,19 @@ int CODEC_DECODE_DT_ENTRY(const uint8_t *in, size_t in_len,
     const int N = wire_read_block_n(&ptr);
     if (N <= 0 || N > PIVCO_WIRE_MAX_N) return PIVCO_ERR_CORRUPT;
 
-    /* Fast path: 2-rank table — a 2-symbol tree (or a single-symbol one,
-     * whose degenerate table is two ranks of the same symbol), where the
-     * whole block collapses to "read the K-bit partition, blend two
-     * symbols".  Skips the recursive codec_decode_subtree machinery
-     * (dispatch + bm_scratch stack frame + scratch TLS reference / arena
-     * ensure).  Worth −26% on two_sym decode on older narrow x86
-     * (IvyBridge), noise on modern hosts.  TODO: consider removing this
-     * extreme-case optimization. */
-    if (dt->num_ranks == 2) {
-        uint8_t bm_scratch[(size_t)bitmap_bytes(N) + 16];
-        const uint8_t *bm = wire_read_bitmap_checked(&ptr, in_end, N,
-                                                     bm_scratch);
-        if (!bm) return PIVCO_ERR_CORRUPT;
-        prim_merge_cst_cst(bm, N,
-                               dt->rank_to_sym[0],
-                               dt->rank_to_sym[1],
-                               symbols);
+    /* Fast path: flat root — the whole block is one packed N·D-bit
+     * region decoded straight into the output buffer; no recursion, no
+     * scratch.  Skips the codec_decode_subtree machinery (dispatch +
+     * bm_scratch stack frame + scratch TLS reference / arena ensure).
+     * D=1 is the former 2-rank/PAIR fast path (worth −26% on two_sym
+     * decode on older narrow x86); D>=2 covers e.g. the uniform-dist
+     * full-alphabet flat tree, which never needed the arena either. */
+    if ((pivco_sched_kind_t)(dt->sched[0].kd & 3u) == PIVCO_SCHED_FLAT) {
+        int D = dt->sched[0].kd >> 2;
+        int total_bytes = (N * D + 7) >> 3;
+        if (in_end - ptr < (ptrdiff_t)total_bytes) return PIVCO_ERR_CORRUPT;
+        prim_merge_flat(symbols, N, ptr, D, &dt->rank_to_sym[dt->sched[0].param]);
+        ptr += total_bytes;
         *consumed = (size_t)(ptr - in);
         return PIVCO_OK;
     }

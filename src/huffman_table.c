@@ -481,17 +481,17 @@ static int length_histogram(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 
 /* Single-symbol degenerate decode table: a fabricated pair of two ranks
  * holding the same symbol, so the walk needs no degenerate special case —
- * root range [0,2) is a plain both-leaves node.  The schedule is a single
- * PAIR record (thr == rank_begin == 0). */
+ * root range [0,2) is a 2-leaf flat node.  The schedule is a single
+ * flat D=1 record (rank_begin == 0). */
 static void build_single_symbol_decode(int sym,
                                        pivco_huffman_decode_table_t *dt)
 {
     dt->rank_to_sym[0] = (uint8_t)sym;
     dt->rank_to_sym[1] = (uint8_t)sym;
     dt->num_ranks = 2;
-    dt->sched[0].kd    = (uint8_t)PIVCO_SCHED_PAIR;
+    dt->sched[0].kd    = (uint8_t)(PIVCO_SCHED_FLAT | (1u << 2));
     dt->sched[0].param = 0;
-    dt->sched[0].right = 0;    /* PAIR: no child records */
+    dt->sched[0].right = 0;    /* flat: no child records */
     dt->sched_len = 1;
 }
 
@@ -556,8 +556,8 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
  * left-to-right leaf-depth sequence uniquely determines a binary tree.
  * The classic greedy reconstruction recovers it with no codewords at
  * all — at a node at depth d, if the next unconsumed chunk sits at
- * depth d it IS this node (a chunk-leaf: FLAT for width >= 4, PAIR for
- * width 2, a bare leaf for width 1); otherwise the node is internal and
+ * depth d it IS this node (a chunk-leaf: FLAT for width >= 2, a bare
+ * leaf for width 1); otherwise the node is internal and
  * both children recurse at d+1.  (An earlier version assigned every
  * rank its MSB-aligned codeword and re-derived the splits by scanning
  * for bit boundaries — a round-trip through the codes that this
@@ -639,9 +639,8 @@ static int build_schedule(pivco_huffman_decode_table_t *dt,
             rank += 1u << b;
             if (b != 0) {
                 pivco_sched_rec_t *rec = &dt->sched[dt->sched_len++];
-                rec->kd    = (b == 1) ? (uint8_t)PIVCO_SCHED_PAIR
-                                      : (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
-                rec->param = (uint8_t)rank0;    /* == thr for PAIR */
+                rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (b << 2));
+                rec->param = (uint8_t)rank0;    /* rank_begin */
                 rec->right = 0;                 /* no child records */
             }
         }
@@ -664,23 +663,27 @@ static int build_schedule(pivco_huffman_decode_table_t *dt,
              * leaf next to an internal sibling is always LEFT (chunk
              * depths never decrease left-to-right under a node); the
              * both-lone case is a sibling singleton pair (NAIVE mode —
-             * OPTIMIZED emits at most one singleton per length). */
+             * OPTIMIZED emits at most one singleton per length),
+             * recorded as the smallest flat subtree. */
             int left_lone  = (f->mid_sched == f->my + 1) &&
                              (f->mid_rank == (uint8_t)(f->rank0 + 1));
             int right_lone = (dt->sched_len == f->mid_sched) &&
                              (rank == (unsigned)f->mid_rank + 1);
             pivco_sched_rec_t *rec = &dt->sched[f->my];
-            if (left_lone && right_lone)  rec->kd = (uint8_t)PIVCO_SCHED_PAIR;
-            else if (left_lone)           rec->kd = (uint8_t)PIVCO_SCHED_LEAF_LEFT;
-            else if (right_lone)          return -1;
-            else                          rec->kd = (uint8_t)PIVCO_SCHED_FULL;
-            rec->param = (uint8_t)(f->mid_rank - 1);
-            /* right child's record starts where the left subtree's
-             * records ended (1 for LEAF_LEFT: bare left leaf, no record;
-             * 0 for the PAIR case: no child records at all). */
-            rec->right = (rec->kd == (uint8_t)PIVCO_SCHED_PAIR)
-                             ? 0
-                             : (uint8_t)(f->mid_sched - f->my);
+            if (left_lone && right_lone) {
+                rec->kd    = (uint8_t)(PIVCO_SCHED_FLAT | (1u << 2));
+                rec->param = f->rank0;      /* rank_begin */
+                rec->right = 0;             /* no child records */
+            } else {
+                if (right_lone) return -1;
+                rec->kd    = left_lone ? (uint8_t)PIVCO_SCHED_LEAF_LEFT
+                                       : (uint8_t)PIVCO_SCHED_FULL;
+                rec->param = (uint8_t)(f->mid_rank - 1);
+                /* right child's record starts where the left subtree's
+                 * records ended (1 for LEAF_LEFT: bare left leaf, no
+                 * record). */
+                rec->right = (uint8_t)(f->mid_sched - f->my);
+            }
             sp--;
         }
     }
@@ -747,10 +750,10 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
      * Compression is unaffected — code lengths match the Huffman result.
      *
      * Algorithm: per length L, decompose c_L by its binary representation
-     * into "chunks": bits >= 2 form D>=2 flat subtrees of size 2^D rooted
-     * at depth L-D; bit 1 forms a D=1 sibling pair (handled by stage
-     * fusion at decode); bit 0 is a singleton.  Sort chunks by their
-     * tree-depth asc (depth = L-D for D>=2 chunks, L-1 for D=1, L for
+     * into "chunks": bits >= 1 form D>=1 flat subtrees of size 2^D rooted
+     * at depth L-D (D=1 is the former sibling pair, now the smallest flat
+     * region); bit 0 is a singleton.  Sort chunks by their
+     * tree-depth asc (depth = L-D for D>=1 chunks, L for
      * singletons), then canonical-assign codes to chunks.  Within each
      * chunk, top-freq-first symbols of length L are assigned to its
      * 2^bit suffix slots (highest freqs go to the largest-D chunk per
@@ -885,12 +888,8 @@ static int build_core(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             for (int bit = PIVCO_MAX_CODE_LEN; bit >= 0; bit--) {
                 if (c & (1 << bit)) {
                     int n = 1 << bit;
-                    int depth;
-                    if      (bit >= 2) depth = L - bit;
-                    else if (bit == 1) depth = L - 1;
-                    else               depth = L;
                     chunks[n_chunks].bit     = (uint8_t)bit;
-                    chunks[n_chunks].depth   = (uint8_t)depth;
+                    chunks[n_chunks].depth   = (uint8_t)(L - bit);
                     chunks[n_chunks].sym_idx = (uint8_t)cur;
                     cur += n;
                     n_chunks++;
@@ -1183,13 +1182,6 @@ static int16_t etree_walk(etree_ctx_t *c, unsigned rank_begin, unsigned rank_end
         t->max_leaf_depth[id] = (uint8_t)D;
         break;
     }
-    case PIVCO_SCHED_PAIR:
-        t->tree[id].left  = etree_leaf(c, rank_begin);
-        t->tree[id].right = etree_leaf(c, rank_begin + 1);
-        t->split_rank[id] = rec->param;
-        t->node_type[id] = (uint8_t)PIVCO_NODE_BOTH_LEAVES;
-        t->max_leaf_depth[id] = 1;
-        break;
     case PIVCO_SCHED_LEAF_LEFT: {
         t->tree[id].left = etree_leaf(c, rank_begin);
         int16_t r = etree_walk(c, rank_begin + 1, rank_end);
@@ -1218,7 +1210,7 @@ static int16_t etree_walk(etree_ctx_t *c, unsigned rank_begin, unsigned rank_end
 void pivco_huffman_build_explicit_tree(pivco_huffman_table_t *table)
 {
     if (!table || table->dec.num_ranks < 2) return;
-    /* Zero the per-node arrays: the flat test (flat_depth >= 2), the
+    /* Zero the per-node arrays: the flat test (flat_depth >= 1), the
      * flat-root split_rank convention (stays 0) and max_leaf_depth leaf
      * entries all rely on zeros, and the table may have been built
      * without the memset covering a previous explicit-tree fill. */
