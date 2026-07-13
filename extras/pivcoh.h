@@ -77,7 +77,9 @@ typedef struct {
     /* internals */
     uint16_t num_ranks, sched_len;
     uint8_t rank_to_sym[256], sym_to_rank[256];
-    pivcoh__rec sched[255];
+    pivcoh__rec sched[60];   /* Kraft-complete max is 59 records (33 chunks,
+                                27 with bit >= 1); +1 so gen's overflow guard
+                                can't fire mid-walk on a maximal table */
 } pivcoh_table;
 
 /* Build a table from symbol frequencies (encoder side).  Derives optimal
@@ -126,7 +128,8 @@ typedef struct { uint8_t depth, bit, sym_idx; } pivcoh__chunk;
 static int pivcoh__gen(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
                        int *ci, int *rank, int depth, const uint8_t *items)
 {
-    if (*ci >= nch || depth > PIVCOH__MAXLEN || t->sched_len >= 255) return 0;
+    if (*ci >= nch || depth > PIVCOH__MAXLEN ||
+        t->sched_len >= (int)(sizeof t->sched / sizeof *t->sched)) return 0;
     if (ch[*ci].depth == depth) {              /* chunk leaf */
         const pivcoh__chunk *c = &ch[(*ci)++];
         int n = 1 << c->bit, r0 = *rank;
@@ -183,7 +186,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         /* "optimized" chunking: split each length's count by its set bits
          * (largest first), a 2^b chunk rooted at depth L-b; then stable
          * depth-sort so canonical assignment fills the tree left-to-right */
-        pivcoh__chunk ch[256];
+        pivcoh__chunk ch[49];   /* max sum popcount(cnt[L]): 11 classes, sum <= 256 */
         int nch = 0, i, j;
         for (L = 1, acc = 0; L <= PIVCOH__MAXLEN; acc += cnt[L], L++)
             for (i = 8, j = acc; i >= 0; i--)
