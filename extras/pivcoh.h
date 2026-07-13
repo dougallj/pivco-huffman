@@ -254,27 +254,24 @@ PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
             if (lens[sym[i]] > maxd) maxd = lens[sym[i]];
         }
 
-        if (maxd > PIVCOH__MAXLEN) {           /* RFC1951-style length limiting */
+        if (maxd > PIVCOH__MAXLEN) {           /* DEFLATE-style length limiting */
+            /* Clamp to MAXLEN, then repair the Kraft sum: in units of
+             * 2^-MAXLEN a clamped symbol weighs 1 instead of < 1, so
+             * 0 < debt < cnt[MAXLEN].  Each step re-homes one MAXLEN
+             * symbol as the sibling of a symbol demoted from the deepest
+             * shorter level: net -1 unit, so the loop lands on Kraft == 1
+             * exactly.  A non-empty b always exists: 256 symbols all at
+             * MAXLEN would be under-subscribed. */
             int cnt[PIVCOH__MAXLEN + 2] = {0}, b;
             for (i = 0; i < 256; i++)
                 if (lens[i]) cnt[lens[i] < PIVCOH__MAXLEN ? lens[i] : PIVCOH__MAXLEN]++;
-            long kraft = 0, target = 1L << PIVCOH__MAXLEN;
+            long kraft = 0;
             for (i = 1; i <= PIVCOH__MAXLEN; i++) kraft += (long)cnt[i] << (PIVCOH__MAXLEN - i);
-            while (kraft > target) {           /* over-full: lengthen the longest */
-                for (b = PIVCOH__MAXLEN - 1; b >= 1 && !cnt[b]; b--) {}
-                if (b < 1) break;
-                cnt[b]--; cnt[b + 1]++;
-                kraft -= 1L << (PIVCOH__MAXLEN - b - 1);
-            }
-            while (kraft < target && cnt[PIVCOH__MAXLEN]) {  /* under-full: shorten */
-                for (b = PIVCOH__MAXLEN - 1; b >= 1; b--) {
-                    long d = (1L << (PIVCOH__MAXLEN - b)) - 1;
-                    if (kraft + d <= target) { cnt[PIVCOH__MAXLEN]--; cnt[b]++; kraft += d; break; }
-                }
-                if (kraft < target) {
-                    if (cnt[PIVCOH__MAXLEN] < 2) break;
-                    cnt[PIVCOH__MAXLEN]--; cnt[PIVCOH__MAXLEN - 1]++; kraft++;
-                }
+            for (; kraft > 1L << PIVCOH__MAXLEN; kraft--) {
+                for (b = PIVCOH__MAXLEN - 1; !cnt[b]; b--) {}
+                cnt[b]--;
+                cnt[b + 1] += 2;
+                cnt[PIVCOH__MAXLEN]--;
             }
             /* reassign: stable by (capped old length, symbol) — snapshot the
              * order first, the assignments overwrite the sort keys */

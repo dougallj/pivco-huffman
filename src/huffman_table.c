@@ -232,69 +232,27 @@ static void limit_code_lengths(uint8_t *lengths, int n_symbols, int max_len)
     for (int L = 1; L <= max_len; L++)
         count[L] = h[0][L] + h[1][L] + h[2][L] + h[3][L];
 
-    /* Kraft sum may exceed 1.0. Fix by moving symbols from max_len
-       to shorter lengths. Each time we move one symbol from length L
-       to length L-1, the Kraft delta is: 2^(max-L+1) - 2^(max-L) = 2^(max-L).
-       But that creates a "debt" at length L-1 which may also overflow.
-
-       Work bottom-up: for each length from max_len down, if we have
-       overflow, push pairs up to parent (length-1). */
-
-    /* Compute Kraft sum in units of 2^(-max_len) */
+    /* DEFLATE-style Kraft repair (what zlib's gen_bitlen fixup does).
+       Clamping made the histogram over-subscribed: in units of
+       2^(-max_len), a clamped symbol weighs 1 instead of its true
+       2^(max_len - orig_len) < 1, so 0 < debt < count[max_len].  Each
+       step re-homes one max_len symbol as the new sibling of a symbol
+       demoted from the deepest shorter level b (count[b]--,
+       count[b+1] += 2, count[max_len]--): net -1 unit, no overshoot,
+       so the loop lands on Kraft == 1 exactly.  debt < count[max_len]
+       is preserved every step, and a non-empty b < max_len exists
+       while over-full (256 symbols all at max_len would be
+       under-subscribed for any max_len >= 9). */
     uint64_t kraft = 0;
-    for (int i = 1; i <= max_len; i++) {
+    for (int i = 1; i <= max_len; i++)
         kraft += (uint64_t)count[i] << (max_len - i);
-    }
-    uint64_t target = (uint64_t)1 << max_len;
-
-    /* While over-full, increase the longest codes */
-    while (kraft > target) {
-        /* Find a symbol at a length < max_len and increase it by 1.
-           This reduces Kraft by 2^(max_len - len) - 2^(max_len - len - 1)
-           = 2^(max_len - len - 1). Pick the longest such length to
-           minimize Kraft reduction per step. */
-        int best = -1;
-        for (int len = max_len - 1; len >= 1; len--) {
-            if (count[len] > 0) {
-                best = len;
-                break;
-            }
-        }
-        if (best < 0) break; /* shouldn't happen */
-
-        count[best]--;
-        count[best + 1]++;
-        kraft -= (uint64_t)1 << (max_len - best - 1);
-    }
-
-    /* While under-full, decrease some max_len codes to shorter lengths.
-       This fills unused Kraft capacity. */
-    while (kraft < target && count[max_len] > 0) {
-        /* Find the shortest length where we can add capacity */
-        for (int len = max_len - 1; len >= 1; len--) {
-            /* Moving one code from max_len to len changes kraft by:
-               +2^(max_len-len) - 2^(max_len-max_len) = 2^(max_len-len) - 1 */
-            uint64_t delta = ((uint64_t)1 << (max_len - len)) - 1;
-            if (kraft + delta <= target && count[max_len] > 0) {
-                count[max_len]--;
-                count[len]++;
-                kraft += delta;
-                break;
-            }
-        }
-        /* If we couldn't shorten anything, done */
-        if (kraft < target) {
-            /* Try filling one slot at max_len-1 at a time */
-            uint64_t delta = ((uint64_t)1 << 1) - 1; /* moving max_len to max_len-1 */
-            if (kraft + delta <= target && count[max_len] >= 2) {
-                /* Move one from max_len to max_len-1: net = +2 - 1 = +1 */
-                count[max_len]--;
-                count[max_len - 1]++;
-                kraft += 1;
-            } else {
-                break;
-            }
-        }
+    for (uint64_t target = (uint64_t)1 << max_len; kraft > target; kraft--) {
+        int b = max_len - 1;
+        while (b >= 1 && !count[b]) b--;
+        PIVCO_CHECK(b >= 1);
+        count[b]--;
+        count[b + 1] += 2;
+        count[max_len]--;
     }
 
     /* Reassign lengths based on new counts.
