@@ -28,7 +28,7 @@ extern const uint64_t *bench_dist_freq(int idx);
 /* Shortest leaf depth relative to this node, i.e. local_min. */
 static int compute_local_min(const pivco_huffman_table_t *t, int16_t node_id)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return 0;
     int l = compute_local_min(t, n->left);
     int r = compute_local_min(t, n->right);
@@ -39,7 +39,7 @@ static int compute_local_min(const pivco_huffman_table_t *t, int16_t node_id)
 __attribute__((unused))
 static int compute_local_max(const pivco_huffman_table_t *t, int16_t node_id)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return 0;
     int l = compute_local_max(t, n->left);
     int r = compute_local_max(t, n->right);
@@ -50,9 +50,9 @@ static int compute_local_max(const pivco_huffman_table_t *t, int16_t node_id)
  * canonical code layout), return the resulting tree node id. */
 static int16_t walk_prefix(const pivco_huffman_table_t *t, uint32_t prefix, int M)
 {
-    int16_t node_id = t->tree_root;
+    int16_t node_id = t->dec.tree_root;
     for (int b = M - 1; b >= 0; b--) {
-        const pivco_tree_node_t *n = &t->tree[node_id];
+        const pivco_tree_node_t *n = &t->dec.tree[node_id];
         if (n->symbol >= 0) return node_id;
         int bit = (prefix >> b) & 1;
         node_id = bit ? n->right : n->left;
@@ -108,7 +108,7 @@ static void analyze_distribution(int d)
 
     for (int v = 0; v < K; v++) {
         int16_t node = walk_prefix(t, (uint32_t)v, M_top);
-        const pivco_tree_node_t *n = &t->tree[node];
+        const pivco_tree_node_t *n = &t->dec.tree[node];
         if (n->symbol >= 0) {
             leaf_bins++;
             w_leaf += bin_weight[v];

@@ -85,9 +85,9 @@ static void measure_mode(pivco_tree_mode_t mode, const uint8_t *sym, size_t n,
     /* Total symbols absorbed by flat-D>=2 subtrees -- a better proxy for
        "how much of the decode work is fast-pathed" than the bare node count. */
     int flat_syms_total = 0;
-    for (int i = 0; i < table->tree_node_count; i++) {
-        if (table->flat_depth[i] >= 2)
-            flat_syms_total += (1 << table->flat_depth[i]);
+    for (int i = 0; i < table->dec.tree_node_count; i++) {
+        if (table->dec.flat_depth[i] >= 2)
+            flat_syms_total += (1 << table->dec.flat_depth[i]);
     }
     *flat_internal_nodes_out = flat_syms_total;
 

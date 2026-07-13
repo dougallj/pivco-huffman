@@ -50,7 +50,7 @@ static uint64_t fill_subtree_freq(const pivco_huffman_table_t *t,
                                   int16_t node,
                                   uint64_t out[])
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) { out[node] = freq[n->symbol]; return out[node]; }
     uint64_t l = fill_subtree_freq(t, freq, n->left,  out);
     uint64_t r = fill_subtree_freq(t, freq, n->right, out);
@@ -63,7 +63,7 @@ static void walk_full_tans(const pivco_huffman_table_t *t,
                            const uint64_t subtree_freq[],
                            int16_t node, double *bits)
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) return;
     uint64_t sf = subtree_freq[node];
     if (sf == 0) return;
@@ -79,11 +79,11 @@ static void walk_flat_carve(const pivco_huffman_table_t *t,
                             const uint64_t subtree_freq[],
                             int16_t node, double *bits, double *flat_bits)
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) return;
     uint64_t sf = subtree_freq[node];
     if (sf == 0) return;
-    int D = t->flat_depth[node];
+    int D = t->dec.flat_depth[node];
     if (D >= 2) {
         *bits      += (double)sf * (double)D;
         *flat_bits += (double)sf * (double)D;
@@ -128,11 +128,11 @@ static void analyze_freq(const uint64_t freq[256],
         if (freq[s]) huf_bits += (double)freq[s] * tbl->code_len[s];
 
     memset(subtree_freq, 0, PIVCO_MAX_TREE_NODES * sizeof(uint64_t));
-    fill_subtree_freq(tbl, freq, tbl->tree_root, subtree_freq);
+    fill_subtree_freq(tbl, freq, tbl->dec.tree_root, subtree_freq);
 
     double full_tans = 0.0, flat_carve = 0.0, flat_only = 0.0;
-    walk_full_tans (tbl, subtree_freq, tbl->tree_root, &full_tans);
-    walk_flat_carve(tbl, subtree_freq, tbl->tree_root, &flat_carve, &flat_only);
+    walk_full_tans (tbl, subtree_freq, tbl->dec.tree_root, &full_tans);
+    walk_flat_carve(tbl, subtree_freq, tbl->dec.tree_root, &flat_carve, &flat_only);
 
     *huf_bps       = huf_bits   / (double)N;
     *tans_flat_bps = flat_carve / (double)N;
@@ -221,10 +221,10 @@ static void simulate_partition(const pivco_huffman_table_t *t,
                                uint16_t *tmp)
 {
     if (n == 0) return;
-    const pivco_tree_node_t *node = &t->tree[node_id];
+    const pivco_tree_node_t *node = &t->dec.tree[node_id];
     if (node->symbol >= 0) return; /* leaf */
 
-    int D = t->flat_depth[node_id];
+    int D = t->dec.flat_depth[node_id];
     if (D >= 2) {
         *flat_bits += (double)n * (double)D;
         return;
@@ -346,12 +346,12 @@ static void walk_exact(const pivco_huffman_table_t *t,
                        exact_depth_t depth_stats[MAX_DEPTH_BUCKETS],
                        double *flat_bits)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return;
     uint64_t sf = subtree_freq[node_id];
     if (sf == 0) return;
 
-    int D = t->flat_depth[node_id];
+    int D = t->dec.flat_depth[node_id];
     if (D >= 2) {
         *flat_bits += (double)sf * scale * (double)D;
         return;
@@ -405,11 +405,11 @@ static int run_exact_tier_mode(int main_only)
         double scale = (double)PIVCO_BLOCK_SIZE / (double)total_freq;
 
         memset(subtree_freq, 0, PIVCO_MAX_TREE_NODES * sizeof(uint64_t));
-        fill_subtree_freq(tbl, freq, tbl->tree_root, subtree_freq);
+        fill_subtree_freq(tbl, freq, tbl->dec.tree_root, subtree_freq);
 
         exact_depth_t depth_stats[MAX_DEPTH_BUCKETS] = {{0}};
         double flat_bits = 0.0;
-        walk_exact(tbl, subtree_freq, tbl->tree_root, 0, scale, depth_stats, &flat_bits);
+        walk_exact(tbl, subtree_freq, tbl->dec.tree_root, 0, scale, depth_stats, &flat_bits);
 
         /* Total Huffman bits in one 8K block. */
         double huff_bits = 0.0;
@@ -551,7 +551,7 @@ static int run_verify_dist_mode(int main_only)
                 codes_la[j] = len > 0
                     ? (uint16_t)(tbl->code[s] << (16 - len)) : 0;
             }
-            simulate_partition(tbl, codes_la, PIVCO_BLOCK_SIZE, tbl->tree_root, 0,
+            simulate_partition(tbl, codes_la, PIVCO_BLOCK_SIZE, tbl->dec.tree_root, 0,
                                &flat_bits, depth_stats, tmp_buf);
         }
 
@@ -685,11 +685,11 @@ int main(int argc, char **argv)
                 if (freq[s]) total_huf_bits += (double)freq[s] * tbl->code_len[s];
 
             memset(subtree_freq, 0, PIVCO_MAX_TREE_NODES * sizeof(uint64_t));
-            fill_subtree_freq(tbl, freq, tbl->tree_root, subtree_freq);
+            fill_subtree_freq(tbl, freq, tbl->dec.tree_root, subtree_freq);
 
             double full_tans = 0, flat_carve = 0, flat_only = 0;
-            walk_full_tans (tbl, subtree_freq, tbl->tree_root, &full_tans);
-            walk_flat_carve(tbl, subtree_freq, tbl->tree_root, &flat_carve, &flat_only);
+            walk_full_tans (tbl, subtree_freq, tbl->dec.tree_root, &full_tans);
+            walk_flat_carve(tbl, subtree_freq, tbl->dec.tree_root, &flat_carve, &flat_only);
 
             total_shannon_bits   += full_tans;
             total_tans_flat_bits += flat_carve;

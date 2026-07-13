@@ -93,7 +93,7 @@ static cov_t opt_cov(const multiset_t *m, int min_D)
 
 static int local_min(const pivco_huffman_table_t *t, int16_t node_id)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return 0;
     int l = local_min(t, n->left);
     int r = local_min(t, n->right);
@@ -102,7 +102,7 @@ static int local_min(const pivco_huffman_table_t *t, int16_t node_id)
 
 static int local_max(const pivco_huffman_table_t *t, int16_t node_id)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return 0;
     int l = local_max(t, n->left);
     int r = local_max(t, n->right);
@@ -113,7 +113,7 @@ static uint64_t subtree_freq_sum(const pivco_huffman_table_t *t,
                                   int16_t node_id,
                                   const uint64_t *freq)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return freq[n->symbol];
     return subtree_freq_sum(t, n->left, freq) +
            subtree_freq_sum(t, n->right, freq);
@@ -135,7 +135,7 @@ static void canonical_walk(const pivco_huffman_table_t *t,
                             uint16_t *d1_pair_per_depth,
                             int *partition_count,   uint64_t *partition_freq)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return;
 
     int lmin = local_min(t, node_id);
@@ -150,8 +150,8 @@ static void canonical_walk(const pivco_huffman_table_t *t,
         return;
     }
 
-    const pivco_tree_node_t *lc = &t->tree[n->left];
-    const pivco_tree_node_t *rc = &t->tree[n->right];
+    const pivco_tree_node_t *lc = &t->dec.tree[n->left];
+    const pivco_tree_node_t *rc = &t->dec.tree[n->right];
     if (lc->symbol >= 0 && rc->symbol >= 0) {
         int leaf_depth = cur_depth + 1;
         *d1_pair_leaves += 2;
@@ -319,7 +319,7 @@ static void analyze(int d)
     uint16_t cn_d1_per_depth[MAX_DEPTH] = {0};
     int      cn_part_count = 0;
     uint64_t cn_part_cost  = 0;
-    canonical_walk(t, t->tree_root, 0, freq,
+    canonical_walk(t, t->dec.tree_root, 0, freq,
                    &cn_d2_leaves, &cn_d2_freq, cn_d2_per_depth,
                    &cn_d1_leaves, &cn_d1_freq, cn_d1_per_depth,
                    &cn_part_count, &cn_part_cost);

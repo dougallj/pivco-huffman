@@ -42,16 +42,16 @@ static void collect_flat(const pivco_huffman_table_t *t,
                           uint64_t *w_by_depth,  /* depth 0..15 */
                           int *count_by_depth)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return;   /* single leaf: no subtree */
 
-    int D = t->flat_depth[node_id];
+    int D = t->dec.flat_depth[node_id];
     if (D >= 2) {
         int d = D > 15 ? 15 : D;
         count_by_depth[d] += 1;
         uint64_t w = 0;
-        int off = t->flat_offset[node_id];
-        for (int k = 0; k < (1 << D); k++) w += freq[t->flat_code_to_sym[off + k]];
+        int off = t->dec.flat_offset[node_id];
+        for (int k = 0; k < (1 << D); k++) w += freq[t->dec.flat_code_to_sym[off + k]];
         w_by_depth[d] += w;
         return;  /* maximal flat subtree — don't descend further */
     }
@@ -87,7 +87,7 @@ static void analyze_distribution(int d)
      * "root flat" and do not descend into the flat-subtree tally (the
      * existing full-tree flat path already handles this). */
     if (!root_flat) {
-        collect_flat(t, t->tree_root, freq, w_by_depth, c_by_depth);
+        collect_flat(t, t->dec.tree_root, freq, w_by_depth, c_by_depth);
     }
 
     uint64_t w_total_flat = 0;

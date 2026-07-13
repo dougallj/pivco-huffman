@@ -1,3 +1,7 @@
+/* FROZEN fork copy (see extras/ph-td/README): kr_header_needed here keys
+ * on ph-td's own pivco_huffman_table_t (explicit tree at top level); the
+ * live src/ copy now keys on the codec's pivco_huffman_decode_table_t.
+ * Wire semantics are identical. */
 #ifndef PIVCO_HUFFMAN_COMMON_H
 #define PIVCO_HUFFMAN_COMMON_H
 
@@ -95,7 +99,7 @@ static inline int bitmap_bytes(int n)
  *
  * The "needs header" decision is a pure function of the tree topology and
  * matches across encoder and decoder via this shared helper. */
-static inline int kr_header_needed(const pivco_huffman_decode_table_t *table,
+static inline int kr_header_needed(const pivco_huffman_table_t *table,
                                     int16_t node_id)
 {
     const pivco_tree_node_t *n = &table->tree[node_id];

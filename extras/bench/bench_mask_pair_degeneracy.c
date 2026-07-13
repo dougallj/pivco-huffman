@@ -73,9 +73,9 @@ static void walk_partition(const pivco_huffman_table_t *t,
                             stats_t *st)
 {
     if (n == 0) return;
-    const pivco_tree_node_t *node = &t->tree[node_id];
+    const pivco_tree_node_t *node = &t->dec.tree[node_id];
     if (node->symbol >= 0) return;
-    if (t->flat_depth[node_id] >= 2) return;  /* skipped by partition_8 path */
+    if (t->dec.flat_depth[node_id] >= 2) return;  /* skipped by partition_8 path */
 
     int n_left = 0, n_right = 0;
     int j = 0;
@@ -167,7 +167,7 @@ static void run_dist(int idx, int n_blocks)
             blk_lens[i]  = lens[symbols[i]];
             indices[i]   = (uint16_t)i;
         }
-        walk_partition(&t, t.tree_root, indices, PIVCO_BLOCK_SIZE, 0,
+        walk_partition(&t, t.dec.tree_root, indices, PIVCO_BLOCK_SIZE, 0,
                        blk_codes, blk_lens, tmp, &st);
     }
 

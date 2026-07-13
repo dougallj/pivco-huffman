@@ -96,11 +96,11 @@ static void build_canonical(const uint8_t *code_len,
 
     /* Build tree from canonical codes (walk MSB-first). */
     int16_t nc = 0;
-    out->tree[nc].symbol = -1;
-    out->tree[nc].left   = -1;
-    out->tree[nc].right  = -1;
+    out->dec.tree[nc].symbol = -1;
+    out->dec.tree[nc].left   = -1;
+    out->dec.tree[nc].right  = -1;
     nc++;
-    out->tree_root = 0;
+    out->dec.tree_root = 0;
 
     for (int s = 0; s < PIVCO_MAX_SYMBOLS; s++) {
         if (code_len[s] == 0) continue;
@@ -109,19 +109,19 @@ static void build_canonical(const uint8_t *code_len,
         int16_t cur  = 0;
         for (int b = len - 1; b >= 0; b--) {
             int bit = (c >> b) & 1;
-            int16_t *child = bit ? &out->tree[cur].right : &out->tree[cur].left;
+            int16_t *child = bit ? &out->dec.tree[cur].right : &out->dec.tree[cur].left;
             if (*child < 0) {
                 *child = nc;
-                out->tree[nc].symbol = -1;
-                out->tree[nc].left   = -1;
-                out->tree[nc].right  = -1;
+                out->dec.tree[nc].symbol = -1;
+                out->dec.tree[nc].left   = -1;
+                out->dec.tree[nc].right  = -1;
                 nc++;
             }
             cur = *child;
         }
-        out->tree[cur].symbol = (int16_t)s;
+        out->dec.tree[cur].symbol = (int16_t)s;
     }
-    out->tree_node_count = nc;
+    out->dec.tree_node_count = nc;
 }
 
 /* ---------- SVG rendering ---------- */
@@ -208,7 +208,7 @@ static void avg_ops_per_leaf(const pivco_huffman_table_t *t,
     int total_ops = 0, n_leaves = 0;
     uint64_t total_freq = 0;
     double total_freq_ops = 0.0;
-    leaf_ops_walk(t->tree, t->tree_root, 0, -1,
+    leaf_ops_walk(t->dec.tree, t->dec.tree_root, 0, -1,
                    &total_ops, &n_leaves,
                    freq, &total_freq, &total_freq_ops);
     *out_unweighted = n_leaves ? (double)total_ops / (double)n_leaves : 0.0;
@@ -257,7 +257,7 @@ static double render_tree_panel(FILE *f, const pivco_huffman_table_t *t,
                                  const char *title, double ox, double oy,
                                  double *out_panel_h)
 {
-    int n_leaves = subtree_leaves(t->tree, t->tree_root);
+    int n_leaves = subtree_leaves(t->dec.tree, t->dec.tree_root);
     int max_len  = t->max_len;
     double w = n_leaves * LEAF_W;
     double h = (double)max_len * LEVEL_H + LEAF_R * 2 + LEVEL_H * 0.5;
@@ -270,7 +270,7 @@ static double render_tree_panel(FILE *f, const pivco_huffman_table_t *t,
     /* Flat boxes first (background). */
     flat_box_t boxes[PIVCO_MAX_SYMBOLS];
     int nbox = 0;
-    collect_flat_boxes(t->tree, t->tree_root, 0.0, w, 0, boxes, &nbox);
+    collect_flat_boxes(t->dec.tree, t->dec.tree_root, 0.0, w, 0, boxes, &nbox);
     int total_flat_leaves = 0;
     int total_d2plus_leaves = 0;
     for (int i = 0; i < nbox; i++) {
@@ -301,7 +301,7 @@ static double render_tree_panel(FILE *f, const pivco_huffman_table_t *t,
     }
 
     /* Tree on top. */
-    draw_tree(f, t->tree, t->tree_root, 0.0, w, 0, -1.0, /*in_box=*/0);
+    draw_tree(f, t->dec.tree, t->dec.tree_root, 0.0, w, 0, -1.0, /*in_box=*/0);
 
     /* Footer: stats.  Avg ops/leaf = mean over all leaves of
      * (#partitioning ancestors + 1 terminal op).  "weighted" =
@@ -347,7 +347,7 @@ static double render_distribution(FILE *f, const char *name,
     build_canonical(t_opt.code_len, &t_canon);
 
     /* Distribution title. */
-    int n_leaves = subtree_leaves(t_opt.tree, t_opt.tree_root);
+    int n_leaves = subtree_leaves(t_opt.dec.tree, t_opt.dec.tree_root);
     fprintf(f, "<g transform=\"translate(0, %.1f)\">\n", oy);
     fprintf(f, "  <text x=\"4\" y=\"14\" font-family=\"sans-serif\" "
             "font-size=\"13\" font-weight=\"bold\" fill=\"#000\">%s</text>\n",
@@ -461,11 +461,11 @@ static void dot_emit_tree_cluster(FILE *f, const pivco_huffman_table_t *t,
 
     /* Flat-D cluster subgraphs (must be inside the tree's cluster). */
     int seq = 0;
-    dot_emit_flat_clusters(f, t->tree, t->tree_root, cluster_name, &seq);
+    dot_emit_flat_clusters(f, t->dec.tree, t->dec.tree_root, cluster_name, &seq);
 
     /* All nodes + edges (those in flat clusters are listed there too;
      * dot tolerates this — they end up positioned inside the cluster). */
-    dot_emit_subtree(f, t->tree, t->tree_root, cluster_name);
+    dot_emit_subtree(f, t->dec.tree, t->dec.tree_root, cluster_name);
 
     fprintf(f, "}\n");
 }
@@ -511,7 +511,7 @@ static void measure_distribution(const uint64_t *freq, double *out_w,
     if (pivco_huffman_build_table(freq, &t_opt) != PIVCO_OK) {
         *out_w = 0; *out_h = 0; return;
     }
-    int n_leaves = subtree_leaves(t_opt.tree, t_opt.tree_root);
+    int n_leaves = subtree_leaves(t_opt.dec.tree, t_opt.dec.tree_root);
     int max_len  = t_opt.max_len;
     double w_panel = n_leaves * LEAF_W;
     double h_panel = (double)max_len * LEVEL_H + LEAF_R * 2 + LEVEL_H * 0.5;

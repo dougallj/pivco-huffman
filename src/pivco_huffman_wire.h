@@ -74,7 +74,7 @@ static inline int wire_read_block_n(const uint8_t **in_ptr)
  * The encoder reserves the header slot(s) BEFORE knowing n_right, then
  * commits the value afterwards.  Returns pointer to where the K_right
  * uint16 should be written (NULL if no header was reserved). */
-static inline uint8_t *wire_reserve_kr_header(const pivco_huffman_table_t *table,
+static inline uint8_t *wire_reserve_kr_header(const pivco_huffman_decode_table_t *table,
                                                int16_t node_id,
                                                uint8_t **out_ptr)
 {
@@ -108,7 +108,7 @@ static inline void wire_commit_kr_header(uint8_t *slot, int n_right)
 /* Skip the K_right header bytes, returning the value as an int.  If no
  * header is present for this node, returns -1.  (Top-down decoders
  * don't use the value; bottom-up ones do.) */
-static inline int wire_read_kr_header(const pivco_huffman_table_t *table,
+static inline int wire_read_kr_header(const pivco_huffman_decode_table_t *table,
                                        int16_t node_id,
                                        const uint8_t **in_ptr)
 {

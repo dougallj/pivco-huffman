@@ -105,6 +105,34 @@ typedef enum {
     PIVCO_NODE_LEAF,               /* leaf — consumed by the parent merge, never dispatched */
 } pivco_node_type_t;
 
+/* ---------- Decode table ----------
+ *
+ * EVERYTHING the codec walk (encode and decode) reads, as one
+ * self-contained struct: the tree nodes in a contiguous buffer plus the
+ * per-node dispatch / flat metadata and the flat rank -> symbol pool.
+ * The full pivco_huffman_table_t embeds one as `dec` (its first member),
+ * so the walk takes the same pointer either way.
+ *
+ * Flat-subtree fast path: per-node, if flat_depth[i] >= 2 then node i
+ * is the root of a MAXIMAL flat subtree of depth D = flat_depth[i]
+ * (all 2^D leaves at the same relative depth; no child nodes are
+ * materialized below it).  Encoder emits N*D packed bits at this node
+ * instead of D levels of bitmaps; decoder reads N*D bits and uses
+ * flat_code_to_sym[flat_offset[i] + code] per element. */
+typedef struct {
+    /* Decode side: tree + dispatch + flat lookups. */
+    pivco_tree_node_t tree[PIVCO_MAX_TREE_NODES];
+    uint8_t  node_type[PIVCO_MAX_TREE_NODES];       /* pivco_node_type_t */
+    uint8_t  flat_depth[PIVCO_MAX_TREE_NODES];      /* >= 2: flat-subtree root */
+    uint16_t flat_offset[PIVCO_MAX_TREE_NODES];     /* flat root's slice base */
+    uint8_t  flat_code_to_sym[PIVCO_MAX_SYMBOLS];
+    /* Encode side ("partbyrank" routing; see the full table). */
+    uint8_t  split_rank[PIVCO_MAX_TREE_NODES];      /* max rank in node's left subtree */
+    uint8_t  flat_base_rank[PIVCO_MAX_TREE_NODES];  /* min rank in a flat subtree */
+    int16_t  tree_root;
+    int16_t  tree_node_count;
+} pivco_huffman_decode_table_t;
+
 /* ---------- Huffman table ---------- */
 
 /* Arch-specific precomputed gather tables for prim_enc_init.  Every pointer is
@@ -118,6 +146,10 @@ typedef struct {
 } pivco_huffman_enc_init_aux_t;
 
 typedef struct {
+    /* Codec core — the tree walk (both encode and decode) reads ONLY
+     * this.  See pivco_huffman_decode_table_t. */
+    pivco_huffman_decode_table_t dec;
+
     /* Per-symbol encode info */
     uint16_t code[PIVCO_MAX_SYMBOLS];       /* canonical Huffman code */
     uint8_t  code_len[PIVCO_MAX_SYMBOLS];   /* code length (0 = unused) */
@@ -136,13 +168,6 @@ typedef struct {
      * NULL (other arches).  Self-referential — rebuild, don't bitwise-copy, a
      * table after pivco_huffman_build_table. */
     pivco_huffman_enc_init_aux_t enc_init_aux;
-    uint8_t  split_rank[PIVCO_MAX_TREE_NODES];      /* max rank in node's left subtree */
-    uint8_t  flat_base_rank[PIVCO_MAX_TREE_NODES];  /* min rank in a flat subtree */
-
-    /* Tree for PIVCO tree-walk encode/decode */
-    pivco_tree_node_t tree[PIVCO_MAX_TREE_NODES];
-    int16_t tree_root;
-    int16_t tree_node_count;
 
     /* Canonical decode info (for traditional decoder) */
     uint16_t first_code[PIVCO_MAX_CODE_LEN + 1];
@@ -158,16 +183,6 @@ typedef struct {
     uint8_t  min_len;
     uint16_t num_symbols;
 
-    /* Flat-subtree fast path: per-node, if flat_depth[i] >= 2 then node i
-       is the root of a MAXIMAL flat subtree of depth D = flat_depth[i]
-       (all 2^D leaves at the same relative depth).  Encoder emits N*D
-       packed bits at this node instead of D levels of bitmaps; decoder
-       reads N*D bits and uses flat_code_to_sym[flat_offset[i] + code]
-       per element.  Pool sum of 2^D across flat subtrees <= num_symbols. */
-    uint8_t  flat_depth[PIVCO_MAX_TREE_NODES];
-    uint16_t flat_offset[PIVCO_MAX_TREE_NODES];
-    uint8_t  flat_code_to_sym[PIVCO_MAX_SYMBOLS];
-
     /* Max leaf depth in the subtree rooted at this node, relative to
      * the global tree.  At runtime, the encoder checks
      * `max_leaf_depth[node] - depth <= 8` to decide whether to repack
@@ -175,10 +190,6 @@ typedef struct {
      * byte-wide SIMD. */
     uint8_t  max_leaf_depth[PIVCO_MAX_TREE_NODES];
 
-    /* Decode dispatch type per node — see pivco_node_type_t.  Set by
-     * build_table after tree and flat_depth are finalized.  Decoders
-     * switch on this instead of running per-call conditional chains. */
-    uint8_t  node_type[PIVCO_MAX_TREE_NODES];
 } pivco_huffman_table_t;
 
 /* ---------- Implementation selection ---------- */

@@ -57,23 +57,23 @@ static void leaf_stats_walk(const pivco_huffman_table_t *t,
                              uint64_t *out_total_freq,
                              double *out_freq_ops,
                              double *out_freq_depth) {
-    if (t->tree[node].symbol >= 0) {
+    if (t->dec.tree[node].symbol >= 0) {
         int ops = depth;
-        int sym = t->tree[node].symbol;
+        int sym = t->dec.tree[node].symbol;
         uint64_t fw = freq[sym];
         *out_total_freq += fw;
         *out_freq_ops   += (double)fw * (double)ops;
         *out_freq_depth += (double)fw * (double)depth;
         return;
     }
-    if (t->flat_depth[node] >= 2) {
-        int D = t->flat_depth[node];
-        int off = t->flat_offset[node];
+    if (t->dec.flat_depth[node] >= 2) {
+        int D = t->dec.flat_depth[node];
+        int off = t->dec.flat_offset[node];
         int n = 1 << D;
         int ops = depth + 1;      /* one flat_decode op for whole subtree */
         int leaf_depth = depth + D;
         for (int i = 0; i < n; i++) {
-            int sym = t->flat_code_to_sym[off + i];
+            int sym = t->dec.flat_code_to_sym[off + i];
             uint64_t fw = freq[sym];
             *out_total_freq += fw;
             *out_freq_ops   += (double)fw * (double)ops;
@@ -81,9 +81,9 @@ static void leaf_stats_walk(const pivco_huffman_table_t *t,
         }
         return;
     }
-    leaf_stats_walk(t, t->tree[node].left,  depth+1, freq,
+    leaf_stats_walk(t, t->dec.tree[node].left,  depth+1, freq,
                     out_total_freq, out_freq_ops, out_freq_depth);
-    leaf_stats_walk(t, t->tree[node].right, depth+1, freq,
+    leaf_stats_walk(t, t->dec.tree[node].right, depth+1, freq,
                     out_total_freq, out_freq_ops, out_freq_depth);
 }
 
@@ -91,11 +91,11 @@ static void leaf_stats_walk(const pivco_huffman_table_t *t,
  * Leaves produce constants — no op. A flat-D>=2 subtree root counts once
  * (its children are absorbed and not materialized in tree[]). */
 static int count_op_nodes(const pivco_huffman_table_t *t, int16_t node) {
-    if (t->tree[node].symbol >= 0) return 0;        /* leaf */
-    if (t->flat_depth[node] >= 2)  return 1;        /* flat root: 1 merge */
+    if (t->dec.tree[node].symbol >= 0) return 0;        /* leaf */
+    if (t->dec.flat_depth[node] >= 2)  return 1;        /* flat root: 1 merge */
     int c = 1;
-    c += count_op_nodes(t, t->tree[node].left);
-    c += count_op_nodes(t, t->tree[node].right);
+    c += count_op_nodes(t, t->dec.tree[node].left);
+    c += count_op_nodes(t, t->dec.tree[node].right);
     return c;
 }
 
@@ -119,11 +119,11 @@ static mode_stats_t build_and_measure(pivco_tree_mode_t mode,
 
     uint64_t tot_f = 0;
     double f_ops = 0.0, f_depth = 0.0;
-    leaf_stats_walk(t, t->tree_root, 0, freq, &tot_f, &f_ops, &f_depth);
+    leaf_stats_walk(t, t->dec.tree_root, 0, freq, &tot_f, &f_ops, &f_depth);
     st.ops_per_byte = tot_f ? f_ops / (double)tot_f : 0.0;
     if (out_weighted_code_len)
         *out_weighted_code_len = tot_f ? f_depth / (double)tot_f : 0.0;
-    st.node_count = count_op_nodes(t, t->tree_root);
+    st.node_count = count_op_nodes(t, t->dec.tree_root);
     free(t);
     return st;
 }

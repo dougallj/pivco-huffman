@@ -507,8 +507,8 @@ int main(int argc, char **argv)
         comp_stats[d].name = name;
         comp_stats[d].max_code_len = (double)table->max_len;
         comp_stats[d].n_leaves = (int)table->num_symbols;
-        for (int16_t i = 0; i < table->tree_node_count; i++) {
-            switch ((pivco_node_type_t)table->node_type[i]) {
+        for (int16_t i = 0; i < table->dec.tree_node_count; i++) {
+            switch ((pivco_node_type_t)table->dec.node_type[i]) {
                 case PIVCO_NODE_INTERNAL_FULL: comp_stats[d].n_internal_full++; break;
                 case PIVCO_NODE_INTERNAL_FLAT: comp_stats[d].n_internal_flat++; break;
                 case PIVCO_NODE_LEAF_LEFT:     comp_stats[d].n_half++; break;
@@ -522,9 +522,9 @@ int main(int argc, char **argv)
         {
             int internals_inside_flat = 0;
             int leaves_inside_flat    = 0;
-            for (int16_t i = 0; i < table->tree_node_count; i++) {
-                if (table->node_type[i] == (uint8_t)PIVCO_NODE_INTERNAL_FLAT) {
-                    int D = table->flat_depth[i];
+            for (int16_t i = 0; i < table->dec.tree_node_count; i++) {
+                if (table->dec.node_type[i] == (uint8_t)PIVCO_NODE_INTERNAL_FLAT) {
+                    int D = table->dec.flat_depth[i];
                     /* A flat subtree of depth D has 2^D - 1 internal
                      * nodes below the flat root and 2^D leaves below it. */
                     int n_subtree_internals = (1 << D) - 1;

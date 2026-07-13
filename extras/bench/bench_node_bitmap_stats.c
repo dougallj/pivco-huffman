@@ -43,12 +43,12 @@ typedef struct {
 static void walk(const pivco_huffman_table_t *t, int node,
                  uint8_t *ranks, int n, uint8_t *tmp, stats_t *s)
 {
-    pivco_node_type_t nt = (pivco_node_type_t)t->node_type[node];
+    pivco_node_type_t nt = (pivco_node_type_t)t->dec.node_type[node];
     if (nt == PIVCO_NODE_LEAF) return;
     if (nt == PIVCO_NODE_INTERNAL_FLAT) return;          /* packed codes, no bitmap */
     if (n <= 0) return;
 
-    uint8_t thr = t->split_rank[node];
+    uint8_t thr = t->dec.split_rank[node];
     s->nodes++; s->elems += (unsigned long long)n;
 
     int nw = n >> 6;
@@ -85,8 +85,8 @@ static void walk(const pivco_huffman_table_t *t, int node,
         uint8_t r = ranks[j];
         if (r > thr) tmp[nr++] = r; else ranks[nl++] = r;
     }
-    walk(t, t->tree[node].left,  ranks, nl, tmp + nr, s);
-    walk(t, t->tree[node].right, tmp,   nr, tmp + nr, s);
+    walk(t, t->dec.tree[node].left,  ranks, nl, tmp + nr, s);
+    walk(t, t->dec.tree[node].right, tmp,   nr, tmp + nr, s);
 }
 
 int main(int argc, char **argv)
@@ -119,7 +119,7 @@ int main(int argc, char **argv)
         for (int off = 0; off + PIVCO_BLOCK_SIZE <= n; off += PIVCO_BLOCK_SIZE) {
             for (int i = 0; i < PIVCO_BLOCK_SIZE; i++)
                 ranks[i] = table->sym_to_rank[sym[off + i]];
-            walk(table, table->tree_root, ranks, PIVCO_BLOCK_SIZE, tmp, &s);
+            walk(table, table->dec.tree_root, ranks, PIVCO_BLOCK_SIZE, tmp, &s);
         }
 
 #define PCT(a, b) ((b) ? 100.0 * (double)(a) / (double)(b) : 0.0)

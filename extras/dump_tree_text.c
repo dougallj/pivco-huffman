@@ -42,25 +42,25 @@ static void emit_path(const char *buf, int depth)
 static void walk(const pivco_huffman_table_t *T, int16_t node,
                  char *buf, int depth)
 {
-    if (T->flat_depth[node] >= 2) {
-        int D = T->flat_depth[node];
-        uint16_t off = T->flat_offset[node];
+    if (T->dec.flat_depth[node] >= 2) {
+        int D = T->dec.flat_depth[node];
+        uint16_t off = T->dec.flat_offset[node];
         emit_path(buf, depth);
         printf(" FLAT D=%d syms=", D);
         for (int i = 0; i < (1 << D); i++) {
             if (i) putchar(',');
-            printf("%d", T->flat_code_to_sym[off + i]);
+            printf("%d", T->dec.flat_code_to_sym[off + i]);
         }
         putchar('\n');
         return;                       /* maximal -- don't descend */
     }
-    if (T->tree[node].symbol >= 0) {
+    if (T->dec.tree[node].symbol >= 0) {
         emit_path(buf, depth);
-        printf(" LEAF sym=%d len=%d\n", T->tree[node].symbol, depth);
+        printf(" LEAF sym=%d len=%d\n", T->dec.tree[node].symbol, depth);
         return;
     }
-    buf[depth] = '0'; walk(T, T->tree[node].left,  buf, depth + 1);
-    buf[depth] = '1'; walk(T, T->tree[node].right, buf, depth + 1);
+    buf[depth] = '0'; walk(T, T->dec.tree[node].left,  buf, depth + 1);
+    buf[depth] = '1'; walk(T, T->dec.tree[node].right, buf, depth + 1);
 }
 
 int main(int argc, char **argv)
@@ -97,7 +97,7 @@ int main(int argc, char **argv)
     }
     printf("## tree  (path kind detail; path 0=left 1=right, \".\" = root)\n");
     char buf[64];
-    walk(T, T->tree_root, buf, 0);
+    walk(T, T->dec.tree_root, buf, 0);
 
     free(T);
     return 0;

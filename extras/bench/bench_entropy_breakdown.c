@@ -111,7 +111,7 @@ static uint64_t xs_next(stats_t *s)
  * subtree rooted here is flat, or -1 otherwise.  A leaf returns 0. */
 static int subtree_flat_depth(const pivco_huffman_table_t *t, int16_t node)
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) return 0;
     int ld = subtree_flat_depth(t, n->left);
     if (ld < 0) return -1;
@@ -125,7 +125,7 @@ static int subtree_flat_depth(const pivco_huffman_table_t *t, int16_t node)
 static int collect_leaf_freqs(const pivco_huffman_table_t *t, int16_t node,
                                 const uint64_t *freq, uint64_t *out, int cap)
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) {
         if (cap <= 0) return 0;
         out[0] = freq[n->symbol];
@@ -144,7 +144,7 @@ static uint64_t walk(const pivco_huffman_table_t *t, int16_t node, int depth,
                      uint8_t *bitmap_buf, uint8_t *expand_buf,
                      uint8_t *scratch, size_t scratch_cap)
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) return freq[n->symbol];
 
     /* Maximal-flat check.  `subtree_flat_depth` returns D if this
@@ -304,14 +304,14 @@ int main(int argc, char **argv)
         int16_t stk[2 * 256];
         int     dep[2 * 256];
         int sp = 0;
-        stk[sp] = table->tree_root;
+        stk[sp] = table->dec.tree_root;
         dep[sp] = 0;
         sp++;
         while (sp > 0) {
             sp--;
             int16_t cur = stk[sp];
             int     d2  = dep[sp];
-            const pivco_tree_node_t *nn = &table->tree[cur];
+            const pivco_tree_node_t *nn = &table->dec.tree[cur];
             if (nn->symbol >= 0) {
                 leaf_depth[nn->symbol] = d2;
             } else {
@@ -326,7 +326,7 @@ int main(int argc, char **argv)
         }
 
         stats_t s = { .xs_state = 0x9E3779B97F4A7C15ULL ^ (uint64_t)d };
-        walk(table, table->tree_root, 0, hist, &s,
+        walk(table, table->dec.tree_root, 0, hist, &s,
               bitmap_buf, expand_buf, scratch, sizeof(scratch));
 
         double fse_byte_bpB  = s.total_fse_byte_bits  / (double)BLK;

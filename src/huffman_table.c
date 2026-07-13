@@ -245,22 +245,22 @@ static void build_single_symbol_table(int sym, pivco_huffman_table_t *table)
     table->first_code[1] = 0;
     table->first_sym_idx[1] = 0;
     table->sorted_symbols[0] = (uint8_t)sym;
-    table->tree[0].symbol = -1;
-    table->tree[0].left = 1;
-    table->tree[0].right = 2;
-    table->tree[1].symbol = (int16_t)sym;
-    table->tree[1].left = -1;
-    table->tree[1].right = -1;
-    table->tree[2].symbol = (int16_t)sym; /* both children = same symbol */
-    table->tree[2].left = -1;
-    table->tree[2].right = -1;
-    table->tree_root = 0;
-    table->tree_node_count = 3;
+    table->dec.tree[0].symbol = -1;
+    table->dec.tree[0].left = 1;
+    table->dec.tree[0].right = 2;
+    table->dec.tree[1].symbol = (int16_t)sym;
+    table->dec.tree[1].left = -1;
+    table->dec.tree[1].right = -1;
+    table->dec.tree[2].symbol = (int16_t)sym; /* both children = same symbol */
+    table->dec.tree[2].left = -1;
+    table->dec.tree[2].right = -1;
+    table->dec.tree_root = 0;
+    table->dec.tree_node_count = 3;
     /* node 0 (root): both children leaves -> BOTH_LEAVES (the decode
      * entry's root fast path handles it); nodes 1, 2: LEAF. */
-    table->node_type[0] = PIVCO_NODE_BOTH_LEAVES;
-    table->node_type[1] = PIVCO_NODE_LEAF;
-    table->node_type[2] = PIVCO_NODE_LEAF;
+    table->dec.node_type[0] = PIVCO_NODE_BOTH_LEAVES;
+    table->dec.node_type[1] = PIVCO_NODE_LEAF;
+    table->dec.node_type[2] = PIVCO_NODE_LEAF;
     fill_enc_init_aux(table);   /* sym_to_rank is all-zero (rank 0) here; aux must not stay NULL */
 }
 
@@ -312,22 +312,22 @@ int pivco_huffman_build_table(const uint64_t freq[PIVCO_MAX_SYMBOLS],
 static uint16_t assign_inorder_ranks(pivco_huffman_table_t *table,
                                      int16_t id, uint16_t rank)
 {
-    const pivco_tree_node_t *n = &table->tree[id];
+    const pivco_tree_node_t *n = &table->dec.tree[id];
     if (n->symbol >= 0) {                       /* leaf */
         table->sym_to_rank[n->symbol] = (uint8_t)rank;
         return (uint16_t)(rank + 1);
     }
-    if (table->flat_depth[id] >= 2) {           /* flat subtree */
-        table->flat_base_rank[id] = (uint8_t)rank;
-        int cnt = 1 << table->flat_depth[id];
+    if (table->dec.flat_depth[id] >= 2) {           /* flat subtree */
+        table->dec.flat_base_rank[id] = (uint8_t)rank;
+        int cnt = 1 << table->dec.flat_depth[id];
         for (int i = 0; i < cnt; i++) {
-            uint8_t sym = table->flat_code_to_sym[table->flat_offset[id] + i];
+            uint8_t sym = table->dec.flat_code_to_sym[table->dec.flat_offset[id] + i];
             table->sym_to_rank[sym] = (uint8_t)(rank + i);
         }
         return (uint16_t)(rank + cnt);
     }
     rank = assign_inorder_ranks(table, n->left, rank);
-    table->split_rank[id] = (uint8_t)(rank - 1); /* max rank of the left subtree */
+    table->dec.split_rank[id] = (uint8_t)(rank - 1); /* max rank of the left subtree */
     return assign_inorder_ranks(table, n->right, rank);
 }
 
@@ -626,11 +626,11 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
        build their leaves. */
     {
         int16_t nc = 0; /* node count */
-        table->tree[0].symbol = -1;
-        table->tree[0].left   = -1;
-        table->tree[0].right  = -1;
+        table->dec.tree[0].symbol = -1;
+        table->dec.tree[0].left   = -1;
+        table->dec.tree[0].right  = -1;
         nc++;
-        table->tree_root = 0;
+        table->dec.tree_root = 0;
         uint16_t pool = 0;
 
         for (int ci = 0; ci < n_chunks; ci++) {
@@ -642,13 +642,13 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
             /* Walk rc's d bits MSB-first, creating spine nodes as needed. */
             int16_t cur = 0;
             for (int b = d - 1; b >= 0; b--) {
-                int16_t *child = ((rc >> b) & 1) ? &table->tree[cur].right
-                                                 : &table->tree[cur].left;
+                int16_t *child = ((rc >> b) & 1) ? &table->dec.tree[cur].right
+                                                 : &table->dec.tree[cur].left;
                 if (*child < 0) {
                     *child = nc;
-                    table->tree[nc].symbol = -1;
-                    table->tree[nc].left   = -1;
-                    table->tree[nc].right  = -1;
+                    table->dec.tree[nc].symbol = -1;
+                    table->dec.tree[nc].left   = -1;
+                    table->dec.tree[nc].right  = -1;
                     nc++;
                 }
                 cur = *child;
@@ -659,28 +659,28 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
                    Leaf i of the chunk has in-subtree code i (low D bits of
                    its canonical code), so flat_code_to_sym[base+i] is its
                    i-th symbol. */
-                PIVCO_CHECK(table->tree[cur].left == -1 &&
-                            table->tree[cur].right == -1);
-                table->flat_depth[cur]  = (uint8_t)D;
-                table->flat_offset[cur] = pool;
+                PIVCO_CHECK(table->dec.tree[cur].left == -1 &&
+                            table->dec.tree[cur].right == -1);
+                table->dec.flat_depth[cur]  = (uint8_t)D;
+                table->dec.flat_offset[cur] = pool;
                 int n = 1 << D;
                 for (int i = 0; i < n; i++)
-                    table->flat_code_to_sym[pool + i] = flat_items[base + i].sym;
+                    table->dec.flat_code_to_sym[pool + i] = flat_items[base + i].sym;
                 pool = (uint16_t)(pool + n);
             } else if (D == 1) {
                 /* Sibling pair: two leaf children (suffix 0 -> left). */
-                table->tree[cur].left = nc;
-                table->tree[nc].symbol = (int16_t)flat_items[base].sym;
-                table->tree[nc].left = -1; table->tree[nc].right = -1; nc++;
-                table->tree[cur].right = nc;
-                table->tree[nc].symbol = (int16_t)flat_items[base + 1].sym;
-                table->tree[nc].left = -1; table->tree[nc].right = -1; nc++;
+                table->dec.tree[cur].left = nc;
+                table->dec.tree[nc].symbol = (int16_t)flat_items[base].sym;
+                table->dec.tree[nc].left = -1; table->dec.tree[nc].right = -1; nc++;
+                table->dec.tree[cur].right = nc;
+                table->dec.tree[nc].symbol = (int16_t)flat_items[base + 1].sym;
+                table->dec.tree[nc].left = -1; table->dec.tree[nc].right = -1; nc++;
             } else {
                 /* Singleton: cur is the leaf at depth d. */
-                table->tree[cur].symbol = (int16_t)flat_items[base].sym;
+                table->dec.tree[cur].symbol = (int16_t)flat_items[base].sym;
             }
         }
-        table->tree_node_count = nc;
+        table->dec.tree_node_count = nc;
     }
 
 
@@ -689,30 +689,30 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
      * Canonical code assignment always puts a lone leaf child on the
      * 0/left side (shorter code = smaller left-aligned value), so a
      * right-leaf-only node cannot occur — asserted. */
-    for (int16_t i = 0; i < table->tree_node_count; i++) {
-        const pivco_tree_node_t *node = &table->tree[i];
+    for (int16_t i = 0; i < table->dec.tree_node_count; i++) {
+        const pivco_tree_node_t *node = &table->dec.tree[i];
 
         if (node->symbol >= 0) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_LEAF;
+            table->dec.node_type[i] = (uint8_t)PIVCO_NODE_LEAF;
             continue;
         }
 
         /* Internal node */
-        if (table->flat_depth[i] >= 2) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_INTERNAL_FLAT;
+        if (table->dec.flat_depth[i] >= 2) {
+            table->dec.node_type[i] = (uint8_t)PIVCO_NODE_INTERNAL_FLAT;
             continue;
         }
 
-        int left_leaf  = (table->tree[node->left].symbol  >= 0);
-        int right_leaf = (table->tree[node->right].symbol >= 0);
+        int left_leaf  = (table->dec.tree[node->left].symbol  >= 0);
+        int right_leaf = (table->dec.tree[node->right].symbol >= 0);
 
         if (left_leaf && right_leaf) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_BOTH_LEAVES;
+            table->dec.node_type[i] = (uint8_t)PIVCO_NODE_BOTH_LEAVES;
         } else if (left_leaf) {
-            table->node_type[i] = (uint8_t)PIVCO_NODE_LEAF_LEFT;
+            table->dec.node_type[i] = (uint8_t)PIVCO_NODE_LEAF_LEFT;
         } else {
             PIVCO_CHECK(!right_leaf);
-            table->node_type[i] = (uint8_t)PIVCO_NODE_INTERNAL_FULL;
+            table->dec.node_type[i] = (uint8_t)PIVCO_NODE_INTERNAL_FULL;
         }
     }
 
@@ -732,7 +732,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
          * thinking about node-allocation order, and recursion-free. */
         int stack[2 * PIVCO_MAX_TREE_NODES];
         int top = 0;
-        stack[top++] = table->tree_root;
+        stack[top++] = table->dec.tree_root;
         /* First pass: count children visited per node, leaf := 0. */
         memset(table->max_leaf_depth, 0, sizeof(table->max_leaf_depth));
         int order[PIVCO_MAX_TREE_NODES];
@@ -740,9 +740,9 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         while (top > 0) {
             int16_t id = (int16_t)stack[--top];
             order[order_n++] = id;
-            const pivco_tree_node_t *n = &table->tree[id];
+            const pivco_tree_node_t *n = &table->dec.tree[id];
             /* Flat roots have no materialized children -- treat as terminal. */
-            if (n->symbol < 0 && table->flat_depth[id] < 2) {
+            if (n->symbol < 0 && table->dec.flat_depth[id] < 2) {
                 stack[top++] = n->left;
                 stack[top++] = n->right;
             }
@@ -750,12 +750,12 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
         /* Process in reverse (children before parents). */
         for (int oi = order_n - 1; oi >= 0; oi--) {
             int16_t id = (int16_t)order[oi];
-            const pivco_tree_node_t *n = &table->tree[id];
+            const pivco_tree_node_t *n = &table->dec.tree[id];
             if (n->symbol >= 0) {
                 table->max_leaf_depth[id] = 0;
-            } else if (table->flat_depth[id] >= 2) {
+            } else if (table->dec.flat_depth[id] >= 2) {
                 /* All 2^D leaves sit D levels below this flat root. */
-                table->max_leaf_depth[id] = table->flat_depth[id];
+                table->max_leaf_depth[id] = table->dec.flat_depth[id];
             } else {
                 uint8_t l = table->max_leaf_depth[n->left];
                 uint8_t r = table->max_leaf_depth[n->right];
@@ -766,7 +766,7 @@ static int build_table_finish(const uint8_t lengths[PIVCO_MAX_SYMBOLS],
 
     /* partbyrank: one in-order pass assigns every leaf its rank and every
      * internal node its split_rank / flat_base_rank (see assign_inorder_ranks). */
-    assign_inorder_ranks(table, table->tree_root, 0);
+    assign_inorder_ranks(table, table->dec.tree_root, 0);
 
     fill_enc_init_aux(table);   /* x86 2tab/4tab gather tables (or NULL elsewhere) */
 

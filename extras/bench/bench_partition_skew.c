@@ -30,7 +30,7 @@ extern const uint64_t *bench_dist_freq(int idx);
 static double walk(const pivco_huffman_table_t *t, int16_t node,
                     const uint64_t *freq, double hist[NBINS])
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) return (double)freq[n->symbol];
 
     double left  = walk(t, n->left, freq, hist);
@@ -54,7 +54,7 @@ static void print_one(const char *name, const uint64_t *freq)
         return;
     }
     double hist[NBINS] = {0};
-    walk(&t, t.tree_root, freq, hist);
+    walk(&t, t.dec.tree_root, freq, hist);
 
     double total = 0;
     for (int i = 0; i < NBINS; i++) total += hist[i];

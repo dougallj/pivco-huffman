@@ -64,7 +64,7 @@ static double h_binary(double p)
  * the library-built tree -- no rebuild logic. */
 static int subtree_flat_depth(const pivco_huffman_table_t *t, int16_t node)
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) return 0;
     int ld = subtree_flat_depth(t, n->left);
     if (ld < 0) return -1;
@@ -76,7 +76,7 @@ static int subtree_flat_depth(const pivco_huffman_table_t *t, int16_t node)
 static uint64_t subtree_freq_sum(const pivco_huffman_table_t *t,
                                   const uint64_t *freq, int16_t node)
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) return freq[n->symbol];
     return subtree_freq_sum(t, freq, n->left)
          + subtree_freq_sum(t, freq, n->right);
@@ -92,7 +92,7 @@ static uint64_t walk_top1(const pivco_huffman_table_t *t,
                           const uint64_t *freq, int16_t node,
                           double *max_saved)
 {
-    const pivco_tree_node_t *n = &t->tree[node];
+    const pivco_tree_node_t *n = &t->dec.tree[node];
     if (n->symbol >= 0) return freq[n->symbol];
     if (subtree_flat_depth(t, node) >= 2)
         return subtree_freq_sum(t, freq, node);   /* flat: no bitmap node */
@@ -181,7 +181,7 @@ int main(int argc, char **argv)
             avg_len = (total > 0) ? wsum / (double)total : 0.0;
 
             double max_saved = 0.0;
-            walk_top1(&t, f, t.tree_root, &max_saved);
+            walk_top1(&t, f, t.dec.tree_root, &max_saved);
             max_node_benefit = (total > 0) ? max_saved / (double)total : 0.0;
         }
 

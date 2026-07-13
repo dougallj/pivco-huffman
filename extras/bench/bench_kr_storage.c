@@ -37,7 +37,7 @@ extern void           bench_generate_symbols(int dist_idx, uint8_t *symbols,
 static int subtree_hist_sum(const pivco_huffman_table_t *t, int16_t node_id,
                              const int *hist)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
     if (n->symbol >= 0) return hist[n->symbol];
     return subtree_hist_sum(t, n->left, hist)
          + subtree_hist_sum(t, n->right, hist);
@@ -63,8 +63,8 @@ static void walk_kr(const pivco_huffman_table_t *t, int16_t node_id, int K,
                      const int *hist, stats_t *s)
 {
     if (K == 0) return;
-    const pivco_tree_node_t *n = &t->tree[node_id];
-    pivco_node_type_t type = (pivco_node_type_t)t->node_type[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
+    pivco_node_type_t type = (pivco_node_type_t)t->dec.node_type[node_id];
     switch (type) {
     case PIVCO_NODE_LEAF:
     case PIVCO_NODE_INTERNAL_FLAT:
@@ -95,8 +95,8 @@ static void walk_kr(const pivco_huffman_table_t *t, int16_t node_id, int K,
 static void walk_kleaf(const pivco_huffman_table_t *t, int16_t node_id,
                         const int *hist, stats_t *s)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
-    pivco_node_type_t type = (pivco_node_type_t)t->node_type[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
+    pivco_node_type_t type = (pivco_node_type_t)t->dec.node_type[node_id];
     switch (type) {
     case PIVCO_NODE_LEAF: {
         int K = hist[n->symbol];
@@ -123,8 +123,8 @@ static void walk_kleaf(const pivco_huffman_table_t *t, int16_t node_id,
 /* Count topology slots once (don't need hist). */
 static int count_kr_slots(const pivco_huffman_table_t *t, int16_t node_id)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
-    pivco_node_type_t type = (pivco_node_type_t)t->node_type[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
+    pivco_node_type_t type = (pivco_node_type_t)t->dec.node_type[node_id];
     switch (type) {
     case PIVCO_NODE_LEAF:
     case PIVCO_NODE_INTERNAL_FLAT:
@@ -139,8 +139,8 @@ static int count_kr_slots(const pivco_huffman_table_t *t, int16_t node_id)
 
 static int count_kleaf_slots(const pivco_huffman_table_t *t, int16_t node_id)
 {
-    const pivco_tree_node_t *n = &t->tree[node_id];
-    pivco_node_type_t type = (pivco_node_type_t)t->node_type[node_id];
+    const pivco_tree_node_t *n = &t->dec.tree[node_id];
+    pivco_node_type_t type = (pivco_node_type_t)t->dec.node_type[node_id];
     switch (type) {
     case PIVCO_NODE_LEAF:
     case PIVCO_NODE_INTERNAL_FLAT:
@@ -160,8 +160,8 @@ static void analyze_dist(int dist_idx, int blocks)
     }
 
     stats_t s = {0};
-    s.kr_slots    = count_kr_slots(&table, table.tree_root);
-    s.kleaf_slots = count_kleaf_slots(&table, table.tree_root);
+    s.kr_slots    = count_kr_slots(&table, table.dec.tree_root);
+    s.kleaf_slots = count_kleaf_slots(&table, table.dec.tree_root);
 
     uint8_t *symbols = (uint8_t *)malloc(TOTAL_SYMBOLS);
     bench_generate_symbols(dist_idx, symbols, TOTAL_SYMBOLS, 0xFEEDC0DE);
@@ -180,8 +180,8 @@ static void analyze_dist(int dist_idx, int blocks)
                                  enc, &enc_len) == PIVCO_OK) {
             s.encoded_bytes += enc_len;
         }
-        walk_kr(&table, table.tree_root, BLK, hist, &s);
-        walk_kleaf(&table, table.tree_root, hist, &s);
+        walk_kr(&table, table.dec.tree_root, BLK, hist, &s);
+        walk_kleaf(&table, table.dec.tree_root, hist, &s);
     }
 
     double avg_enc = (double)s.encoded_bytes / s.blocks_seen;
