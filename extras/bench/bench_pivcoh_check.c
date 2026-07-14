@@ -35,6 +35,11 @@ static int n_tables, n_blocks, n_fuzz;
 
 static void one_case(const uint64_t freq[256], const char *tag, int id)
 {
+    /* fresh-zero the pivcoh tables: sym_to_rank now fills lazily on
+     * first encode, so whole-struct memcmps are only meaningful from a
+     * common (zero) starting state */
+    memset(&mini, 0, sizeof(mini));
+    memset(&mini2, 0, sizeof(mini2));
     int rc_ref = pivco_huffman_build_table(freq, &ref_table);
     int rc_min = pivcoh_table_from_freqs(&mini, freq);
     if ((rc_ref == PIVCO_OK) != rc_min) FAIL("build rc %d vs %d", rc_ref, rc_min);
@@ -192,6 +197,8 @@ int main(void)
           for (size_t gi = 0; gi < sizeof(GR) / sizeof(*GR); gi++) {
               pivcoh_joint j = PIVCOH_JOINT_DEFAULTS;
               j.gran = GR[gi];
+              memset(&jt, 0, sizeof(jt));
+              memset(&jt2, 0, sizeof(jt2));
               if (!pivcoh_table_from_freqs_joint(&jt, freq, &j, jscratch))
                   FAIL("joint build gran=%d", GR[gi]);
               if (!pivcoh_table_from_freqs_joint(&jt2, freq, &j, NULL))
@@ -220,6 +227,18 @@ int main(void)
                       || cons != (size_t)el || memcmp(dec_buf, blk, N))
                   FAIL("production decode of joint stream gran=%d", GR[gi]);
           }
+          /* lambda > 1/7 breaks the slot DP's order condition; the
+           * mass-DP fallback is deliberately not ported, so the reject
+           * must gracefully keep the plain Huffman lengths.  (The
+           * condition depends only on lambda/kappa, never the data, so
+           * in-contract knobs can never reach it.) */
+          pivcoh_joint jbig = PIVCOH_JOINT_DEFAULTS;
+          jbig.lambda = 0.2f;
+          memset(&jt, 0, sizeof(jt));
+          if (!pivcoh_table_from_freqs_joint(&jt, freq, &jbig, jscratch)
+                  || memcmp(jt.code_len, mini.code_len, 256))
+              FAIL("lambda>1/7 did not keep the baseline");
+
           /* lambda <= 0 must be byte-identical to the plain build
            * (fresh-zeroed structs: bytes past the live region are
            * residue of prior builds, meaningless to compare) */

@@ -48,8 +48,9 @@
  * PIVCOH_SCRATCH_SIZE(max_n) bytes always suffices, and decode-only
  * callers can pass the smaller PIVCOH_DECODE_SCRATCH_SIZE(max_n).
  * Tables and scratch are plain memory: no cleanup calls, safe to copy,
- * const tables are shareable across threads (encode/decode themselves
- * touch only their arguments).
+ * const tables are shareable across threads (decode never writes them;
+ * the FIRST encode on a table completes its encoder view in place with
+ * idempotent writes, so concurrent first encodes are also benign).
  *
  * Encoding a symbol whose frequency/length was zero produces a valid but
  * meaningless stream (never memory-unsafe).  Encode's SIMD packers may
@@ -148,6 +149,8 @@ typedef struct {
                                 what the encoder transmits to the decoder. */
     /* internals */
     uint16_t num_ranks, sched_len;
+    uint8_t enc_ready;       /* sym_to_rank valid (filled lazily on first
+                                encode; decode never needs it) */
     uint8_t rank_to_sym[256], sym_to_rank[256];
     pivcoh__rec sched[60];   /* Kraft-complete max is 59 records (33 chunks,
                                 27 with bit >= 1); +1 so the schedule render's
@@ -368,9 +371,9 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         if (pivcoh__sched(t, ch, nch, items) != 0) return 0;
     }
 
-    memset(t->sym_to_rank, 0, 256);
-    for (s = t->num_ranks - 1; s >= 0; s--)
-        t->sym_to_rank[t->rank_to_sym[s]] = (uint8_t)s;
+    t->enc_ready = 0;        /* sym_to_rank fills lazily on first encode:
+                                this builder is also the decode-side table
+                                build, which never reads it */
     return 1;
 }
 
@@ -2472,6 +2475,18 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
     if (!t || !in || !out || n < 1 || n > 65535 || !t->num_ranks) return -1;
     if (out_cap < PIVCOH_ENCODE_BOUND(n)) return -1;
     pivcoh__init_enc();
+    if (!t->enc_ready) {
+        /* Encoder view of the table, built on first use so decode-side
+         * builds skip it.  The writes are a pure function of
+         * rank_to_sym and idempotent, and enc_ready is set last, so
+         * concurrent first encodes on a shared table are benign — the
+         * same contract as the lazy static tables above. */
+        pivcoh_table *tw = (pivcoh_table *)t;
+        memset(tw->sym_to_rank, 0, 256);
+        for (int s = t->num_ranks - 1; s >= 0; s--)
+            tw->sym_to_rank[t->rank_to_sym[s]] = (uint8_t)s;
+        tw->enc_ready = 1;
+    }
     uint8_t *sc = scratch ? (uint8_t *)scratch : (uint8_t *)malloc(PIVCOH_SCRATCH_SIZE(n));
     if (!sc) return -1;
     uint8_t *ranks = sc, *tmp = sc + n + 64;   /* +64: the root ranks' overshoot
