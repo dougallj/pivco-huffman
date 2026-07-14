@@ -1370,16 +1370,24 @@ static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uin
     return i;
 }
 
-/* D=4: 16 ranks -> 8 bytes. */
+/* D=4: 32 ranks -> 16 bytes, pairing (r[2k], r[2k+1]) into one byte
+ * each — unrolled once so the vpaddq_u8 pairs two full input vectors
+ * instead of wasting its high half; a 16-rank remainder iteration
+ * keeps the half-width store.  Local codes are in [0,2^D); no mask. */
 static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
     static const int8_t shifts_d4[16] = { 0,4, 0,4, 0,4, 0,4, 0,4, 0,4, 0,4, 0,4 };
+    const int8x16_t sh = vld1q_s8(shifts_d4);
     uint8x16_t vb = vdupq_n_u8(base);
     int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint8x16_t b0 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i),      vb), sh);
+        uint8x16_t b1 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i + 16), vb), sh);
+        vst1q_u8(out + (i >> 1), vpaddq_u8(b0, b1));
+    }
     for (; i + 16 <= n; i += 16) {
-        uint8x16_t b = vsubq_u8(vld1q_u8(ranks + i), vb);
-        b = vshlq_u8(b, vld1q_s8(shifts_d4));
-        vst1_u8(out + (i * 4 / 8), vget_low_u8(vpaddq_u8(b, b)));
+        uint8x16_t b = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i), vb), sh);
+        vst1_u8(out + (i >> 1), vget_low_u8(vpaddq_u8(b, b)));
     }
     return i;
 }
