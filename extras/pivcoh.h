@@ -1333,19 +1333,30 @@ int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
 
 /* ---- flat pack: (rank - base) is already the D-bit local code ---- */
 
-/* D=2: 16 ranks -> 4 bytes. */
+/* D=2: 64 ranks -> 16 bytes (4 ranks per byte, no byte crossings) —
+ * unrolled x4 so both vpaddq_u8 reduction levels pair full vectors and
+ * the result is a whole 16-byte store; the 16-rank remainder keeps the
+ * self-pairing quarter-width form.  Local codes in [0,2^D); no mask. */
 static inline int pivcoh__pack_d2(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
     static const int8_t shifts_d2[16] = { 0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6 };
+    const int8x16_t sh = vld1q_s8(shifts_d2);
     uint8x16_t vb = vdupq_n_u8(base);
     int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        uint8x16_t b0 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i),      vb), sh);
+        uint8x16_t b1 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i + 16), vb), sh);
+        uint8x16_t b2 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i + 32), vb), sh);
+        uint8x16_t b3 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i + 48), vb), sh);
+        vst1q_u8(out + (i >> 2),
+                 vpaddq_u8(vpaddq_u8(b0, b1), vpaddq_u8(b2, b3)));
+    }
     for (; i + 16 <= n; i += 16) {
-        uint8x16_t b = vsubq_u8(vld1q_u8(ranks + i), vb);
-        b = vshlq_u8(b, vld1q_s8(shifts_d2));
+        uint8x16_t b = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i), vb), sh);
         uint8x16_t s1 = vpaddq_u8(b, b);
         uint8x16_t s2 = vpaddq_u8(s1, s1);
         uint32_t packed4 = vgetq_lane_u32(vreinterpretq_u32_u8(s2), 0);
-        memcpy(out + (i * 2 / 8), &packed4, 4);
+        memcpy(out + (i >> 2), &packed4, 4);
     }
     return i;
 }
