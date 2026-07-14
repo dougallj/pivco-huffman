@@ -1369,6 +1369,18 @@ static inline unsigned pivcoh__tailmask(const uint8_t *bm, int j, unsigned rem)
  * share one vcnt + 64-bit-multiply prefix sum for the per-chunk cursor
  * splits and the L/R advance — then 16-byte chunks.
  *
+ * The loop is software-pipelined one iteration deep: the carried chain
+ * (bitmap load -> vcnt -> lane move -> multiply -> cursor advance) is
+ * ~12 cycles of latency against ~16 cycles of work, so each iteration
+ * starts the NEXT mask/prefix up front and the chain resolves under
+ * the current merges.  The popcount path loads its own copy of the
+ * bitmap straight into SIMD (a GPR->SIMD fmov costs a load-port uop on
+ * Apple and would sit mid-chain).  Byte k of pfx = sum of the mask's
+ * byte-popcounts 0..k: bytes 1/3/5 are the 16-bit chunk boundaries,
+ * byte 7 the total.  Store cadence is unchanged — the 128B-unroll
+ * shape that won microbenches but lost e2e to streaming effects is
+ * deliberately avoided (micro: +7% L1, +4% streaming as-is).
+ *
  * EXACT=0 (interior nodes, arena-backed out): entirely SIMD, no scalar
  * tail.  The final partial chunk runs mask-trimmed at full 16-byte
  * width, overwriting up to 15 bytes past out+K; the 16 bytes there are
@@ -1378,6 +1390,8 @@ static inline unsigned pivcoh__tailmask(const uint8_t *bm, int j, unsigned rem)
  *
  * Both variants validate at the end — see the section comment.  Returns
  * 0, or -1 when the bitmap contradicts the K_right header. */
+#define PIVCOH__PFX8(p) (vget_lane_u64(vreinterpret_u64_u8(                \
+                             vcnt_u8(vld1_u8(p))), 0) * 0x0101010101010101ull)
 __attribute__((always_inline)) static inline
 int pivcoh__mvv(const uint8_t *bm, int K, const uint8_t *l, int KL,
                 const uint8_t *r, int KR, uint8_t *out, int EXACT)
@@ -1386,20 +1400,28 @@ int pivcoh__mvv(const uint8_t *bm, int K, const uint8_t *l, int KL,
     uint8x16_t keep = vdupq_n_u8(0);
     if (!EXACT) keep = vld1q_u8(out + K);
     intptr_t i = 0;
-    for (; i + 64 <= K; i += 64) {
-        uint64_t mask; memcpy(&mask, bm + (i >> 3), 8);
-        /* Byte k of pfx = sum of the mask's byte-popcounts 0..k: bytes
-         * 1/3/5 are the 16-bit chunk boundaries, byte 7 the total. */
-        uint8x8_t pop8 = vcnt_u8(vcreate_u8(mask));
-        uint64_t pfx = vget_lane_u64(vreinterpret_u64_u8(pop8), 0) * 0x0101010101010101ull;
-        intptr_t p0 = (pfx >> 8) & 0xff, p1 = (pfx >> 24) & 0xff, p2 = (pfx >> 40) & 0xff;
-        pivcoh__merge16(out + i,      l,           r,      mask);
-        pivcoh__merge16(out + i + 16, l + 16 - p0, r + p0, mask >> 16);
-        pivcoh__merge16(out + i + 32, l + 32 - p1, r + p1, mask >> 32);
-        pivcoh__merge16(out + i + 48, l + 48 - p2, r + p2, mask >> 48);
-        intptr_t p3 = pfx >> 56;
-        r += p3; l += 64 - p3;
+#define PIVCOH__MVV4(mask, pfx) do {                                       \
+        intptr_t p0 = ((pfx) >> 8) & 0xff, p1 = ((pfx) >> 24) & 0xff,      \
+                 p2 = ((pfx) >> 40) & 0xff, p3 = (pfx) >> 56;              \
+        pivcoh__merge16(out + i,      l,           r,      (mask));        \
+        pivcoh__merge16(out + i + 16, l + 16 - p0, r + p0, (mask) >> 16);  \
+        pivcoh__merge16(out + i + 32, l + 32 - p1, r + p1, (mask) >> 32);  \
+        pivcoh__merge16(out + i + 48, l + 48 - p2, r + p2, (mask) >> 48);  \
+        r += p3; l += 64 - p3;                                             \
+    } while (0)
+    if (i + 64 <= K) {
+        uint64_t mask; memcpy(&mask, bm, 8);
+        uint64_t pfx = PIVCOH__PFX8(bm);
+        for (; i + 128 <= K; i += 64) {
+            uint64_t nmask; memcpy(&nmask, bm + ((i + 64) >> 3), 8);
+            uint64_t npfx = PIVCOH__PFX8(bm + ((i + 64) >> 3));
+            PIVCOH__MVV4(mask, pfx);
+            mask = nmask; pfx = npfx;
+        }
+        PIVCOH__MVV4(mask, pfx);
+        i += 64;
     }
+#undef PIVCOH__MVV4
     int j = (int)i;
     for (; j + 16 <= K; j += 16) {
         uint16_t m16; memcpy(&m16, bm + (j >> 3), 2);
@@ -1435,6 +1457,7 @@ static int pivcoh__merge_vec_vec_x(const uint8_t *bm, int K,
                                    const uint8_t *l, int KL,
                                    const uint8_t *r, int KR, uint8_t *out)
 { return pivcoh__mvv(bm, K, l, KL, r, KR, out, 1); }
+#undef PIVCOH__PFX8
 
 /* merge_cst_vec: L is a broadcast constant (LEAF_LEFT) — no L load or
  * cursor; only the R cursor advances (and is guarded/validated).  Same
