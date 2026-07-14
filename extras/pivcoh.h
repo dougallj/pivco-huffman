@@ -1118,17 +1118,7 @@ static int pivcoh__jl_core(pivcoh__leaf *sf, int sigma,
         dp_time = pivcoh__jl_time(dch, nchunks, &jv, kap, P[sigma]);
         if (dp_time < 0) return -1;
     }
-    /* Near-incompressible windows: the RELATIVE bits cap vetoes the
-     * store-collapse tree (one full-depth flat: a single record, zero
-     * merge passes, ~memcpy decode) exactly where it shines — costing
-     * ~+2pp on 97%-ratio data that lambda's objective happily pays.
-     * Above 95% baseline ratio the bits cap is waived (exposure is
-     * structurally < +5pp: the proposal can't exceed 8 bits/sym) and
-     * lambda plus the time cap decide.  Upstream IDEAS 2026-07-12,
-     * "guard bits-cap misfires on near-incompressible windows". */
-    const int incompressible = base_bits >= 0.95 * 8.0 * P[sigma];
-    if (!(dp_time <= gtime * base_time
-          && (incompressible || dp_bits <= gbits * base_bits)))
+    if (!(dp_time <= gtime * base_time && dp_bits <= gbits * base_bits))
         return -1;
 
     /* Deal freq-sorted symbols to the chunks in that same order.
