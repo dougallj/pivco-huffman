@@ -550,3 +550,9 @@ target_link_libraries(pivco_bench_pivcoh_check pivco_huffman)
 add_executable(pivco_bench_pivcoh_speed bench_pivcoh_speed.c ${BENCH_DIST})
 target_include_directories(pivco_bench_pivcoh_speed PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pivco_bench_pivcoh_speed pivco_huffman m)
+
+# pivcoh vs production on the fresh-table-every-G-bytes workload over the
+# Silesia .lits corpus (git checkout silesia-lits -- testdata).
+add_executable(pivco_bench_pivcoh_lits bench_pivcoh_lits.c)
+target_include_directories(pivco_bench_pivcoh_lits PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(pivco_bench_pivcoh_lits pivco_huffman m)
