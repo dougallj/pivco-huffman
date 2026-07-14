@@ -1403,18 +1403,22 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
     return i;
 }
 
-/* D=5/6/7: shift-insert pack, 16 codes/iter.  A u16 lane of the code
- * bytes ALREADY holds code[2i] | code[2i+1] << 8, so pairing is just
- * re-basing the high half from << 8 to << D: one USHR + one SLI
- * (shift-left-insert keeps the low code's bits [0, D)), repeated at
- * u32 (<< 16 -> << 2D) and u64 (<< 32 -> << 4D) width — 6 ops, no
- * constants beyond the compact shuffle.  This replaces the ryg
- * multiply-as-shift pyramid (vmull with {1, 2^D} multipliers +
- * vpaddq): the multiply only existed because ARM's per-lane dynamic
- * shift has no widening form, and no widening is actually needed.
- * Each 16-byte store carries 16-2D trailing junk bytes, overwritten by
- * the next iter / next record (the caller's out_cap >=
- * PIVCOH_ENCODE_BOUND keeps even the last one in bounds). */
+/* D=5/6/7: variable-shift pack, 16 codes/iter.  At each width the two
+ * halves of a lane pair are shifted TOWARD each other with one USHL of
+ * {+s, -s} per-lane counts — the even half's top bit and the odd
+ * half's bottom bit meet at the lane boundary — so each pairing level
+ * is a single instruction and the packed field rides mid-lane until
+ * one final immediate right shift re-bases it:
+ *   L1 u8  {8-D, 0}:            u16 = pair  << (8-D)
+ *   L2 u16 {8-D, -(8-D)}:       u32 = quad  << (16-2D)
+ *   L3 u32 {16-2D, -(16-2D)}:   u64 = octet << (32-4D)
+ *   >> (32-4D), compact shuffle.
+ * 4 shift ops; the count vectors are vdups of computed constants.
+ * (History: ryg's multiply-as-shift vmull pyramid, then a 6-op
+ * USHR+SLI ladder, each replaced in turn.)  Each 16-byte store carries
+ * 16-2D trailing junk bytes, overwritten by the next iter / next
+ * record (the caller's out_cap >= PIVCOH_ENCODE_BOUND keeps even the
+ * last one in bounds). */
 static const uint8_t pivcoh__pack_compact_d5[16] = {
     0, 1, 2, 3, 4,   8, 9, 10, 11, 12,  0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 };
@@ -1428,16 +1432,21 @@ static const uint8_t pivcoh__pack_compact_d7[16] = {
 #define PIVCOH__PACK_DN(NAME, D_VAL, COMPACT_TAB)                                \
 static inline int NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)  \
 {                                                                                \
+    const int8x16_t s1 = vreinterpretq_s8_u16(vdupq_n_u16(8 - (D_VAL)));         \
+    const int16x8_t s2 = vreinterpretq_s16_u32(vdupq_n_u32(                      \
+        (uint32_t)(uint16_t)(8 - (D_VAL)) |                                      \
+        ((uint32_t)(uint16_t)-(8 - (D_VAL)) << 16)));                            \
+    const int32x4_t s3 = vreinterpretq_s32_u64(vdupq_n_u64(                      \
+        (uint64_t)(uint32_t)(16 - 2 * (D_VAL)) |                                 \
+        ((uint64_t)(uint32_t)-(16 - 2 * (D_VAL)) << 32)));                       \
     const uint8x16_t compact = vld1q_u8(COMPACT_TAB);                            \
     int i = 0;                                                                   \
     for (; i + 16 <= n; i += 16) {                                               \
         uint8x16_t cb = vsubq_u8(vld1q_u8(ranks + i), vdupq_n_u8(base));         \
-        uint16x8_t w16 = vreinterpretq_u16_u8(cb);                               \
-        w16 = vsliq_n_u16(w16, vshrq_n_u16(w16, 8), D_VAL);                      \
-        uint32x4_t w32 = vreinterpretq_u32_u16(w16);                             \
-        w32 = vsliq_n_u32(w32, vshrq_n_u32(w32, 16), 2 * (D_VAL));               \
-        uint64x2_t w64 = vreinterpretq_u64_u32(w32);                             \
-        w64 = vsliq_n_u64(w64, vshrq_n_u64(w64, 32), 4 * (D_VAL));               \
+        uint16x8_t w16 = vreinterpretq_u16_u8(vshlq_u8(cb, s1));                 \
+        uint32x4_t w32 = vreinterpretq_u32_u16(vshlq_u16(w16, s2));              \
+        uint64x2_t w64 = vreinterpretq_u64_u32(vshlq_u32(w32, s3));              \
+        w64 = vshrq_n_u64(w64, 32 - 4 * (D_VAL));                                \
         uint8x16_t packed = vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact);      \
         vst1q_u8(out + ((i * (D_VAL)) >> 3), packed);                            \
     }                                                                            \
