@@ -74,9 +74,11 @@
 #define PIVCOH_ENCODE_BOUND(n)  ((11 * (size_t)(n) + 7) / 8 + 1024)
 
 /* Scratch bytes for encode or decode of blocks up to n symbols.  The
- * encoder dominates: a ranks buffer (n + 64) plus one right-half per
- * recursion level (max 11 levels), like the production arena. */
-#define PIVCOH_SCRATCH_SIZE(n)  (13 * (size_t)(n) + 128)
+ * encoder dominates: a ranks buffer (n + 64) plus, per recursion level
+ * (max 11), one staged bitmap, one compacted right-half and a 64-byte
+ * overshoot gap (~9n/8 + 73 per level) for the tail-free partition's
+ * scatter, which strays up to 63 bytes past a ranks region. */
+#define PIVCOH_SCRATCH_SIZE(n)  (14 * (size_t)(n) + 1024)
 
 /* Scratch bytes for DECODE ONLY of blocks up to n symbols.  The decode
  * walk ping-pongs children through (out, partner) buffer pairs instead
@@ -1116,7 +1118,6 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
 /* ================= encode kernels (ports of primitives_neon) ================ */
 
 /* Per-mask LUTs:
- *   pc8[m]         popcount of mask byte m
  *   ctab8[m][0:8]  right source lanes packed at [0,n_right), 0xff fill
  *                  (vtbl1 returns 0 for out-of-range indices)
  * p16rev partition LUTs (part_full): one combined index per 16-lane group
@@ -1125,7 +1126,6 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
  *   ptabA[m0]      low byte: left -> front, right -> back reversed
  *   ptabB0[m1]     high byte, pc0=0 layout; pc0>0 is the same table
  *                  loaded at byte offset pc0 (padded to 32 B/entry). */
-static uint8_t pivcoh__pc8[256];
 static uint8_t pivcoh__ctab8[256][16]   __attribute__((aligned(16)));
 static uint8_t pivcoh__ptabA[256][16]   __attribute__((aligned(16)));
 static uint8_t pivcoh__ptabB0[256][32]  __attribute__((aligned(32)));
@@ -1135,7 +1135,6 @@ static void pivcoh__init_enc(void)
     static int built = 0;
     if (built) return;
     for (int m = 0; m < 256; m++) {
-        pivcoh__pc8[m] = (uint8_t)__builtin_popcount(m);
         memset(pivcoh__ctab8[m], 0xff, 16);
         int qr = 0, ql = 0;
         for (int k = 0; k < 8; k++) {
@@ -1160,14 +1159,6 @@ static void pivcoh__init_enc(void)
         }
     }
     built = 1;
-}
-
-static const uint8_t pivcoh__bw8[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-
-/* 8-bit mask of (ids > thr) over 8 ranks. */
-static inline uint8_t pivcoh__nmask8(uint8x8_t ids, uint8x8_t thr)
-{
-    return vaddv_u8(vand_u8(vcgt_u8(ids, thr), vld1_u8(pivcoh__bw8)));
 }
 
 /* 8 partition mask bytes for 64 ranks, packed LE into a u64 via one
@@ -1220,33 +1211,26 @@ static void pivcoh__enc_init(uint8_t *ranks, int n,
     for (; i < n; i++) ranks[i] = s2r[sym[i]];
 }
 
-/* Full partition: bitmap + both sides compacted (left in place in ranks,
- * right into tmp).  Per 16-lane group, ONE combined shuffle index (the
- * OR of ptabA[m0] | ptabB0[m1]+pc0) yields both sides at once: the
- * register IS the left output, and a loop-invariant full-reverse vqtbl1
- * recovers the right.  Tail stores overstore up to 16 B past the valid
- * counts — absorbed by the ranks/tmp slack (see pivcoh_encode). */
-static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
-                             uint8_t *bm, uint8_t *tmp)
+/* Scatter one 64-rank group-set of a full partition: per 16-lane
+ * group, ONE combined shuffle index (the OR of ptabA[m0] |
+ * ptabB0[m1]+pc0) yields both sides at once — the register IS the
+ * left output, and a loop-invariant full-reverse vqtbl1 recovers the
+ * right.  mask_word may be tail-masked: zero bits scatter their lanes
+ * as (phantom) lefts AFTER the real ones, so the left prefix stays
+ * exact and only dead bytes past it take garbage.  Stores run 16 wide
+ * (up to +64/+16 past the valid counts, into dead/slack space).
+ * Returns the group-set's right count. */
+__attribute__((always_inline)) static inline
+int pivcoh__part64_full(uint8x16_t v0, uint8x16_t v1, uint8x16_t v2,
+                        uint8x16_t v3, uint64_t mask_word,
+                        uint8_t *ldst, uint8_t *rdst)
 {
-    int n_left = 0, n_right = 0;
-    int j = 0;
-    uint8x16_t vt = vdupq_n_u8(thr);
-    static const uint8_t bw_a[16] = {1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
-    uint8x16_t bw = vld1q_u8(bw_a);
+    uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(
+                       vcnt_u8(vcreate_u8(mask_word))), 0);
+    uint64_t pfx = pcw * 0x0101010101010101ULL;
+    uint8x16_t vg[4] = { v0, v1, v2, v3 };
     static const uint8_t rev16_a[16] = {15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0};
     uint8x16_t rev16 = vld1q_u8(rev16_a);
-    for (; j + 64 <= n; j += 64) {
-        uint8x16_t v0 = vld1q_u8(ranks + j);
-        uint8x16_t v1 = vld1q_u8(ranks + j + 16);
-        uint8x16_t v2 = vld1q_u8(ranks + j + 32);
-        uint8x16_t v3 = vld1q_u8(ranks + j + 48);
-        uint64_t mask_word = pivcoh__masks64(v0, v1, v2, v3, vt, bw);
-        memcpy(bm + (j >> 3), &mask_word, 8);
-        uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(
-                           vcnt_u8(vcreate_u8(mask_word))), 0);
-        uint64_t pfx = pcw * 0x0101010101010101ULL;
-        uint8x16_t vg[4] = { v0, v1, v2, v3 };
 #define PIVCOH__PART(g) do {                                                 \
         uint8_t  m0 = (uint8_t)(mask_word >> (16*(g)));                     \
         uint8_t  m1 = (uint8_t)(mask_word >> (16*(g) + 8));                 \
@@ -1256,35 +1240,26 @@ static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
         uint8x16_t ri = vorrq_u8(vld1q_u8(pivcoh__ptabA[m0]),               \
                                  vld1q_u8(&pivcoh__ptabB0[m1][pc0]));       \
         uint8x16_t comb = vqtbl1q_u8(vg[g], ri);                            \
-        vst1q_u8(ranks + n_left + (16*(g) - cr), comb);                     \
-        vst1q_u8(tmp + n_right + cr, vqtbl1q_u8(comb, rev16));              \
+        vst1q_u8(ldst + (16*(g) - cr), comb);                               \
+        vst1q_u8(rdst + cr, vqtbl1q_u8(comb, rev16));                       \
     } while (0)
-        PIVCOH__PART(0); PIVCOH__PART(1); PIVCOH__PART(2); PIVCOH__PART(3);
+    PIVCOH__PART(0); PIVCOH__PART(1); PIVCOH__PART(2); PIVCOH__PART(3);
 #undef PIVCOH__PART
-        uint32_t total_r = (uint32_t)(pfx >> 56);
-        n_right += (int)total_r;
-        n_left  += 64 - (int)total_r;
-    }
-    for (; j < n; j++) {
-        if ((j & 7) == 0) bm[j >> 3] = 0;
-        uint8_t r = ranks[j];
-        if (r > thr) { bm[j >> 3] |= (uint8_t)(1u << (j & 7)); tmp[n_right++] = r; }
-        else         { ranks[n_left++] = r; }
-    }
-    return n_right;
+    return (int)(pfx >> 56);
 }
 
-/* One-sided (right/none) partition: bitmap always, right side compacted
- * into tmp when EMIT_RIGHT (the left side of a LEAF_LEFT node is dead).
- * EMIT_RIGHT=0 folds to a pure bitmap build (the D=1 flat pack). */
-__attribute__((always_inline)) static inline
-int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
-                      uint8_t *bm, uint8_t *tmp, int EMIT_RIGHT)
+/* Full partition: bitmap + both sides compacted (left in place in
+ * ranks, right into tmp).  Tail-free: the final partial group-set runs
+ * the same 64-wide body with the mask word trimmed to the real ranks —
+ * the wire bytes stay exact, the loads overread into the ranks
+ * buffer's +64 slack, and the phantom-left scatter lands in dead
+ * bytes.  No scalar tail: the per-element rank>thr branch is the
+ * bitmap itself, i.e. maximally unpredictable. */
+static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
+                             uint8_t *bm, uint8_t *tmp)
 {
-    int n_right = 0;
-    int j = 0;
+    int n_left = 0, n_right = 0, j = 0;
     uint8x16_t vt = vdupq_n_u8(thr);
-    uint8x8_t  vt8 = vdup_n_u8(thr);
     static const uint8_t bw_a[16] = {1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
     uint8x16_t bw = vld1q_u8(bw_a);
     for (; j + 64 <= n; j += 64) {
@@ -1292,41 +1267,91 @@ int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
         uint8x16_t v1 = vld1q_u8(ranks + j + 16);
         uint8x16_t v2 = vld1q_u8(ranks + j + 32);
         uint8x16_t v3 = vld1q_u8(ranks + j + 48);
-        uint64_t mask_word = pivcoh__masks64(v0, v1, v2, v3, vt, bw);
-        memcpy(bm + (j >> 3), &mask_word, 8);
-        uint64_t pc_word = vget_lane_u64(vreinterpret_u64_u8(
-                               vcnt_u8(vcreate_u8(mask_word))), 0);
-        uint64_t pfx = pc_word * 0x0101010101010101ULL;
-        uint8x8_t cv[8] = {
-            vget_low_u8(v0), vget_high_u8(v0),
-            vget_low_u8(v1), vget_high_u8(v1),
-            vget_low_u8(v2), vget_high_u8(v2),
-            vget_low_u8(v3), vget_high_u8(v3),
-        };
+        uint64_t w = pivcoh__masks64(v0, v1, v2, v3, vt, bw);
+        memcpy(bm + (j >> 3), &w, 8);
+        int tr = pivcoh__part64_full(v0, v1, v2, v3, w,
+                                     ranks + n_left, tmp + n_right);
+        n_right += tr;
+        n_left  += 64 - tr;
+    }
+    if (j < n) {
+        uint8x16_t v0 = vld1q_u8(ranks + j);
+        uint8x16_t v1 = vld1q_u8(ranks + j + 16);
+        uint8x16_t v2 = vld1q_u8(ranks + j + 32);
+        uint8x16_t v3 = vld1q_u8(ranks + j + 48);
+        uint64_t w = pivcoh__masks64(v0, v1, v2, v3, vt, bw)
+                     & (~0ull >> (64 - (n - j)));
+        memcpy(bm + (j >> 3), &w, 8);   /* 8B store: bm is padded (+8) */
+        n_right += pivcoh__part64_full(v0, v1, v2, v3, w,
+                                       ranks + n_left, tmp + n_right);
+    }
+    return n_right;
+}
+
+/* Scatter one 64-rank group-set's right side via ctab8 (8-lane
+ * chunks); same phantom-left masking argument as part64_full.
+ * Returns the group-set's right count. */
+__attribute__((always_inline)) static inline
+int pivcoh__part64_right(uint8x16_t v0, uint8x16_t v1, uint8x16_t v2,
+                         uint8x16_t v3, uint64_t mask_word, uint8_t *rdst)
+{
+    uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(
+                       vcnt_u8(vcreate_u8(mask_word))), 0);
+    uint64_t pfx = pcw * 0x0101010101010101ULL;
+    uint8x8_t cv[8] = {
+        vget_low_u8(v0), vget_high_u8(v0),
+        vget_low_u8(v1), vget_high_u8(v1),
+        vget_low_u8(v2), vget_high_u8(v2),
+        vget_low_u8(v3), vget_high_u8(v3),
+    };
 #define PIVCOH__PART1(K_) do {                                               \
         uint32_t cr = (K_)==0 ? 0u : (uint32_t)((pfx >> (8*((K_)-1))) & 0xFF); \
-        if (EMIT_RIGHT) {                                                    \
-            const uint8_t *tab = pivcoh__ctab8[(uint8_t)(mask_word >> (8*(K_)))]; \
-            vst1_u8(tmp + n_right + cr, vtbl1_u8(cv[K_], vld1_u8(tab)));     \
-        }                                                                    \
+        const uint8_t *tab = pivcoh__ctab8[(uint8_t)(mask_word >> (8*(K_)))]; \
+        vst1_u8(rdst + cr, vtbl1_u8(cv[K_], vld1_u8(tab)));                  \
     } while (0)
-        PIVCOH__PART1(0); PIVCOH__PART1(1); PIVCOH__PART1(2); PIVCOH__PART1(3);
-        PIVCOH__PART1(4); PIVCOH__PART1(5); PIVCOH__PART1(6); PIVCOH__PART1(7);
+    PIVCOH__PART1(0); PIVCOH__PART1(1); PIVCOH__PART1(2); PIVCOH__PART1(3);
+    PIVCOH__PART1(4); PIVCOH__PART1(5); PIVCOH__PART1(6); PIVCOH__PART1(7);
 #undef PIVCOH__PART1
-        n_right += (int)(uint32_t)(pfx >> 56);
+    return (int)(pfx >> 56);
+}
+
+/* One-sided (right/none) partition: bitmap always, right side compacted
+ * into tmp when EMIT_RIGHT (the left side of a LEAF_LEFT node is dead).
+ * EMIT_RIGHT=0 folds to a pure bitmap build (the D=1 flat pack, whose
+ * `bm` is the STREAM: the tail's whole-word store rides the packs'
+ * junk-byte contract there).  Tail-free like part_full. */
+__attribute__((always_inline)) static inline
+int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
+                      uint8_t *bm, uint8_t *tmp, int EMIT_RIGHT)
+{
+    int n_right = 0, j = 0;
+    uint8x16_t vt = vdupq_n_u8(thr);
+    static const uint8_t bw_a[16] = {1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
+    uint8x16_t bw = vld1q_u8(bw_a);
+    for (; j + 64 <= n; j += 64) {
+        uint8x16_t v0 = vld1q_u8(ranks + j);
+        uint8x16_t v1 = vld1q_u8(ranks + j + 16);
+        uint8x16_t v2 = vld1q_u8(ranks + j + 32);
+        uint8x16_t v3 = vld1q_u8(ranks + j + 48);
+        uint64_t w = pivcoh__masks64(v0, v1, v2, v3, vt, bw);
+        memcpy(bm + (j >> 3), &w, 8);
+        if (EMIT_RIGHT)
+            n_right += pivcoh__part64_right(v0, v1, v2, v3, w, tmp + n_right);
+        else
+            n_right += __builtin_popcountll(w);
     }
-    for (; j + 8 <= n; j += 8) {
-        uint8x8_t v = vld1_u8(ranks + j);
-        uint8_t mask = pivcoh__nmask8(v, vt8);
-        bm[j >> 3] = mask;
-        if (EMIT_RIGHT) vst1_u8(tmp + n_right, vtbl1_u8(v, vld1_u8(pivcoh__ctab8[mask])));
-        n_right += pivcoh__pc8[mask];
-    }
-    for (; j < n; j++) {
-        if ((j & 7) == 0) bm[j >> 3] = 0;
-        uint8_t r = ranks[j];
-        if (r > thr) { bm[j >> 3] |= (uint8_t)(1u << (j & 7));
-                       if (EMIT_RIGHT) tmp[n_right] = r; n_right++; }
+    if (j < n) {
+        uint8x16_t v0 = vld1q_u8(ranks + j);
+        uint8x16_t v1 = vld1q_u8(ranks + j + 16);
+        uint8x16_t v2 = vld1q_u8(ranks + j + 32);
+        uint8x16_t v3 = vld1q_u8(ranks + j + 48);
+        uint64_t w = pivcoh__masks64(v0, v1, v2, v3, vt, bw)
+                     & (~0ull >> (64 - (n - j)));
+        memcpy(bm + (j >> 3), &w, 8);
+        if (EMIT_RIGHT)
+            n_right += pivcoh__part64_right(v0, v1, v2, v3, w, tmp + n_right);
+        else
+            n_right += __builtin_popcountll(w);
     }
     return n_right;
 }
@@ -1549,11 +1574,11 @@ static void pivcoh__pack_dN(uint8_t *out, const uint8_t *ranks,
 }
 
 /* ---- encode tree walk ----
- * Production placement: partition leaves the left half in place in
- * `ranks` and compacts the right half into `tmp`; recursion descends
- * left on ranks, right on tmp, both children using tmp + n_right as
- * their scratch.  Per level tmp grows by n_right <= n, depth <= 10,
- * plus the partition's 16 B overstore — inside PIVCOH_SCRATCH_SIZE. */
+ * Production placement, arena-staged: each node's scratch starts with
+ * its staged bitmap (nbytes+8), then the compacted right half, then
+ * the children's deeper scratch.  Per level that is n/8 + 9 + n_right
+ * bytes, depth <= 11, plus the tail-free partition's bounded
+ * overstores — inside PIVCOH_SCRATCH_SIZE.  The header is VLA-free. */
 static void pivcoh__enc_node(const pivcoh_table *t, int idx,
                              uint8_t *ranks, int n,
                              uint8_t **pp, uint8_t *tmp)
@@ -1571,26 +1596,34 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
     /* Decode-order record (wire v0.7): the K_right header goes at the
      * node's PRE-order position, the marker+bitmap at its POST-order
      * position, the children's regions between, larger-K child first.
-     * The bitmap is staged on the stack across the child recursion (its
-     * stream position depends on the children's encoded sizes). */
+     * The bitmap is staged across the child recursion (its stream
+     * position depends on the children's encoded sizes) at the base of
+     * this node's scratch, NOT the stack: as a VLA it was live across
+     * the recursion, ~90KB of stack on a worst-case 64K block.  +8 pads
+     * the tail-free partition's whole-word final mask store.  The
+     * children's scratch starts 64 bytes past the right ranks: a
+     * node's tail-free left scatter overshoots up to 63 bytes past its
+     * OWN ranks region, and a right child's ranks end exactly where
+     * its scratch (holding its live stage) would otherwise begin. */
     int nbytes = (n + 7) >> 3;
-    uint8_t bm_stage[(size_t)nbytes];
+    uint8_t *bm_stage = tmp;
+    uint8_t *rout = tmp + nbytes + 8;
     int n_right = (kind == PIVCOH__LEAFL)
-        ? pivcoh__part_core(ranks, n, rec->param, bm_stage, tmp, 1)
-        : pivcoh__part_full(ranks, n, rec->param, bm_stage, tmp);
+        ? pivcoh__part_core(ranks, n, rec->param, bm_stage, rout, 1)
+        : pivcoh__part_full(ranks, n, rec->param, bm_stage, rout);
     int n_left = n - n_right;
     *p++ = (uint8_t)n_right;                   /* K_right, u16 LE */
     *p++ = (uint8_t)(n_right >> 8);
     *pp = p;
     if (kind == PIVCOH__FULL && n_right > n_left) {
-        pivcoh__enc_node(t, idx + rec->right, tmp, n_right, pp, tmp + n_right);
+        pivcoh__enc_node(t, idx + rec->right, rout, n_right, pp, rout + n_right + 64);
         if (n_left > 0)
-            pivcoh__enc_node(t, idx + 1, ranks, n_left, pp, tmp + n_right);
+            pivcoh__enc_node(t, idx + 1, ranks, n_left, pp, rout + n_right + 64);
     } else {
         if (kind == PIVCOH__FULL && n_left > 0)
-            pivcoh__enc_node(t, idx + 1, ranks, n_left, pp, tmp + n_right);
+            pivcoh__enc_node(t, idx + 1, ranks, n_left, pp, rout + n_right + 64);
         if (n_right > 0)
-            pivcoh__enc_node(t, idx + rec->right, tmp, n_right, pp, tmp + n_right);
+            pivcoh__enc_node(t, idx + rec->right, rout, n_right, pp, rout + n_right + 64);
     }
     p = *pp;
     *p++ = 0;                                  /* marker: raw bitmap */
