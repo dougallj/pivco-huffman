@@ -240,30 +240,78 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
     return 1;
 }
 
+typedef struct { uint64_t freq; uint16_t sym; } pivcoh__leaf;
+
+/* Stable ascending (freq, sym) sort of the leaves.  They arrive in
+ * symbol order (the stable seed), so a stable freq sort IS the (freq,
+ * sym) order.  Small alphabets insertion-sort; larger ones take an LSD
+ * radix over only the frequency bytes that VARY across the set (vary =
+ * OR ^ AND of all freqs, a free by-product of the caller's scan) — a
+ * constant byte is an identity pass, so it is skipped outright.  Port
+ * of the production sort_leaves_by_freq (same n <= 40 crossover, minus
+ * its dominant-bin scatter specialization); the O(n^2) insertion sort
+ * this replaces was 3-5x the whole production table build on
+ * fresh-tables-every-4K workloads over near-full alphabets. */
+static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint64_t vary)
+{
+    int i, j;
+    if (n <= 40) {
+        for (i = 1; i < n; i++) {
+            pivcoh__leaf cur = leaf[i];
+            for (j = i - 1; j >= 0 && leaf[j].freq > cur.freq; j--)
+                leaf[j + 1] = leaf[j];
+            leaf[j + 1] = cur;
+        }
+        return;
+    }
+    int shift[8], npass = 0;
+    for (int b = 0; b < 64; b += 8)
+        if ((vary >> b) & 0xFF) shift[npass++] = b;
+    if (npass == 0) return;                    /* all frequencies equal */
+    uint16_t cnt[8][256];
+    memset(cnt, 0, (size_t)npass * sizeof(cnt[0]));
+    for (i = 0; i < n; i++)                    /* all planes in one pass */
+        for (int p = 0; p < npass; p++)
+            cnt[p][(leaf[i].freq >> shift[p]) & 0xFF]++;
+    pivcoh__leaf tmp[256], *src = leaf, *dst = tmp;
+    for (int p = 0; p < npass; p++) {
+        unsigned sum = 0;
+        for (int k = 0; k < 256; k++) {
+            unsigned c = cnt[p][k];
+            cnt[p][k] = (uint16_t)sum;
+            sum += c;
+        }
+        for (i = 0; i < n; i++)
+            dst[cnt[p][(src[i].freq >> shift[p]) & 0xFF]++] = src[i];
+        pivcoh__leaf *t = src; src = dst; dst = t;
+    }
+    if (src != leaf) memcpy(leaf, src, (size_t)n * sizeof(*leaf));
+}
+
 PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
 {
-    /* leaves sorted ascending by (freq, symbol) */
-    uint64_t f[256];
-    uint16_t sym[256];
-    int n = 0, i, j;
+    pivcoh__leaf leaf[256];
+    uint64_t orv = 0, andv = ~(uint64_t)0;
+    int n = 0, i;
     for (i = 0; i < 256; i++)
         if (freq[i]) {
-            uint64_t v = freq[i];
-            for (j = n - 1; j >= 0 && f[j] > v; j--) { f[j + 1] = f[j]; sym[j + 1] = sym[j]; }
-            f[j + 1] = v;
-            sym[j + 1] = (uint16_t)i;
+            leaf[n].freq = freq[i];
+            leaf[n].sym  = (uint16_t)i;
             n++;
+            orv |= freq[i];
+            andv &= freq[i];
         }
     if (n == 0) return 0;
+    pivcoh__sort_leaves(leaf, n, orv ^ andv);
 
     uint8_t lens[256] = {0};
     if (n == 1) {
-        lens[sym[0]] = 1;
+        lens[leaf[0].sym] = 1;
     } else {
         /* van Leeuwen two-queue: sorted leaves + FIFO of made internals */
         uint64_t nf[512];
         int parent[512], li = 0, ih = n, ni = n, rem;
-        memcpy(nf, f, (size_t)n * sizeof(uint64_t));
+        for (i = 0; i < n; i++) nf[i] = leaf[i].freq;
         for (rem = n; rem > 1; rem--) {
             int a, b;
             if (li < n && (ih == ni || nf[li] <= nf[ih])) a = li++; else a = ih++;
@@ -276,8 +324,9 @@ PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
         depth[ni - 1] = 0;
         for (i = ni - 2; i >= 0; i--) depth[i] = (uint8_t)(depth[parent[i]] + 1);
         for (i = 0; i < n; i++) {
-            lens[sym[i]] = depth[i] ? depth[i] : 1;
-            if (lens[sym[i]] > maxd) maxd = lens[sym[i]];
+            uint8_t L = depth[i] ? depth[i] : 1;
+            lens[leaf[i].sym] = L;
+            if (L > maxd) maxd = L;
         }
 
         if (maxd > PIVCOH__MAXLEN) {           /* DEFLATE-style length limiting */
