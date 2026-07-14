@@ -556,3 +556,12 @@ target_link_libraries(pivco_bench_pivcoh_speed pivco_huffman m)
 add_executable(pivco_bench_pivcoh_lits bench_pivcoh_lits.c)
 target_include_directories(pivco_bench_pivcoh_lits PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pivco_bench_pivcoh_lits pivco_huffman m)
+
+# pivcoh (SIMPLEST/BALANCED) vs huf0 on the zstd-lits corpus: enc/dec/ratio.
+add_executable(pivco_bench_huf0_lits bench_huf0_lits.c)
+target_include_directories(pivco_bench_huf0_lits PRIVATE ${CMAKE_SOURCE_DIR}/ext/fse/lib)
+target_link_libraries(pivco_bench_huf0_lits huf0 m)
+
+# pivcoh decode-time decomposition (rebuild vs kernels, node/call counts).
+add_executable(pivco_bench_pivcoh_prof bench_pivcoh_prof.c)
+target_link_libraries(pivco_bench_pivcoh_prof m)

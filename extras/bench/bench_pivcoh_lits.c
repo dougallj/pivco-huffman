@@ -77,6 +77,10 @@ static uint8_t  *ENC2;              /* joint mode: production's encode sink —
                                        ciphertext ENC/WOFF/LEN describe, so
                                        the timed pass must not overwrite it */
 static size_t   *WOFF;              /* per-window ciphertext offsets */
+static size_t   *WSTART;            /* per-window byte offset into D (NW+1) */
+static int      BLOCKS;             /* --blocks: one window per zstd block */
+static int      TABLES;             /* --tables: merge blocks per zstd HUF-table lifetime */
+static const char *CURPATH;         /* current input path (for the sidecars) */
 static uint8_t  escratch[PIVCOH_SCRATCH_SIZE(BLK)];
 static uint8_t  dscratch[PIVCOH_DECODE_SCRATCH_SIZE(BLK)];
 static uint8_t  gatebuf[PIVCOH_ENCODE_BOUND(BLK)];
@@ -87,7 +91,66 @@ static pivcoh_joint JP;             /* tier/lambda/gamma from the CLI */
 static uint8_t      jscratch[PIVCOH_JOINT_SCRATCH_SIZE];
 static size_t       j_adopt, j_bytes, p_bytes;   /* per-file, from setup */
 
-static size_t wlen_of(size_t w) { return (w + 1) * G <= N ? G : N - w * G; }
+static size_t wlen_of(size_t w) { return WSTART[w + 1] - WSTART[w]; }
+
+/* Partition the file into windows.  Default: fixed G bytes.  --blocks:
+ * one window per zstd block (boundaries from the .litblk sidecar, u32 LE
+ * per-block litSize).  --tables: merge consecutive blocks that share a
+ * zstd HUF table into one window — a new window starts only where zstd
+ * built a fresh table (.lithdr type==2 Compressed); Raw/RLE/Treeless
+ * blocks (0/1/3) extend the current window, mirroring zstd's real
+ * table-build cadence.  Sets NW and WSTART[0..NW]. */
+static int build_windows(const char *base)
+{
+    if (BLOCKS || TABLES) {
+        size_t plen = strlen(CURPATH);
+        if (plen < 5 || strcmp(CURPATH + plen - 5, ".lits") != 0)
+            return fprintf(stderr, "%s: --blocks/--tables needs a .lits input\n", base);
+        char path[4096];
+        snprintf(path, sizeof path, "%.*s.litblk", (int)(plen - 5), CURPATH);
+        size_t bn;
+        uint8_t *b = slurp(path, &bn);
+        if (!b)     return fprintf(stderr, "%s: cannot read %s\n", base, path);
+        if (bn % 4) return fprintf(stderr, "%s: %s not u32-aligned\n", base, path);
+        size_t m = bn / 4;                       /* zstd block count */
+        uint8_t *hdr = NULL;
+        if (TABLES) {
+            snprintf(path, sizeof path, "%.*s.lithdr", (int)(plen - 5), CURPATH);
+            size_t hn;
+            hdr = slurp(path, &hn);
+            if (!hdr)     { free(b); return fprintf(stderr, "%s: cannot read %s\n", base, path); }
+            if (hn != m)  { free(b); free(hdr);
+                return fprintf(stderr, "%s: lithdr %zu != litblk %zu\n", base, hn, m); }
+        }
+        /* a block starts a window iff it's the first, or (--tables) it
+         * built a fresh HUF table; --blocks alone => every block starts one */
+        #define WIN_START(i) (!TABLES || (i) == 0 || hdr[i] == 2)
+        NW = 0;
+        for (size_t i = 0; i < m; i++) if (WIN_START(i)) NW++;
+        WSTART = malloc((NW + 1) * sizeof(*WSTART));
+        if (!WSTART) { free(b); free(hdr); return -1; }
+        size_t off = 0, w = 0;
+        for (size_t i = 0; i < m; i++) {
+            uint32_t e = (uint32_t)b[4 * i]       | (uint32_t)b[4 * i + 1] << 8 |
+                         (uint32_t)b[4 * i + 2] << 16 | (uint32_t)b[4 * i + 3] << 24;
+            if (WIN_START(i)) WSTART[w++] = off;
+            off += e;
+        }
+        #undef WIN_START
+        WSTART[NW] = off;
+        free(b); free(hdr);
+        if (off != N)
+            return fprintf(stderr, "%s: litblk sum %zu != file size %zu\n",
+                           base, off, N);
+    } else {
+        NW = (N + G - 1) / G;
+        WSTART = malloc((NW + 1) * sizeof(*WSTART));
+        if (!WSTART) return -1;
+        for (size_t w = 0; w < NW; w++) WSTART[w] = w * G;
+        WSTART[NW] = N;
+    }
+    return 0;
+}
 
 /* ---- whole-file passes, one per (engine, metric) ---- */
 
@@ -98,7 +161,7 @@ static void pass_enc_prod(void)
     for (size_t w = 0; w < NW; w++) {
         size_t wlen = wlen_of(w);
         uint64_t f[256] = {0};
-        const uint8_t *p = D + w * G;
+        const uint8_t *p = D + WSTART[w];
         for (size_t i = 0; i < wlen; i++) f[p[i]]++;
         pivco_huffman_codec_table_t ct;
         pivco_huffman_build_codec_table(f, &ct);
@@ -116,7 +179,7 @@ static void pass_enc_mini(void)
     for (size_t w = 0; w < NW; w++) {
         size_t wlen = wlen_of(w);
         uint64_t f[256] = {0};
-        const uint8_t *p = D + w * G;
+        const uint8_t *p = D + WSTART[w];
         for (size_t i = 0; i < wlen; i++) f[p[i]]++;
         pivcoh_table t;
         if (JOINT) pivcoh_table_from_freqs_joint(&t, f, &JP, jscratch);
@@ -138,7 +201,7 @@ static void pass_dec_prod(void)
         while (dof < wlen) {
             size_t consumed;
             pivco_huffman_decode_dt(ENC + off, WOFF[w + 1] - off, &dt,
-                                    DEC + w * G + dof, &consumed);
+                                    DEC + WSTART[w] + dof, &consumed);
             off += consumed;
             dof += wlen - dof < BLK ? wlen - dof : BLK;
         }
@@ -154,7 +217,7 @@ static void pass_dec_mini(void)
         while (dof < wlen) {
             size_t consumed;
             ptrdiff_t dn = pivcoh_decode(&t, ENC + off, WOFF[w + 1] - off,
-                                         DEC + w * G + dof, wlen - dof,
+                                         DEC + WSTART[w] + dof, wlen - dof,
                                          &consumed, dscratch);
             if (dn < 0) exit(fprintf(stderr, "pivcoh decode failed\n"));
             off += consumed;
@@ -219,7 +282,7 @@ static double timeit(void (*fn)(void), int reps)
 static int setup_and_gate(const char *base)
 {
     j_adopt = j_bytes = p_bytes = 0;
-    NW   = (N + G - 1) / G;
+    if (build_windows(base) != 0) return -1;
     FR   = malloc(NW * sizeof(*FR));
     LEN  = malloc(NW * sizeof(*LEN));
     WOFF = malloc((NW + 1) * sizeof(*WOFF));
@@ -232,7 +295,7 @@ static int setup_and_gate(const char *base)
     for (size_t w = 0; w < NW; w++) {
         WOFF[w] = off;
         size_t wlen = wlen_of(w);
-        const uint8_t *p = D + w * G;
+        const uint8_t *p = D + WSTART[w];
         memset(FR[w], 0, sizeof(FR[w]));
         for (size_t i = 0; i < wlen; i++) FR[w][p[i]]++;
 
@@ -304,6 +367,10 @@ int main(int argc, char **argv)
         if (!strncmp(argv[argi], "--G=", 4)) {
             gs[0] = (size_t)atoi(argv[argi] + 4) * 1024;
             ngs = 1;
+        } else if (!strcmp(argv[argi], "--blocks")) {
+            BLOCKS = 1;
+        } else if (!strcmp(argv[argi], "--tables")) {
+            TABLES = 1;
         } else if (!strncmp(argv[argi], "--reps=", 7)) {
             reps = atoi(argv[argi] + 7);
         } else if (!strncmp(argv[argi], "--joint=", 8)) {
@@ -339,14 +406,16 @@ int main(int argc, char **argv)
         } else if (!strncmp(argv[argi], "--gamma=", 8)) {
             JP.gamma = (float)atof(argv[argi] + 8);
         } else {
-            fprintf(stderr, "usage: %s [--G=KB] [--reps=N] [--joint=TIER]"
+            fprintf(stderr, "usage: %s [--G=KB] [--blocks] [--tables] [--reps=N] [--joint=TIER]"
                             " [--lambda=F] [--gamma=F] file...\n", argv[0]);
             return 1;
         }
     }
+    if (BLOCKS || TABLES) ngs = 1;
     pivco_huffman_set_fse_enabled(0);
 
-    printf("blocks=%d fse=0 reps=%d joint=%s", (int)BLK, reps, jname);
+    printf("codec_blk=%d fse=0 reps=%d joint=%s win=%s", (int)BLK, reps, jname,
+           TABLES ? "tables" : BLOCKS ? "litblk" : "fixedG");
     if (JOINT)
         printf(" lambda=%.3f gamma=%.0f", (double)JP.lambda, (double)JP.gamma);
     printf("\n");
@@ -359,6 +428,10 @@ int main(int argc, char **argv)
 
     for (int gi = 0; gi < ngs; gi++) {
         G = gs[gi];
+        char glab[8];
+        if (TABLES)      snprintf(glab, sizeof glab, "tbl");
+        else if (BLOCKS) snprintf(glab, sizeof glab, "blk");
+        else             snprintf(glab, sizeof glab, "%zuK", G / 1024);
         double gm[4] = {0};     /* log-sums: enc m/p, dec m/p */
         size_t tj = 0, tp = 0, tn = 0, ta = 0, tw = 0;  /* joint ratio totals */
         int nfiles = 0;
@@ -366,6 +439,7 @@ int main(int argc, char **argv)
             uint8_t *data = slurp(argv[ai], &N);
             if (!data) { fprintf(stderr, "skip %s\n", argv[ai]); continue; }
             D = data;
+            CURPATH = argv[ai];
             const char *base = strrchr(argv[ai], '/');
             base = base ? base + 1 : argv[ai];
 
@@ -386,9 +460,9 @@ int main(int argc, char **argv)
             double dbm = timeit(pass_dbuild_mini, reps) / (double)NW * 1e6;
             double dbp = timeit(pass_dbuild_prod, reps) / (double)NW * 1e6;
 
-            printf("%-13s %4zuK | %6.0f %6.0f %5.2fx | %6.0f %6.0f %5.2fx |"
+            printf("%-13s %5s | %6.0f %6.0f %5.2fx | %6.0f %6.0f %5.2fx |"
                    " %5.2f %5.2f | %5.2f %5.2f",
-                   base, G / 1024, em, ep, em / ep, dm, dp, dm / dp,
+                   base, glab, em, ep, em / ep, dm, dp, dm / dp,
                    ebm, ebp, dbm, dbp);
             if (JOINT)
                 printf(" | %+.3fpp %zu/%zu",
@@ -400,12 +474,12 @@ int main(int argc, char **argv)
             tj += j_bytes; tp += p_bytes; tn += N; ta += j_adopt; tw += NW;
             nfiles++;
             free(data);
-            free(FR); free(LEN); free(WOFF); free(ENC); free(ENC2); free(DEC);
+            free(FR); free(LEN); free(WOFF); free(WSTART); free(ENC); free(ENC2); free(DEC);
         }
         if (nfiles > 1) {
-            printf("%-13s %4zuK | %6.0f %6.0f %5.2fx | %6.0f %6.0f %5.2fx |"
+            printf("%-13s %5s | %6.0f %6.0f %5.2fx | %6.0f %6.0f %5.2fx |"
                    " geomean over %d files",
-                   "== geomean", G / 1024,
+                   "== geomean", glab,
                    exp(gm[0] / nfiles), exp(gm[1] / nfiles),
                    exp((gm[0] - gm[1]) / nfiles),
                    exp(gm[2] / nfiles), exp(gm[3] / nfiles),

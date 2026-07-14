@@ -81,23 +81,30 @@ int main(int argc, char** argv) {
         const char* base = strrchr(path, '/');
         base = base ? base + 1 : path;
 
-        char p_lit[1024], p_ll[1024], p_of[1024], p_ml[1024];
-        snprintf(p_lit, sizeof(p_lit), "%s/%s.lits", out_dir, base);
-        snprintf(p_ll,  sizeof(p_ll),  "%s/%s.ll",   out_dir, base);
-        snprintf(p_of,  sizeof(p_of),  "%s/%s.of",   out_dir, base);
-        snprintf(p_ml,  sizeof(p_ml),  "%s/%s.ml",   out_dir, base);
+        char p_lit[1024], p_ll[1024], p_of[1024], p_ml[1024], p_blk[1024];
+        snprintf(p_lit, sizeof(p_lit), "%s/%s.lits",   out_dir, base);
+        snprintf(p_ll,  sizeof(p_ll),  "%s/%s.ll",     out_dir, base);
+        snprintf(p_of,  sizeof(p_of),  "%s/%s.of",     out_dir, base);
+        snprintf(p_ml,  sizeof(p_ml),  "%s/%s.ml",     out_dir, base);
+        snprintf(p_blk, sizeof(p_blk), "%s/%s.litblk", out_dir, base);
+        char p_hdr[1024];
+        snprintf(p_hdr, sizeof(p_hdr), "%s/%s.lithdr", out_dir, base);
 
         FILE* f_lit = fopen(p_lit, "wb");
         FILE* f_ll  = fopen(p_ll,  "wb");
         FILE* f_of  = fopen(p_of,  "wb");
         FILE* f_ml  = fopen(p_ml,  "wb");
-        if (!f_lit || !f_ll || !f_of || !f_ml) {
+        FILE* f_blk = fopen(p_blk, "wb");   /* per-block litSize, u32 LE */
+        FILE* f_hdr = fopen(p_hdr, "wb");   /* per-block type: 0/1/2/3    */
+        if (!f_lit || !f_ll || !f_of || !f_ml || !f_blk || !f_hdr) {
             fprintf(stderr, "open output failed for %s\n", base); return 1;
         }
-        g_zstd_prof_lit_dump_fp = f_lit;
-        g_zstd_prof_ll_dump_fp  = f_ll;
-        g_zstd_prof_of_dump_fp  = f_of;
-        g_zstd_prof_ml_dump_fp  = f_ml;
+        g_zstd_prof_lit_dump_fp    = f_lit;
+        g_zstd_prof_ll_dump_fp     = f_ll;
+        g_zstd_prof_of_dump_fp     = f_of;
+        g_zstd_prof_ml_dump_fp     = f_ml;
+        g_zstd_prof_litblk_dump_fp = f_blk;
+        g_zstd_prof_lithdr_dump_fp = f_hdr;
 
         size_t cbound = ZSTD_compressBound(raw_len);
         void* compressed = malloc(cbound);
@@ -105,11 +112,13 @@ int main(int argc, char** argv) {
         if (ZSTD_isError(csize)) {
             fprintf(stderr, "compress err: %s\n", ZSTD_getErrorName(csize)); return 1;
         }
-        g_zstd_prof_lit_dump_fp = NULL;
-        g_zstd_prof_ll_dump_fp = NULL;
-        g_zstd_prof_of_dump_fp = NULL;
-        g_zstd_prof_ml_dump_fp = NULL;
-        fclose(f_lit); fclose(f_ll); fclose(f_of); fclose(f_ml);
+        g_zstd_prof_lit_dump_fp    = NULL;
+        g_zstd_prof_ll_dump_fp     = NULL;
+        g_zstd_prof_of_dump_fp     = NULL;
+        g_zstd_prof_ml_dump_fp     = NULL;
+        g_zstd_prof_litblk_dump_fp = NULL;
+        g_zstd_prof_lithdr_dump_fp = NULL;
+        fclose(f_lit); fclose(f_ll); fclose(f_of); fclose(f_ml); fclose(f_blk); fclose(f_hdr);
 
         size_t n_lit, n_ll, n_of, n_ml;
         uint8_t* d_lit = slurp(p_lit, &n_lit);

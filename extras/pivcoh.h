@@ -1,24 +1,8 @@
-/* pivcoh.h - v3.0 - single-file PIVCO-Huffman block codec, NEON edition
+/* pivcoh.h - v3.0 - single-file PIVCO-Huffman block codec
  *
- * A minimal, allocation-free-capable, VLA-free implementation of the
- * PIVCO-Huffman wire format (https://github.com/MarcinZukowski/pivco-huffman).
- * This edition is aarch64-only: it began as straight ports of the
- * production library's NEON kernels (SABD two-table merge, per-D flat
- * decode, p16rev partition) and has since evolved past them — every
- * kernel is fully tail-free (whole vectors end to end; the only scalar
- * remnants are the root merge's exact stores into the caller's buffer
- * and the flat-root extractor), decode ping-pongs two buffers instead
- * of growing an arena, and the flat pack runs a converging-shift
- * pyramid.  Encode and decode meet or beat the production codec on
- * every measured distribution.  ~24 KiB of static shuffle tables build
- * lazily on first use — the writes are idempotent, so concurrent first
- * calls are benign.
- * Streams are byte-identical to the full library's PH-only mode (wire
- * v0.7 decode-order layout; raw bitmaps —
- * pivco_huffman_set_fse_enabled(0), which is also what the pivcohuf
- * tool's default non-ANS format uses; "optimized" tree shaping, max
- * code length 11) for histograms totalling < 4 GiB — see
- * pivcoh_table_from_freqs.  FSE/ANS-coded blocks are not supported and
+ * Based on https://github.com/MarcinZukowski/pivco-huffman
+ *
+ * AArch64/NEON-only. FSE/ANS-coded blocks are not supported and
  * are rejected on decode.
  *
  * Do this in ONE C file to create the implementation:
