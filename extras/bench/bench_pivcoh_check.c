@@ -163,6 +163,79 @@ int main(void)
       memset(lens, 0, 256); lens[0] = 2; lens[1] = 2;             /* under-subscribed */
       if (pivcoh_table_from_lens(&mini, lens)) FAIL("accepted kraft < 1"); }
 
+    /* Joint length/shape tiers.  Production on this branch has no joint
+     * pass (defaults keep exact parity above), so these are consistency
+     * checks: every tier's lengths form a table both engines accept, the
+     * scratch and malloc paths agree byte-for-byte, and joint streams
+     * cross-decode through a lengths-only production rebuild — i.e. a
+     * joint tree is just another valid wire tree. */
+    { const char *tag = "joint"; int id = 0;
+      static uint8_t jscratch[PIVCOH_JOINT_SCRATCH_SIZE];
+      static pivcoh_table jt, jt2;
+      static pivco_huffman_decode_table_t dt;
+      static const int GR[] = { -1, 0, 1, 2, 4, 8 };
+      int n_solve = 0, n_adopt = 0;
+      for (id = 0; id < 40; id++) {
+          memset(freq, 0, sizeof(freq));
+          int ns = 2 + (int)(rng() % 255);
+          for (int k = 0; k < ns; k++) {
+              int s;
+              do { s = (int)(rng() & 255); } while (freq[s]);
+              freq[s] = 1 + rng() % (id & 1 ? 65535 : 1u << 20);
+          }
+          if (!pivcoh_table_from_freqs(&mini, freq)) FAIL("baseline build");
+          int used[256], n_used = 0;
+          for (int s = 0; s < 256; s++) if (freq[s]) used[n_used++] = s;
+          const size_t N = 1 + rng() % 8192;
+          for (size_t i = 0; i < N; i++)
+              blk[i] = (uint8_t)used[rng() % (uint64_t)n_used];
+          for (size_t gi = 0; gi < sizeof(GR) / sizeof(*GR); gi++) {
+              pivcoh_joint j = PIVCOH_JOINT_DEFAULTS;
+              j.gran = GR[gi];
+              if (!pivcoh_table_from_freqs_joint(&jt, freq, &j, jscratch))
+                  FAIL("joint build gran=%d", GR[gi]);
+              if (!pivcoh_table_from_freqs_joint(&jt2, freq, &j, NULL))
+                  FAIL("joint build (malloc) gran=%d", GR[gi]);
+              if (memcmp(&jt, &jt2, sizeof(jt)))
+                  FAIL("scratch/malloc mismatch gran=%d", GR[gi]);
+              n_solve++;
+              if (memcmp(jt.code_len, mini.code_len, 256)) n_adopt++;
+              ptrdiff_t el = pivcoh_encode(&jt, blk, N, enc_mini,
+                                           sizeof(enc_mini), scratch);
+              if (el < 0) FAIL("joint encode gran=%d", GR[gi]);
+              if (!pivcoh_table_from_lens(&jt2, jt.code_len))
+                  FAIL("joint lens rejected by from_lens gran=%d", GR[gi]);
+              memset(dec_buf, 0xAA, N);
+              if (pivcoh_decode(&jt2, enc_mini, (size_t)el, dec_buf,
+                                sizeof(dec_buf), NULL, dscratch)
+                      != (ptrdiff_t)N || memcmp(dec_buf, blk, N))
+                  FAIL("joint roundtrip gran=%d", GR[gi]);
+              if (pivco_huffman_build_decode_table(jt.code_len, &dt)
+                      != PIVCO_OK)
+                  FAIL("joint lens rejected by production gran=%d", GR[gi]);
+              size_t cons = 0;
+              memset(dec_buf, 0xAA, N);
+              if (pivco_huffman_decode_dt(enc_mini, (size_t)el, &dt, dec_buf,
+                                          &cons) != PIVCO_OK
+                      || cons != (size_t)el || memcmp(dec_buf, blk, N))
+                  FAIL("production decode of joint stream gran=%d", GR[gi]);
+          }
+          /* lambda <= 0 must be byte-identical to the plain build
+           * (fresh-zeroed structs: bytes past the live region are
+           * residue of prior builds, meaningless to compare) */
+          pivcoh_joint j0 = PIVCOH_JOINT_DEFAULTS;
+          j0.lambda = 0.0f;
+          memset(&jt, 0, sizeof(jt));
+          memset(&jt2, 0, sizeof(jt2));
+          if (!pivcoh_table_from_freqs_joint(&jt, freq, &j0, jscratch)
+                  || !pivcoh_table_from_freqs(&jt2, freq)
+                  || memcmp(&jt, &jt2, sizeof(jt)))
+              FAIL("lambda=0 not identical to plain build");
+      }
+      printf("pivcoh joint: %d solves consistent (all tiers), %d adopted\n",
+             n_solve, n_adopt);
+    }
+
     printf("pivcoh check PASS: %d tables, %d blocks wire-identical + cross-decoded, "
            "%d hostile decodes survived\n", n_tables, n_blocks, n_fuzz);
     return 0;

@@ -28,6 +28,8 @@
  * Usage — encoder side:
  *     pivcoh_table t;
  *     if (!pivcoh_table_from_freqs(&t, freq)) ...;   // freq: uint64_t[256]
+ *     // or _joint(&t, freq, &j, NULL) to trade a guarded sliver of
+ *     // compressed size for a much faster-to-decode tree shape
  *     // transmit t.code_len (256 values, all <= 11: nibble-packable)
  *     unsigned char out[PIVCOH_ENCODE_BOUND(4096)];
  *     ptrdiff_t len = pivcoh_encode(&t, in, n, out, sizeof out, NULL);
@@ -96,6 +98,48 @@
  * speed.  PIVCOH_SCRATCH_SIZE also always suffices. */
 #define PIVCOH_DECODE_SCRATCH_SIZE(n)  (2 * (size_t)(n) + 128)
 
+/* ---- optional joint length/shape optimization (encoder side) ----
+ *
+ * pivcoh_table_from_freqs picks lengths that minimize compressed bits.
+ * pivcoh_table_from_freqs_joint additionally bends them — at an
+ * explicitly priced, guard-bounded cost in bits — so the class counts
+ * land on round binary numbers and the decoder's counts-to-chunks rule
+ * yields fewer, larger flat blocks and fewer merge passes.  Measured on
+ * windowed LZ-literal workloads this buys +25%..+130% decode speed at
+ * a compression delta within ±0.3 pp (better at small windows).  The
+ * wire carries only lengths, so ANY decoder reads the output.
+ * Port of the production joint optimizer (joint-cost-model @ c6073f5). */
+typedef struct {
+    float lambda;      /* bits one merge pass is worth; <= 0 disables the
+                          pass entirely (plain Huffman lengths) */
+    int   gran;        /* solve tier: 0 auto (exact DP to 64 symbols, then
+                          grouped; always ~<= 10 us), 1 exact DP (~100 us
+                          worst case), 2/4/8 fixed grouping, -1 greedy
+                          nudger (~2 us, no DP, about half the win).
+                          Other values behave as 0. */
+    float guard_bits;  /* adopt only if modeled bits <= guard_bits * baseline */
+    float guard_time;  /* ... and modeled decode time <= guard_time * baseline;
+                          otherwise the plain Huffman lengths are kept */
+    float gamma;       /* fixed decode cost per schedule record per block, in
+                          merge element-pass units (dispatch + wire header).
+                          Blocks are modeled at 16K symbols; gamma and block
+                          size enter the cost only as gamma/block, so scale
+                          gamma if your decode granularity differs */
+    float kappa[9];    /* flat-kernel decode cost per symbol at depth b, in
+                          merge-pass units; all-zero models kernels free */
+    float mu_cst;      /* lone-leaf merge cost relative to a full merge */
+    float prefill;     /* fraction of the prefilled top-symbol leaf its
+                          parent merge skips (pivcoh does not prefill: 0) */
+} pivcoh_joint;
+#define PIVCOH_JOINT_DEFAULTS \
+    { 0.1f, 0, 1.015f, 0.90f, 170.0f, {0}, 1.0f, 0.0f }
+
+/* Scratch for the joint DP tiers: the exact solve at a full 256-symbol
+ * alphabet needs a (257 diagonals x 132 cells) plane of f32 costs plus
+ * 11 u16 backtrack planes (+8 alignment).  Tiers gran 0/-1 use < 64 KiB
+ * of this.  As with encode/decode, scratch may be NULL (malloc). */
+#define PIVCOH_JOINT_SCRATCH_SIZE  (257 * 132 * 26 + 8)
+
 typedef struct { uint8_t kd, param, right; } pivcoh__rec;
 
 typedef struct {
@@ -117,6 +161,16 @@ typedef struct {
  * different — still valid — lengths.  Returns 1, or 0 if every
  * frequency is zero. */
 PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256]);
+
+/* As pivcoh_table_from_freqs, plus the joint length/shape pass when
+ * j && j->lambda > 0 (start from PIVCOH_JOINT_DEFAULTS).  On any
+ * internal reject — the adoption guard, an out-of-contract lambda, or
+ * malloc failure with scratch == NULL — the plain Huffman lengths are
+ * kept, so the return value means exactly what it does above. */
+PIVCOHDEF int pivcoh_table_from_freqs_joint(pivcoh_table *t,
+                                            const uint64_t freq[256],
+                                            const pivcoh_joint *j,
+                                            void *scratch);
 
 /* Build a table from received code lengths (decoder side).  Returns 1, or
  * 0 on invalid lengths (any > 11, all zero, or not Kraft-complete).  Both
@@ -148,6 +202,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
 #endif
 
 #include <arm_neon.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -372,7 +427,730 @@ static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint32_t vary)
     if (src != leaf) memcpy(leaf, src, (size_t)n * sizeof(*leaf));
 }
 
-PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
+/* ============ joint length/shape optimization (encoder side) ============
+ *
+ * Port of the production joint_lengths.c (joint-cost-model @ c6073f5).
+ * Chunk model: choosing lengths IS choosing at most one chunk per
+ * (level L <= 11, flat depth b <= min(8, L)) — a chunk holds 2^b
+ * symbols at length L inside a depth-b flat, so each of its symbols'
+ * occurrences costs L bits and L - b merge passes.  Objective:
+ *     J = sum_s n_s * (L_s + lambda*(L_s - b_s + kappa[b_s]))
+ *         + lambda * gamma * blocks * records
+ * subject to chunk-root Kraft equality.  For a fixed chunk multiset the
+ * optimal symbol assignment deals freq-sorted symbols into cost-sorted
+ * chunks (rearrangement inequality), which turns the solve into a DP
+ * over (symbols placed, open slots); lambda = 0 degenerates to the
+ * Huffman baseline, so the result can only improve in-model, and a
+ * kind-aware time model guards against out-of-model regressions.
+ *
+ * Deliberately not ported: the FSE decode-tax term (pivcoh speaks the
+ * raw-bitmap subset — no bitmap is ever FSE-coded) and the ~10 MB
+ * mass-DP fallback for lambda > 1/7 — when the slot DP's validity
+ * condition fails, the baseline is kept, the same contract as a guard
+ * reject. */
+
+/* ---- kind-aware decode-time model (the adoption guard) ----
+ *
+ * The per-occurrence model above prices every merge alike, but the
+ * decoder's merges differ by KIND: a merge with a lone-leaf child uses
+ * the cheap cst kernels, a merge of two internal streams pays the full
+ * partition.  Tree arrangement is deterministic from the chunk
+ * multiset (roots sorted by depth, canonical prefixes), so for <= 33
+ * chunks we simulate the skeleton exactly and price each node by kind.
+ * Used on BOTH sides of the guard's comparison; the DP keeps its
+ * separable search cost (the guard is where mispricing must not
+ * survive). */
+typedef struct { uint8_t r, D; double W; } pivcoh__jl_ch;
+
+/* Subtree at depth d spanning chunks ch[*i..): consumes them, returns
+ * the subtree's decode-time units and its weight; *kind reports what
+ * the parent sees (0 = lone leaf, 1 = internal).  pre marks the chunk
+ * index holding the prefilled top symbol (-1 = none). */
+static double pivcoh__jl_sim(const pivcoh__jl_ch *ch, int n, int *i, int d,
+                             int pre, const pivcoh_joint *jp,
+                             const double *kap, int *recs,
+                             double *Wout, int *kind)
+{
+    if (*i < n && ch[*i].r == d) {
+        const pivcoh__jl_ch *c = &ch[(*i)++];
+        *Wout = c->W;
+        if (c->D == 0) { *kind = 0; return 0.0; }
+        *kind = 1;
+        (*recs)++;                                 /* pair/flat record */
+        return c->W * kap[c->D];                   /* D=1 pair: kap[1] */
+    }
+    double Wl = 0, Wr = 0, tl, tr;
+    int kl, kr;
+    const int il = *i;
+    (*recs)++;                                     /* merge record */
+    tl = pivcoh__jl_sim(ch, n, i, d + 1, pre, jp, kap, recs, &Wl, &kl);
+    tr = pivcoh__jl_sim(ch, n, i, d + 1, pre, jp, kap, recs, &Wr, &kr);
+    double W = Wl + Wr;
+    double t;
+    if (kl == 0 || kr == 0) {
+        t = W * jp->mu_cst;                   /* one lone leaf: cst_vec */
+        /* prefilled leaf: its side is memset ahead; the merge only
+         * moves the internal side */
+        if (pre >= 0 && ((kl == 0 && il == pre) ||
+                         (kr == 0 && *i - 1 == pre)))
+            t -= (kl == 0 ? Wl : Wr) * (double)jp->prefill * jp->mu_cst;
+    } else
+        t = W;                                /* full partition */
+    *Wout = W;
+    *kind = 1;
+    return t + tl + tr;
+}
+
+/* Kind-aware decode time for a chunk list (any order; sorted here by
+ * root depth asc, D desc, W desc).  The prefill chunk is the heaviest-
+ * per-symbol chunk, if it is a lone leaf — exact under the deal's
+ * sorted order. */
+static double pivcoh__jl_time(pivcoh__jl_ch *ch, int n,
+                              const pivcoh_joint *jp, const double *kap,
+                              double total_weight)
+{
+    int i, j;
+    for (i = 1; i < n; i++) {
+        pivcoh__jl_ch c = ch[i];
+        for (j = i - 1; j >= 0 && (ch[j].r > c.r ||
+                 (ch[j].r == c.r && (ch[j].D < c.D ||
+                  (ch[j].D == c.D && ch[j].W < c.W)))); j--)
+            ch[j + 1] = ch[j];
+        ch[j + 1] = c;
+    }
+    int pre = -1;
+    double best = -1;
+    for (i = 0; i < n; i++) {
+        double per = ch[i].W / (double)(1 << ch[i].D);
+        if (per > best) { best = per; pre = ch[i].D == 0 ? i : -1; }
+    }
+    int ii = 0, kind, recs = 0;
+    double W;
+    double t = pivcoh__jl_sim(ch, n, &ii, 0, pre, jp, kap, &recs, &W, &kind);
+    if (ii != n) return -1.0;   /* malformed multiset (cannot happen) */
+    if (jp->gamma > 0) {        /* per-record fixed cost x blocks/window */
+        double blocks = ceil(total_weight / 16384.0);
+        if (blocks < 1) blocks = 1;
+        t += (double)jp->gamma * (double)recs * blocks;
+    }
+    return t;
+}
+
+/* ---- slot-ledger DP (exact for lambda <= 1/7) ----
+ *
+ * A state is (k symbols placed, s open slots at the current level);
+ * Kraft EQUALITY forces s <= sigma - k at every level.  Levels are
+ * processed ascending, chunk types within a level in cost order; that
+ * equals GLOBAL chunk-cost order — the sorted-matching exactness
+ * requirement — iff pivcoh__jl_order's spread bound holds (kappa = 0
+ * recovers the classic lambda <= 1/7).  Three structural facts make the
+ * walk L1-resident:
+ *
+ * DIAGONALS.  A take (k, s) -> (k + 2^b, s - 2^b) preserves t = k + s,
+ * so within a level the DP decomposes into independent diagonals.
+ * Stored diagonal-major, all take sweeps of a level run over one
+ * <~0.5 KB row; the plane is traversed once per level (the doubling).
+ *
+ * PARITY.  Level-entry states have even s (they come from the doubling
+ * s' = 2s) and takes with b >= 1 preserve s-parity, so the live lattice
+ * is k == t (mod 2): compact index j = (k - (t&1))/2 halves each row.
+ * b = 0 — the only parity flip, always last in the level's cost order —
+ * is folded into the doubling (an odd-s cell's unique source is its
+ * even-lattice predecessor plus one lone leaf) and reconstructed from
+ * s-parity at backtrack.  The deepest level never takes b = 0: entry s
+ * is even and the terminal needs takes summing to s exactly.
+ *
+ * CAPACITY BAND.  A state at level L can place at most s * 2^h more
+ * symbols (h = levels below), so sigma - k <= (t - k) << h is necessary
+ * — and met by every completing trajectory, making the prune exact.
+ * Feasibility is preserved cell-to-cell by takes and by the doubling,
+ * so pruned — hence stale — cells are never read.
+ *
+ * Terminal: (k = sigma, s = 0) after the deepest level.  Per-level u16
+ * pick rows (bits 1..8; bit 0 is implicit in parity) are archived per
+ * diagonal for backtrack. */
+#define PIVCOH__JL_WMAX 132     /* max compact row: j <= 128, padded to x4 */
+
+/* Largest compact index j on diagonal t whose k = 2j + (t&1) can still
+ * feed sigma - k leaves through (t - k) slots h levels above the
+ * bottom; -1 if the whole row is infeasible. */
+static inline int pivcoh__jl_jcap(int t, int h, int sigma)
+{
+    const int p = t & 1;
+    int kcap;
+    if (h == 0) {
+        kcap = t;                     /* t == sigma: all k feasible */
+    } else {
+        const int num = (t << h) - sigma;
+        if (num < 0) return -1;
+        kcap = num / ((1 << h) - 1);
+        if (kcap > t) kcap = t;
+    }
+    if (kcap < p) return -1;
+    return (kcap - p) >> 1;
+}
+
+/* Within-level sweep/deal order under kernel costs.  cost(L, b) =
+ * L(1+lam) + g(b) with g(b) = lam*(kap[b] - b): the within-level cost
+ * order is L-independent, so one sorted order serves every level.
+ * Exactness of the slot DP needs (a) cross-level monotonicity:
+ * spread(g) <= 1 + lam (kappa = 0 recovers lam <= 1/7), and (b) b = 0
+ * dearest within the level (the parity fold runs it last).  Fills
+ * border[0..*nb) with b = 1..bcap by ascending g; returns 1 iff both
+ * hold (on 0 the caller keeps the baseline). */
+static int pivcoh__jl_order(double lam, const double *kap, int bcap,
+                            int border[8], int *nb)
+{
+    double g[9];
+    double gmin = 0, gmax = 0;
+    for (int b = 0; b <= bcap; b++) {
+        g[b] = lam * (kap[b] - (double)b);
+        if (b == 0 || g[b] < gmin) gmin = g[b];
+        if (b == 0 || g[b] > gmax) gmax = g[b];
+    }
+    if (gmax - gmin > (1.0 + lam) * (1.0 - 1e-9)) return 0;
+    int n = 0;
+    for (int b = 1; b <= bcap; b++) {
+        if (g[b] > g[0] + 1e-12) return 0;   /* b0 must stay dearest */
+        int i = n++;
+        while (i > 0 && (g[border[i - 1]] > g[b]
+                         || (g[border[i - 1]] == g[b] && border[i - 1] < b))) {
+            border[i] = border[i - 1];
+            i--;
+        }
+        border[i] = b;                       /* ties: larger b first */
+    }
+    *nb = n;
+    return 1;
+}
+
+/* lmax/bcap parameterize the level range and flat-depth cap so the
+ * same solver runs the exact problem (11, 8) and the 2^G-grouped
+ * coarse problem (11-G, 8-G): a group of 2^G sorted symbols at real
+ * level L is a depth-G flat, so the coarse problem is this problem
+ * shifted by G with an identical cost form.  tc0/tc1: per-take J
+ * constants (lambda * gamma * blocks * records added) for b = 0 and
+ * b >= 1 takes.  scratch: PIVCOH_JOINT_SCRATCH_SIZE or NULL. */
+static double pivcoh__jl_slots(const double *P, int sigma, double lam,
+                               int lmax, int bcap, const double *kap,
+                               double tc0, double tc1,
+                               uint16_t out_BL[PIVCOH__MAXLEN + 1],
+                               void *scratch)
+{
+    int border[8], nb;
+    if (!pivcoh__jl_order(lam, kap, bcap, border, &nb))
+        return -1.0;
+    const int W = (((sigma >> 1) + 2) + 3) & ~3;   /* compact row width */
+    const size_t plane = (size_t)(sigma + 1) * (size_t)W;
+    uint8_t *own = scratch ? NULL :
+        (uint8_t *)malloc(plane * (4 + 2 * (size_t)lmax) + 8);
+    if (!own && !scratch) return -1.0;
+    float *cost = (float *)(((uintptr_t)(own ? own : (uint8_t *)scratch) + 3)
+                            & ~(uintptr_t)3);
+    uint16_t *arch = (uint16_t *)(cost + plane);
+    float     dPt[2][9][PIVCOH__JL_WMAX];   /* [t&1][b][j]: P[k+2^b]-P[k] */
+    float     dP0[257];                     /* P[k] - P[k-1] */
+
+    for (int p = 0; p < 2; p++)
+        for (int b = 1; b <= bcap; b++) {
+            const int cnk = 1 << b;
+            for (int j = 0; j < W; j++) {
+                const int k = 2 * j + p;
+                dPt[p][b][j] = k + cnk <= sigma
+                             ? (float)(P[k + cnk] - P[k]) : 0.0f;
+            }
+        }
+    dP0[0] = 0.0f;
+    for (int k = 1; k <= sigma; k++) dP0[k] = (float)(P[k] - P[k - 1]);
+
+    int tlo[PIVCOH__MAXLEN + 1], thi[PIVCOH__MAXLEN + 1];
+    for (int L = 1; L <= lmax; L++) {
+        const int h = lmax - L;
+        thi[L] = (1 << L) > sigma ? sigma : (1 << L);
+        tlo[L] = (sigma + (1 << h) - 1) >> h;
+        if (tlo[L] < 1) tlo[L] = 1;
+    }
+
+    /* Lazy init: every row is fully written by the doubling that
+     * produces its level, so only the level-1 band rows need priming. */
+    for (int t = tlo[1]; t <= thi[1]; t++)
+        for (int j = 0; j < W; j++) cost[(size_t)t * W + j] = INFINITY;
+    cost[2 * W + 0] = 0.0f;      /* level-1 entry: k = 0, s = 2, t = 2 */
+
+    for (int L = 1; L <= lmax; L++) {
+        const int h = lmax - L;
+        const int bmax = L < bcap ? L : bcap;
+        uint16_t *archL = arch + (size_t)(L - 1) * plane;
+        for (int t = tlo[L]; t <= thi[L]; t++) {
+            const int p = t & 1;
+            const int jcap = pivcoh__jl_jcap(t, h, sigma);
+            if (jcap < 0) continue;
+            float *row = cost + (size_t)t * W;
+            uint16_t *prow = archL + (size_t)t * W;   /* picks, archived
+                                                       * in place */
+            memset(prow, 0, (size_t)(jcap + 1) * sizeof(uint16_t));
+            for (int oi = 0; oi < nb; oi++) {
+                const int b = border[oi];
+                if (b > bmax) continue;
+                const int jstep = 1 << (b - 1);       /* = 2^b slots / 2 */
+                const int jhi = jcap - jstep;         /* dest j <= jcap  */
+                if (jhi < 0) continue;
+                const float a = (float)((double)L
+                                         + lam * ((double)(L - b) + kap[b]));
+                const float tc = (float)tc1;
+                const float *dpb = dPt[p][b];
+                int j = jhi;
+                /* 0/1 in-place: dest j + jstep > src j, so iterate j
+                 * descending — a written dest is never re-read as a
+                 * source for the same chunk.  Stores are unconditional:
+                 * everything is L1-resident, so blending beats the
+                 * data-dependent branch of an "improved?" early-out. */
+                const float32x4_t va = vdupq_n_f32(a);
+                const uint16x4_t vbit = vdup_n_u16((uint16_t)(1u << b));
+                for (; j >= 3; j -= 4) {
+                    const int base = j - 3;
+                    float32x4_t src = vld1q_f32(row + base);
+                    float32x4_t cand = vaddq_f32(
+                        vfmaq_f32(src, vld1q_f32(dpb + base), va),
+                        vdupq_n_f32(tc));
+                    float32x4_t dst = vld1q_f32(row + base + jstep);
+                    uint32x4_t m = vcltq_f32(cand, dst);
+                    vst1q_f32(row + base + jstep, vbslq_f32(m, cand, dst));
+                    uint16x4_t pm = vmovn_u32(m);
+                    uint16x4_t pv = vorr_u16(vld1_u16(prow + base), vbit);
+                    uint16x4_t qv = vld1_u16(prow + base + jstep);
+                    vst1_u16(prow + base + jstep, vbsl_u16(pm, pv, qv));
+                }
+                for (; j >= 0; j--) {
+                    const float v = row[j];
+                    if (!(v < INFINITY)) continue;
+                    const float cand = v + a * dpb[j] + tc;
+                    if (cand < row[j + jstep]) {
+                        row[j + jstep] = cand;
+                        prow[j + jstep] = (uint16_t)(prow[j] | (1u << b));
+                    }
+                }
+            }
+        }
+        if (L == lmax) break;
+        /* Doubling s' = 2s with the b = 0 take folded in.  Dest cell
+         * (t', k) has the unique source (t = (t'+k)/2, k): even-lattice
+         * there if k == t (mod 2), else the odd-s product of a lone
+         * leaf taken at level L from (t, k-1).  In place, t' and j'
+         * descending: sources live on rows <= t', and the single
+         * same-row read (t = t', only at k = t') happens before its
+         * cell is overwritten.
+         *
+         * Branchless: on dest row t' the source diagonal is t = t0 + j'
+         * (t0 = (t'+p')/2), so the level-L band check hoists to a
+         * j'-range, and the source parity d = (t^k)&1 alternates with
+         * j' — two constant-stride subloops with the unified source
+         * index (k - d - (t&1))/2.  The subloop containing the top cell
+         * runs first (it holds the only same-row read). */
+        /* NB the production source declares this constant and then never
+         * adds it — its DP under-prices b = 0 takes by the per-record
+         * gamma surcharge (the nudge scorer and the guard both charge
+         * it).  Fixed here: the fold's take cost carries + tcz. */
+        const float a0 = (float)((double)L * (1.0 + lam) + lam * kap[0]);
+        const float tcz = (float)tc0;
+        for (int tp = thi[L + 1]; tp >= tlo[L + 1]; tp--) {
+            const int pp = tp & 1;
+            const int jcap2 = pivcoh__jl_jcap(tp, h - 1, sigma);
+            if (jcap2 < 0) continue;
+            float *nrow = cost + (size_t)tp * W;
+            const int t0 = (tp + pp) >> 1;
+            int jlo = tlo[L] - t0; if (jlo < 0) jlo = 0;
+            int jhi2 = thi[L] - t0; if (jhi2 > jcap2) jhi2 = jcap2;
+            for (int jp2 = jcap2; jp2 > jhi2; jp2--) nrow[jp2] = INFINITY;
+            for (int jp2 = jlo - 1; jp2 >= 0; jp2--) nrow[jp2] = INFINITY;
+            for (int half = 0; half < 2; half++) {
+                int jp2 = jhi2 - half;
+                if (jp2 < jlo) continue;
+                const int k1 = 2 * jp2 + pp;
+                const int t1 = t0 + jp2;
+                const int d = (t1 ^ k1) & 1;
+                const float *src = cost + (size_t)t1 * W
+                                 + (size_t)((k1 - d - (t1 & 1)) >> 1);
+                if (d == 0) {
+                    for (; jp2 >= jlo; jp2 -= 2, src -= 2 * W + 2)
+                        nrow[jp2] = *src;
+                } else {
+                    /* k = 0 has no lone-leaf predecessor: if this
+                     * chain reaches cell (jp2 = 0, k = 0), stop above
+                     * it and mark it unreachable. */
+                    int floor2 = jlo, patch0 = 0;
+                    if (pp == 0 && (jp2 & 1) == 0 && jlo == 0) {
+                        floor2 = 2;
+                        patch0 = 1;
+                    }
+                    const float *dp0 = dP0 + k1;
+                    for (; jp2 >= floor2; jp2 -= 2, src -= 2 * W + 2, dp0 -= 4)
+                        nrow[jp2] = *src + a0 * *dp0 + tcz;
+                    if (patch0)
+                        nrow[0] = INFINITY;
+                }
+            }
+        }
+    }
+
+    double J = cost[(size_t)sigma * W + (size_t)((sigma - (sigma & 1)) >> 1)];
+    if (J < INFINITY) {
+        /* Backtrack: invert each level's transition; odd end-of-level
+         * s means the folded b0 was taken there — recover its bits
+         * from the even-lattice predecessor and set bit 0. */
+        int k = sigma, s = 0;
+        for (int L = lmax; L >= 1; L--) {
+            const int t = k + s;
+            const int p = t & 1;
+            const uint16_t *arow = arch + (size_t)(L - 1) * plane
+                                        + (size_t)t * W;
+            uint16_t BL;
+            if ((k ^ t) & 1)
+                BL = (uint16_t)(arow[(k - 1 - p) >> 1] | 1u);
+            else
+                BL = arow[(k - p) >> 1];
+            out_BL[L] = BL;
+            int cL = 0;
+            for (int b = 0; b <= 8; b++) if (BL & (1 << b)) cL += 1 << b;
+            k -= cL;
+            s += cL;                  /* slots at level L entry (even) */
+            if (L > 1) s >>= 1;       /* pre-doubling slots left       */
+        }
+    } else {
+        J = -1.0;
+    }
+    free(own);
+    return J;
+}
+
+/* ---- greedy boundary nudger (gran -1): no DP ----
+ *
+ * The DP acts as a boundary nudger that rounds class counts to few
+ * powers of two on a nearly degenerate objective.  Do that directly:
+ * one shallow-to-deep walk with the slot ledger, at each level choosing
+ * among a handful of low-popcount roundings of the baseline class
+ * count inside the feasibility window, scored by the exact chunk cost
+ * of this level plus a clamped-baseline rollout of the rest (a
+ * one-level lookahead systematically walks into corners).  ~2 us; the
+ * adoption guard rejects any bad pick.
+ *
+ * Feasibility window at level L (h levels below, s open slots, rest
+ * symbols unplaced): capacity below needs c <= (s*2^h - rest)/(2^h - 1)
+ * (leaves taken now eat slots the remainder needs); completeness
+ * (every open slot must eventually host >= 1 leaf) needs c >= 2s - rest.
+ * Given the invariants s <= rest <= s*2^h the window is provably
+ * nonempty at every level, and any in-window choice preserves them, so
+ * the walk cannot die.  At h = 0 it collapses to c = rest = s. */
+static inline int pivcoh__jl_clamp(int c, int s, int rest, int h)
+{
+    int hi = s < rest ? s : rest;
+    int lo = 0;
+    if (h == 0)
+        return rest <= hi ? rest : -1;
+    const long cap = (((long)s << h) - rest) / ((1l << h) - 1);
+    if (cap < hi) hi = (int)cap;
+    const long l2 = 2l * s - rest;
+    if (l2 > 0) lo = (int)l2;
+    if (lo > hi) return -1;
+    return c < lo ? lo : c > hi ? hi : c;
+}
+
+/* Exact chunk cost of placing count c at level L on prefix [k, k+c);
+ * bits are dealt in the within-level cost order ord[0..nord). */
+static inline double pivcoh__jl_ccost(const double *P, int k, int c, int L,
+                                      double lam, const double *kap,
+                                      const int *ord, int nord,
+                                      double tc0, double tc1)
+{
+    double sc = 0;
+    int off = 0;
+    for (int oi = 0; oi < nord; oi++) {
+        const int b = ord[oi];
+        if (c & (1 << b)) {
+            sc += (P[k + off + (1 << b)] - P[k + off])
+                * ((double)L + lam * ((double)(L - b) + kap[b]))
+                + (b == 0 ? tc0 : tc1);
+            off += 1 << b;
+        }
+    }
+    return sc;
+}
+
+/* Complete the walk from (k, s) at level L0 following the clamped
+ * baseline counts; the exact modeled cost of that completion is the
+ * lookahead score for candidate choices. */
+static double pivcoh__jl_rollout(const double *P, int sigma, double lam,
+                                 const double *kap, const int *ord, int nord,
+                                 double tc0, double tc1,
+                                 const int cls_n[PIVCOH__MAXLEN + 1],
+                                 int k, int s, int L0)
+{
+    double cost = 0;
+    for (int L = L0; L <= PIVCOH__MAXLEN; L++) {
+        const int c = pivcoh__jl_clamp(cls_n[L], s, sigma - k,
+                                       PIVCOH__MAXLEN - L);
+        if (c < 0) return INFINITY;
+        cost += pivcoh__jl_ccost(P, k, c, L, lam, kap, ord, nord, tc0, tc1);
+        k += c;
+        s = 2 * (s - c);
+    }
+    return cost;
+}
+
+static double pivcoh__jl_nudge(const double *P, int sigma, double lam,
+                               const double *kap, double tc0, double tc1,
+                               const int base[PIVCOH__MAXLEN + 1],
+                               uint16_t out_BL[PIVCOH__MAXLEN + 1])
+{
+    /* Within-level deal order under kappa: all b in 0..8 by ascending
+     * g(b) = lam*(kap[b] - b) — no validity condition; the nudger is a
+     * heuristic and the guard re-scores its output. */
+    int ord[9];
+    int n = 0;
+    for (int b = 0; b <= 8; b++) {
+        double gb = lam * (kap[b] - (double)b);
+        int i = n++;
+        while (i > 0) {
+            double gp = lam * (kap[ord[i - 1]] - (double)ord[i - 1]);
+            if (gp > gb || (gp == gb && ord[i - 1] < b)) {
+                ord[i] = ord[i - 1];
+                i--;
+            } else break;
+        }
+        ord[i] = b;
+    }
+    /* Score with lambda inflated 1.5x: greedy under-commits to
+     * flattening relative to the DP, and the guard judges with the
+     * REAL lambda anyway, so biasing the search toward flatter shapes
+     * raises adoption without risking quality.  (tc0/tc1 stay honest.) */
+    lam *= 1.5;
+    double total = 0;
+    int k = 0, s = 2;
+    for (int L = 1; L <= PIVCOH__MAXLEN; L++) {
+        const int c0 = pivcoh__jl_clamp(base[L], s, sigma - k,
+                                        PIVCOH__MAXLEN - L);
+        if (c0 < 0) return -1.0;             /* cannot happen from a
+                                              * valid baseline */
+        /* candidates: clamped baseline, its 1- and 2-bit
+         * down-roundings, the next power of two up, and 0 (kill the
+         * level), each re-clamped */
+        int cand[5], nc = 0;
+        cand[nc++] = c0;
+        if (c0 > 0) {
+            const int top = 1 << (31 - __builtin_clz((unsigned)c0));
+            const int lowmask = c0 & ~top;
+            cand[nc++] = top;
+            if (lowmask)
+                cand[nc++] = top | (1 << (31 - __builtin_clz((unsigned)lowmask)));
+            if (top != c0)
+                cand[nc++] = top << 1;
+            cand[nc++] = 0;
+        }
+        double bestsc = INFINITY;
+        int bestc = c0;
+        int prev = -1;
+        for (int i = 0; i < nc; i++) {
+            int c = pivcoh__jl_clamp(cand[i], s, sigma - k, PIVCOH__MAXLEN - L);
+            if (c < 0 || c == prev) continue;
+            prev = c;
+            const double sc = pivcoh__jl_ccost(P, k, c, L, lam, kap,
+                                               ord, n, tc0, tc1)
+                + pivcoh__jl_rollout(P, sigma, lam, kap, ord, n, tc0, tc1,
+                                     base, k + c, 2 * (s - c), L + 1);
+            if (sc < bestsc) { bestsc = sc; bestc = c; }
+        }
+        out_BL[L] = (uint16_t)bestc;   /* binary decomposition == bits */
+        total += pivcoh__jl_ccost(P, k, bestc, L, lam, kap, ord, n, tc0, tc1);
+        k += bestc;
+        s = 2 * (s - bestc);
+    }
+    return total;
+}
+
+/* Core over the build's leaf array (ascending — reversed in place
+ * here; ghost-padding may append).  Overwrites lens[] on adoption;
+ * any reject leaves them untouched. */
+static int pivcoh__jl_core(pivcoh__leaf *sf, int sigma,
+                           const uint64_t freq[256], uint8_t lens[256],
+                           const pivcoh_joint *jp, void *scratch)
+{
+    const double lam = (double)jp->lambda;
+    if (sigma < 2) return -1;
+    double kap[9];
+    for (int b = 0; b <= 8; b++)
+        kap[b] = (jp->kappa[b] >= 0.0f && jp->kappa[b] < 100.0f)
+               ? (double)jp->kappa[b] : 0.0;
+    pivcoh_joint jv = *jp;      /* sanitized model knobs for the guard */
+    if (!(jv.mu_cst > 0 && jv.mu_cst < 100)) jv.mu_cst = 1.0f;
+    if (!(jv.prefill >= 0 && jv.prefill <= 1)) jv.prefill = 0.0f;
+    if (!(jv.gamma >= 0 && jv.gamma < 1e6f)) jv.gamma = 0.0f;
+    const double gbits = jp->guard_bits > 0 ? (double)jp->guard_bits : 1.015;
+    const double gtime = jp->guard_time > 0 ? (double)jp->guard_time : 0.90;
+
+    for (int i = 0; i < sigma / 2; i++) {  /* ascending -> descending */
+        pivcoh__leaf tmp = sf[i];
+        sf[i] = sf[sigma - 1 - i];
+        sf[sigma - 1 - i] = tmp;
+    }
+    double P[257];
+    P[0] = 0.0;
+    for (int i = 0; i < sigma; i++) P[i + 1] = P[i] + (double)sf[i].freq;
+
+    /* Baseline model for the adoption guard: bits + kind-aware decode
+     * time of the INCOMING lengths (exchangeable per-class weights,
+     * exact canonical skeleton). */
+    double base_bits = 0, base_time;
+    int    cls_n[PIVCOH__MAXLEN + 1] = {0};
+    {
+        double cls_w[PIVCOH__MAXLEN + 1] = {0};
+        for (int i = 0; i < sigma; i++) {
+            int L = lens[sf[i].sym];
+            if (L < 1 || L > PIVCOH__MAXLEN) L = PIVCOH__MAXLEN;
+            cls_n[L]++; cls_w[L] += (double)sf[i].freq;
+        }
+        pivcoh__jl_ch pch[40];
+        int npc = 0;
+        for (int L = 1; L <= PIVCOH__MAXLEN; L++) {
+            if (!cls_n[L]) continue;
+            base_bits += cls_w[L] * L;
+            const double wbar = cls_w[L] / (double)cls_n[L];
+            for (int b = 0; b <= 8; b++)
+                if (cls_n[L] & (1 << b)) {
+                    pch[npc].r = (uint8_t)(L - b);
+                    pch[npc].D = (uint8_t)b;
+                    pch[npc].W = wbar * (double)(1 << b);
+                    npc++;
+                }
+        }
+        base_time = pivcoh__jl_time(pch, npc, &jv, kap, P[sigma]);
+        if (base_time < 0) return -1;
+    }
+
+    /* Per-take fixed-cost constants: lambda * gamma * blocks, one
+     * record for D0 takes (the skeleton merge above the leaf), two for
+     * deeper chunks (the flat record + its stitch merge). */
+    double blocks = ceil(P[sigma] / 16384.0);
+    if (blocks < 1) blocks = 1;
+    const double tc0 = lam * (double)jv.gamma * blocks;
+    const double tc1 = 2.0 * tc0;
+
+    /* Tier resolve.  Granularity g = 2^G groups the freq-sorted symbols
+     * by g and solves the identical problem G levels shallower (a group
+     * of g sorted symbols at real level L is a depth-G flat), 4^G fewer
+     * states; near-optimal solutions are dense enough that g = 2 loses
+     * ~0.13 % of J on average, g = 4 ~0.25 % (measured on lits data),
+     * and the guard still rejects any bad case per window.  sigma is
+     * ghost-padded to a multiple of g with zero-frequency unused byte
+     * values — real leaves the encoder never emits; there are always
+     * enough since sigma % g != 0 implies sigma < 256. */
+    int gran = jp->gran;
+    if (gran != -1 && gran != 1 && gran != 2 && gran != 4 && gran != 8)
+        gran = 0;
+    if (gran == 0)   /* auto: keep the solve ~<= 10 us at every sigma */
+        gran = sigma <= 64 ? 1 : sigma <= 128 ? 2 : 4;
+    int obuf[8], on;
+    if (gran > 1 && (sigma < 8 * gran
+                     || !pivcoh__jl_order(lam,
+                                          kap + (gran == 8 ? 3 : gran == 4 ? 2 : 1),
+                                          8 - (gran == 8 ? 3 : gran == 4 ? 2 : 1),
+                                          obuf, &on)))
+        gran = 1;
+    const int glog = gran == 8 ? 3 : gran == 4 ? 2 : gran == 2 ? 1 : 0;
+    int sigma_pad = sigma;
+    if (glog) {
+        const int pad = (gran - (sigma % gran)) % gran;
+        int added = 0;
+        for (int s = 0; s < 256 && added < pad; s++)
+            if (!freq[s]) {
+                sf[sigma_pad].freq = 0; sf[sigma_pad].sym = (uint16_t)s;
+                P[sigma_pad + 1] = P[sigma];
+                sigma_pad++; added++;
+            }
+        if (added < pad) return -1;      /* unreachable: pad <= 256-sigma */
+    }
+
+    uint16_t BL[PIVCOH__MAXLEN + 1] = {0};
+    if (gran == -1) {
+        if (pivcoh__jl_nudge(P, sigma, lam, kap, tc0, tc1, cls_n, BL) < 0)
+            return -1;
+    } else if (glog) {
+        double Pg[130];
+        const int sp = sigma_pad / gran;
+        for (int i = 0; i <= sp; i++) Pg[i] = P[i * gran];
+        uint16_t BLc[PIVCOH__MAXLEN + 1] = {0};
+        /* kap + glog: local b' prices the real depth b' + glog; a
+         * grouped b' = 0 take is a real 2^glog flat, hence tc1 twice */
+        if (pivcoh__jl_slots(Pg, sp, lam, PIVCOH__MAXLEN - glog, 8 - glog,
+                             kap + glog, tc1, tc1, BLc, scratch) < 0)
+            return -1;
+        for (int L = 1; L <= PIVCOH__MAXLEN - glog; L++)
+            BL[L + glog] = (uint16_t)(BLc[L] << glog);
+    } else if (pivcoh__jl_slots(P, sigma, lam, PIVCOH__MAXLEN, 8, kap,
+                                tc0, tc1, BL, scratch) < 0) {
+        return -1;      /* order condition failed (lambda > 1/7) or OOM */
+    }
+
+    /* Collect the chosen chunks in GLOBAL per-occurrence cost order —
+     * under kappa the plain "L ascending, b descending" deal is no
+     * longer the cost order, and the sorted matching the solvers assume
+     * must be the assignment we actually realize. */
+    struct { double cost; uint8_t L, b; uint16_t size; } chunks[40];
+    int nchunks = 0;
+    for (int L = 1; L <= PIVCOH__MAXLEN; L++)
+        for (int b = 0; b <= 8; b++)
+            if (BL[L] & (1 << b)) {
+                double c = (double)L + lam * ((double)(L - b) + kap[b]);
+                int i = nchunks++;
+                while (i > 0 && (chunks[i - 1].cost > c
+                                 || (chunks[i - 1].cost == c
+                                     && (chunks[i - 1].L > L
+                                         || (chunks[i - 1].L == L
+                                             && chunks[i - 1].b < b))))) {
+                    chunks[i] = chunks[i - 1];
+                    i--;
+                }
+                chunks[i].cost = c;
+                chunks[i].L    = (uint8_t)L;
+                chunks[i].b    = (uint8_t)b;
+                chunks[i].size = (uint16_t)(1 << b);
+            }
+
+    /* Model the result and apply the adoption guard.  Ghost chunks
+     * carry zero weight, so the model scores real symbols exactly. */
+    double dp_bits = 0, dp_time;
+    {
+        pivcoh__jl_ch dch[40];
+        int cur = 0;
+        for (int i = 0; i < nchunks; i++) {
+            const int L = chunks[i].L, b = chunks[i].b;
+            double w = P[cur + chunks[i].size] - P[cur];
+            dp_bits += w * L;
+            dch[i].r = (uint8_t)(L - b);
+            dch[i].D = (uint8_t)b;
+            dch[i].W = w;
+            cur += chunks[i].size;
+        }
+        if (cur != sigma_pad) return -1;
+        dp_time = pivcoh__jl_time(dch, nchunks, &jv, kap, P[sigma]);
+        if (dp_time < 0) return -1;
+    }
+    if (!(dp_time <= gtime * base_time && dp_bits <= gbits * base_bits))
+        return -1;
+
+    /* Deal freq-sorted symbols to the chunks in that same order.
+     * Ghosts (sorted last) land in the final, dearest chunk: unused
+     * byte values receive real codes the encoder never emits. */
+    {
+        int cur = 0;
+        for (int i = 0; i < nchunks; i++)
+            for (int j = 0; j < chunks[i].size; j++)
+                lens[sf[cur++].sym] = chunks[i].L;
+    }
+    return 0;
+}
+
+static int pivcoh__from_freqs(pivcoh_table *t, const uint64_t freq[256],
+                              const pivcoh_joint *jp, void *scratch)
 {
     /* Frequencies narrow to u32 (and internal sums wrap mod 2^32): a
      * histogram totalling >= 4 GiB may derive different -- still valid,
@@ -458,8 +1236,28 @@ PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
                 left--;
             }
         }
+        /* Optional joint length/shape pass (encoder side only; the
+         * decoder rebuilds identically from the transmitted lengths).
+         * Any internal reject keeps the Huffman lengths above.  leaf[]
+         * is free again after the two-queue — the pass reverses it in
+         * place and may append zero-frequency ghosts. */
+        if (jp && jp->lambda > 0.0f)
+            (void)pivcoh__jl_core(leaf, n, freq, lens, jp, scratch);
     }
     return pivcoh_table_from_lens(t, lens);    /* lengths -> schedule (shared) */
+}
+
+PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
+{
+    return pivcoh__from_freqs(t, freq, NULL, NULL);
+}
+
+PIVCOHDEF int pivcoh_table_from_freqs_joint(pivcoh_table *t,
+                                            const uint64_t freq[256],
+                                            const pivcoh_joint *j,
+                                            void *scratch)
+{
+    return pivcoh__from_freqs(t, freq, j, scratch);
 }
 
 /* ================= decode kernels (ports of primitives_neon) ================
