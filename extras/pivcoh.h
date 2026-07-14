@@ -1231,6 +1231,19 @@ static void pivcoh__enc_init(uint8_t *ranks, int n,
     for (; i < n; i++) ranks[i] = s2r[sym[i]];
 }
 
+/* 16-lane movemask via two GPR magic multiplies: for 0x00/0xFF compare
+ * bytes, x * 0x103070F1F3F80 accumulates each u64 half's byte-MSBs into
+ * its top byte (all 256 patterns verified per half).  Cheaper than the
+ * masks64 reduction tree at narrow-tail widths. */
+static inline uint32_t pivcoh__movemask16(uint8x16_t cm)
+{
+    const uint64_t magic = 0x103070F1F3F80ull;
+    uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(cm), 0);
+    uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(cm), 1);
+    return (uint32_t)((lo * magic) >> 56)
+         | ((uint32_t)((hi * magic) >> 48) & 0xFF00u);
+}
+
 /* Scatter one 64-rank group-set of a full partition: per 16-lane
  * group, ONE combined shuffle index (the OR of ptabA[m0] |
  * ptabB0[m1]+pc0) yields both sides at once — the register IS the
@@ -1269,12 +1282,12 @@ int pivcoh__part64_full(uint8x16_t v0, uint8x16_t v1, uint8x16_t v2,
 }
 
 /* Full partition: bitmap + both sides compacted (left in place in
- * ranks, right into tmp).  Tail-free: the final partial group-set runs
- * the same 64-wide body with the mask word trimmed to the real ranks —
- * the wire bytes stay exact, the loads overread into the ranks
- * buffer's +64 slack, and the phantom-left scatter lands in dead
- * bytes.  No scalar tail: the per-element rank>thr branch is the
- * bitmap itself, i.e. maximally unpredictable. */
+ * ranks, right into tmp).  Tail-free at 16-rank granularity: each tail
+ * step is one movemask + one p16rev group scatter, the final step's
+ * mask trimmed to the real ranks — the wire bytes stay exact, loads
+ * overread into the ranks slack/gaps, and the phantom-left scatter
+ * lands in dead bytes.  No scalar tail: the per-element rank>thr
+ * branch is the bitmap itself, i.e. maximally unpredictable. */
 static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
                              uint8_t *bm, uint8_t *tmp)
 {
@@ -1294,16 +1307,27 @@ static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
         n_right += tr;
         n_left  += 64 - tr;
     }
-    if (j < n) {
-        uint8x16_t v0 = vld1q_u8(ranks + j);
-        uint8x16_t v1 = vld1q_u8(ranks + j + 16);
-        uint8x16_t v2 = vld1q_u8(ranks + j + 32);
-        uint8x16_t v3 = vld1q_u8(ranks + j + 48);
-        uint64_t w = pivcoh__masks64(v0, v1, v2, v3, vt, bw)
-                     & (~0ull >> (64 - (n - j)));
-        memcpy(bm + (j >> 3), &w, 8);   /* 8B store: bm is padded (+8) */
-        n_right += pivcoh__part64_full(v0, v1, v2, v3, w,
-                                       ranks + n_left, tmp + n_right);
+    /* Narrow tail: one 16-rank group per step (the 64-wide group-set is
+     * heavy for the 1..20-rank tails deep trees are made of).  The
+     * final step's mask is trimmed to the real ranks; phantom lefts
+     * land after the real ones in dead bytes, as in the main loop. */
+    static const uint8_t rev16_a[16] = {15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0};
+    uint8x16_t rev16 = vld1q_u8(rev16_a);
+    for (; j < n; j += 16) {
+        uint8x16_t v = vld1q_u8(ranks + j);
+        int keep = n - j < 16 ? n - j : 16;
+        uint32_t m = pivcoh__movemask16(vcgtq_u8(v, vt)) & ((1u << keep) - 1);
+        uint16_t m16 = (uint16_t)m;
+        memcpy(bm + (j >> 3), &m16, 2);
+        uint32_t pc0 = (uint32_t)__builtin_popcount(m & 0xFF);
+        uint8x16_t ri = vorrq_u8(vld1q_u8(pivcoh__ptabA[m & 0xFF]),
+                                 vld1q_u8(&pivcoh__ptabB0[m >> 8][pc0]));
+        uint8x16_t comb = vqtbl1q_u8(v, ri);
+        vst1q_u8(ranks + n_left, comb);
+        vst1q_u8(tmp + n_right, vqtbl1q_u8(comb, rev16));
+        int tr = __builtin_popcount(m);
+        n_right += tr;
+        n_left  += 16 - tr;
     }
     return n_right;
 }
@@ -1360,18 +1384,23 @@ int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
         else
             n_right += __builtin_popcountll(w);
     }
-    if (j < n) {
-        uint8x16_t v0 = vld1q_u8(ranks + j);
-        uint8x16_t v1 = vld1q_u8(ranks + j + 16);
-        uint8x16_t v2 = vld1q_u8(ranks + j + 32);
-        uint8x16_t v3 = vld1q_u8(ranks + j + 48);
-        uint64_t w = pivcoh__masks64(v0, v1, v2, v3, vt, bw)
-                     & (~0ull >> (64 - (n - j)));
-        memcpy(bm + (j >> 3), &w, 8);
-        if (EMIT_RIGHT)
-            n_right += pivcoh__part64_right(v0, v1, v2, v3, w, tmp + n_right);
-        else
-            n_right += __builtin_popcountll(w);
+    /* Narrow tail, as in part_full. */
+    for (; j < n; j += 16) {
+        uint8x16_t v = vld1q_u8(ranks + j);
+        int keep = n - j < 16 ? n - j : 16;
+        uint32_t m = pivcoh__movemask16(vcgtq_u8(v, vt)) & ((1u << keep) - 1);
+        uint16_t m16 = (uint16_t)m;
+        memcpy(bm + (j >> 3), &m16, 2);
+        if (EMIT_RIGHT) {
+            vst1_u8(tmp + n_right,
+                    vtbl1_u8(vget_low_u8(v), vld1_u8(pivcoh__ctab8[m & 0xFF])));
+            n_right += __builtin_popcount(m & 0xFF);
+            vst1_u8(tmp + n_right,
+                    vtbl1_u8(vget_high_u8(v), vld1_u8(pivcoh__ctab8[m >> 8])));
+            n_right += __builtin_popcount(m >> 8);
+        } else {
+            n_right += __builtin_popcount(m);
+        }
     }
     return n_right;
 }
@@ -1606,7 +1635,8 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
      * position depends on the children's encoded sizes) at the base of
      * this node's scratch, NOT the stack: as a VLA it was live across
      * the recursion, ~90KB of stack on a worst-case 64K block.  +8 pads
-     * the tail-free partition's whole-word final mask store.  The
+     * the partition tail's 2-byte mask stores (<= 1 byte past nbytes)
+     * with margin.  The
      * children's scratch starts 64 bytes past the right ranks: a
      * node's tail-free left scatter overshoots up to 63 bytes past its
      * OWN ranks region, and a right child's ranks end exactly where
