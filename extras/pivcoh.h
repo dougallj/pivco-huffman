@@ -1553,21 +1553,22 @@ static inline void pivcoh__d6_chunk16(uint8_t *dst, const uint8_t *src,
 
 /* ---- per-D flat decodes (contiguous output) ---- */
 
-/* D=1 (8 codes/byte): the two symbols replicated across 16 lanes,
- * indexed by the bm bit via the same dup-shuffle + per-lane shift as
- * the D=2 unpack.  The tf chunks read <= 1 byte past the region
- * (inside the stream); tf=0 (a 2-symbol flat root) finishes scalar. */
-static const uint8_t pivcoh__d1_dup_tab[16]   = {0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1};
-static const int8_t  pivcoh__d1_shift_tab[16] = {0,-1,-2,-3,-4,-5,-6,-7,
-                                                 0,-1,-2,-3,-4,-5,-6,-7};
+/* D=1 (8 codes/byte): each output lane bit-selects between the two
+ * broadcast symbols — dup-shuffle the 2 bitmap bytes across the lanes,
+ * CMTST each lane's own bit, BSL the symbols (one op less than the
+ * old shift+mask+lookup, though the kernel is store-bound either way).
+ * The tf chunks read <= 1 byte past the region (inside the stream);
+ * tf=0 (a 2-symbol flat root) finishes scalar. */
+static const uint8_t pivcoh__d1_dup_tab[16] = {0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1};
+static const uint8_t pivcoh__d1_bit_tab[16] = {1,2,4,8,16,32,64,128,
+                                               1,2,4,8,16,32,64,128};
 static void pivcoh__flat_d1(uint8_t *out, int n, const uint8_t *bm,
                             const uint8_t *c2s, int tf)
 {
-    uint16_t lr_word; memcpy(&lr_word, c2s, 2);
-    uint8x16_t c2s_vec = vreinterpretq_u8_u16(vdupq_n_u16(lr_word));
-    uint8x16_t dup_v   = vld1q_u8(pivcoh__d1_dup_tab);
-    int8x16_t  shift_v = vld1q_s8(pivcoh__d1_shift_tab);
-    uint8x16_t one_v   = vdupq_n_u8(1);
+    uint8x16_t Lv    = vdupq_n_u8(c2s[0]);
+    uint8x16_t Rv    = vdupq_n_u8(c2s[1]);
+    uint8x16_t dup_v = vld1q_u8(pivcoh__d1_dup_tab);
+    uint8x16_t bit_v = vld1q_u8(pivcoh__d1_bit_tab);
     uint8x16_t keep = vdupq_n_u8(0);
     if (tf) keep = vld1q_u8(out + n);
 
@@ -1576,10 +1577,8 @@ static void pivcoh__flat_d1(uint8_t *out, int n, const uint8_t *bm,
         uint16_t bm_word; memcpy(&bm_word, bm + (j >> 3), 2);
         uint8x16_t bm_lo = vreinterpretq_u8_u16(
             vsetq_lane_u16(bm_word, vdupq_n_u16(0), 0));
-        uint8x16_t dup     = vqtbl1q_u8(bm_lo, dup_v);
-        uint8x16_t shifted = vshlq_u8(dup, shift_v);
-        uint8x16_t idx     = vandq_u8(shifted, one_v);
-        vst1q_u8(out + j, vqtbl1q_u8(c2s_vec, idx));
+        uint8x16_t dup = vqtbl1q_u8(bm_lo, dup_v);
+        vst1q_u8(out + j, vbslq_u8(vtstq_u8(dup, bit_v), Rv, Lv));
     }
     if (tf) { vst1q_u8(out + n, keep); return; }
     for (; j < n; j++)
@@ -2226,6 +2225,31 @@ int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
  * are zeroed by one byte RMW in the dispatcher, store-forwarded from
  * the final vector store. */
 
+/* D=1: the bit IS (rank > base) — the partition's masks64 bitmap
+ * build (rank == base + 1 exactly when rank > base on a D=1 region)
+ * without the compaction, popcount accumulation, or tail trimming:
+ * the 16-rank remainder stores junk bits past n and rides the packs'
+ * junk-byte contract like every other kernel (the dispatcher's RMW
+ * zeroes the last partial byte). */
+static inline void pivcoh__pack_d1(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
+{
+    uint8x16_t vt = vdupq_n_u8(base);
+    uint8x16_t bw = vld1q_u8(pivcoh__d1_bit_tab);
+    int i = 0;
+    for (; i + 64 <= n; i += 64) {
+        uint64_t w = pivcoh__masks64(vld1q_u8(ranks + i),
+                                     vld1q_u8(ranks + i + 16),
+                                     vld1q_u8(ranks + i + 32),
+                                     vld1q_u8(ranks + i + 48), vt, bw);
+        memcpy(out + (i >> 3), &w, 8);
+    }
+    for (; i < n; i += 16) {
+        uint16_t m16 = (uint16_t)pivcoh__movemask16(
+                           vcgtq_u8(vld1q_u8(ranks + i), vt));
+        memcpy(out + (i >> 3), &m16, 2);
+    }
+}
+
 /* D=2: 64 ranks -> 16 bytes (4 ranks per byte, no byte crossings) —
  * unrolled x4 so both vpaddq_u8 reduction levels pair full vectors and
  * the result is a whole 16-byte store.  The pipeline is linear mod 256
@@ -2395,11 +2419,7 @@ static void pivcoh__pack_dN(uint8_t *out, const uint8_t *ranks,
                             int n, int D, uint8_t base)
 {
     switch (D) {
-    case 1: /* the D=1 bit IS the partition bit: reuse the bitmap build
-             * (EMIT_RIGHT=0 never writes ranks; the cast is sound) */
-            (void)pivcoh__part_core((uint8_t *)(uintptr_t)ranks, n, base,
-                                    out, NULL, 0);
-            break;
+    case 1: pivcoh__pack_d1(out, ranks, n, base); break;
     case 2: pivcoh__pack_d2(out, ranks, n, base); break;
     case 3: pivcoh__pack_d3(out, ranks, n, base); break;
     case 4: pivcoh__pack_d4(out, ranks, n, base); break;
@@ -2410,7 +2430,7 @@ static void pivcoh__pack_dN(uint8_t *out, const uint8_t *ranks,
     }
     /* Zero the padding bits of the last partial byte (the kernels'
      * final vector packed garbage there); one store-forwarded RMW,
-     * idempotent for D=1/8 whose padding is already exact.
+     * idempotent for D=8 whose padding is already exact.
      * Unconditional: at rem_bits == 0 the mask is 0 and the target is
      * the first junk byte PAST the region, zeroed harmlessly under the
      * usual contract — cheaper than a per-node data-dependent branch. */
