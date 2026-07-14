@@ -183,17 +183,45 @@ static int pivcoh__gen(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
 
 PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256])
 {
-    int cnt[PIVCOH__MAXLEN + 1] = {0}, n_used = 0, s, L;
-    for (s = 0; s < 256; s++) {
-        if (code_len[s] > PIVCOH__MAXLEN) return 0;
-        if (code_len[s]) { cnt[code_len[s]]++; n_used++; }
+    /* Fused validation + length histogram + counting sort (port of the
+     * production length_histogram_sort): one vceq sweep per length L
+     * counts bin L and extracts its symbols — in symbol order, so
+     * items[] comes out sorted by (length, symbol) — with a REGISTER
+     * output cursor.  No bin-increment or cursor[L]++ store-to-load
+     * forwarding chains, and validation falls out of bin accounting:
+     * any byte outside {0} u [1, MAXLEN] is never counted, so the zero
+     * count plus the extracted total falls short of 256.  (NEON has no
+     * byte movemask; vshrn narrows the compare to 4 bits per lane.) */
+    uint8_t items[256];
+    int cnt[PIVCOH__MAXLEN + 1], n_used = 0, n_zero, s, L;
+    {
+        const uint8x16_t vzero = vdupq_n_u8(0);
+        uint8x16_t zacc = vzero;
+        for (s = 0; s < 256; s += 16)
+            zacc = vsubq_u8(zacc, vceqq_u8(vld1q_u8(code_len + s), vzero));
+        n_zero = (int)vaddlvq_u8(zacc);
     }
-    if (n_used == 0) return 0;
+    for (L = 1; L <= PIVCOH__MAXLEN; L++) {
+        int start = n_used;
+        const uint8x16_t target = vdupq_n_u8((uint8_t)L);
+        for (s = 0; s < 256; s += 16) {
+            uint8x16_t eq = vceqq_u8(vld1q_u8(code_len + s), target);
+            uint64_t m = vget_lane_u64(vreinterpret_u64_u8(
+                             vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+            m &= 0x1111111111111111ull;
+            while (m) {
+                items[n_used++] = (uint8_t)(s + (__builtin_ctzll(m) >> 2));
+                m &= m - 1;
+            }
+        }
+        cnt[L] = n_used - start;
+    }
+    if (n_used == 0 || n_zero + n_used != 256) return 0;
     memcpy(t->code_len, code_len, 256);
     t->sched_len = 0;
 
     if (n_used == 1) {                         /* degenerate: 1-bit code */
-        for (s = 0; !code_len[s]; s++) {}
+        s = items[0];
         memset(t->code_len, 0, 256);
         t->code_len[s] = 1;
         t->rank_to_sym[0] = t->rank_to_sym[1] = (uint8_t)s;
@@ -202,18 +230,11 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         t->sched[0].param = t->sched[0].right = 0;
         t->sched_len = 1;
     } else {
-        /* symbols counting-sorted by length (symbol order within a length) */
-        uint8_t items[256];
-        int cur[PIVCOH__MAXLEN + 2], acc = 0;
-        for (L = 1; L <= PIVCOH__MAXLEN; L++) { cur[L] = acc; acc += cnt[L]; }
-        for (s = 0; s < 256; s++)
-            if (code_len[s]) items[cur[code_len[s]]++] = (uint8_t)s;
-
         /* "optimized" chunking: split each length's count by its set bits
          * (largest first), a 2^b chunk rooted at depth L-b; then stable
          * depth-sort so canonical assignment fills the tree left-to-right */
         pivcoh__chunk ch[49];   /* max sum popcount(cnt[L]): 11 classes, sum <= 256 */
-        int nch = 0, i, j;
+        int nch = 0, i, j, acc;
         for (L = 1, acc = 0; L <= PIVCOH__MAXLEN; acc += cnt[L], L++)
             for (i = 8, j = acc; i >= 0; i--)
                 if (cnt[L] & (1 << i)) {

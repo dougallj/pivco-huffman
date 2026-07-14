@@ -287,6 +287,12 @@ int main(int argc, char **argv)
 
             if (setup_and_gate(base) != 0) return 1;
 
+            /* >=100 ms hot loop first — DVFS ramp (same discipline as
+             * bench_pivcoh_speed); best-of-reps alone doesn't guarantee
+             * the first-timed engine runs at full clocks. */
+            double w0 = now_sec();
+            do { pass_enc_prod(); pass_enc_mini(); } while (now_sec() - w0 < 0.1);
+
             double em = (double)N / timeit(pass_enc_mini, reps) / 1e6;
             double ep = (double)N / timeit(pass_enc_prod, reps) / 1e6;
             double dm = (double)N / timeit(pass_dec_mini, reps) / 1e6;
