@@ -866,9 +866,7 @@ static void pivcoh__flat_d4(uint8_t *out, int n, const uint8_t *bm,
 static void pivcoh__flat_d5(uint8_t *out, int n, const uint8_t *bm,
                             const uint8_t *c2s, int tf)
 {
-    uint8x16x2_t c2s_vec;
-    c2s_vec.val[0] = vld1q_u8(c2s);
-    c2s_vec.val[1] = vld1q_u8(c2s + 16);
+    uint8x16x2_t c2s_vec = vld1q_u8_x2(c2s);
     uint8x16_t keep = vdupq_n_u8(0);
     if (tf) keep = vld1q_u8(out + n);
     int i = 0, lim = tf ? n : (n >= 25 ? ((n - 9) >> 4) << 4 : 0);
@@ -882,11 +880,7 @@ static void pivcoh__flat_d5(uint8_t *out, int n, const uint8_t *bm,
 static void pivcoh__flat_d6(uint8_t *out, int n, const uint8_t *bm,
                             const uint8_t *c2s, int tf)
 {
-    uint8x16x4_t c2s_vec;
-    c2s_vec.val[0] = vld1q_u8(c2s);
-    c2s_vec.val[1] = vld1q_u8(c2s + 16);
-    c2s_vec.val[2] = vld1q_u8(c2s + 32);
-    c2s_vec.val[3] = vld1q_u8(c2s + 48);
+    uint8x16x4_t c2s_vec = vld1q_u8_x4(c2s);
     uint8x16_t keep = vdupq_n_u8(0);
     if (tf) keep = vld1q_u8(out + n);
     int i = 0, lim = tf ? n : (n >= 24 ? ((n - 8) >> 4) << 4 : 0);
@@ -902,11 +896,7 @@ static void pivcoh__flat_d6(uint8_t *out, int n, const uint8_t *bm,
 static void pivcoh__flat_d7(uint8_t *out, int n, const uint8_t *bm,
                             const uint8_t *c2s, int tf)
 {
-    uint8x16x4_t lo, hi;
-    lo.val[0] = vld1q_u8(c2s);       lo.val[1] = vld1q_u8(c2s + 16);
-    lo.val[2] = vld1q_u8(c2s + 32);  lo.val[3] = vld1q_u8(c2s + 48);
-    hi.val[0] = vld1q_u8(c2s + 64);  hi.val[1] = vld1q_u8(c2s + 80);
-    hi.val[2] = vld1q_u8(c2s + 96);  hi.val[3] = vld1q_u8(c2s + 112);
+    uint8x16x4_t lo = vld1q_u8_x4(c2s), hi = vld1q_u8_x4(c2s + 64);
     uint8x16_t sub64q = vdupq_n_u8(64);
     uint8x8_t  sub64  = vdup_n_u8(64);
     uint8x16_t keep = vdupq_n_u8(0);
@@ -1206,15 +1196,8 @@ static void pivcoh__enc_init(uint8_t *ranks, int n,
 {
     int i = 0;
     if (n >= 20) {
-        uint8x16x4_t t0, t1, t2, t3;
-        t0.val[0]=vld1q_u8(s2r     ); t0.val[1]=vld1q_u8(s2r + 16);
-        t0.val[2]=vld1q_u8(s2r + 32); t0.val[3]=vld1q_u8(s2r + 48);
-        t1.val[0]=vld1q_u8(s2r + 64); t1.val[1]=vld1q_u8(s2r + 80);
-        t1.val[2]=vld1q_u8(s2r + 96); t1.val[3]=vld1q_u8(s2r +112);
-        t2.val[0]=vld1q_u8(s2r +128); t2.val[1]=vld1q_u8(s2r +144);
-        t2.val[2]=vld1q_u8(s2r +160); t2.val[3]=vld1q_u8(s2r +176);
-        t3.val[0]=vld1q_u8(s2r +192); t3.val[1]=vld1q_u8(s2r +208);
-        t3.val[2]=vld1q_u8(s2r +224); t3.val[3]=vld1q_u8(s2r +240);
+        uint8x16x4_t t0 = vld1q_u8_x4(s2r), t1 = vld1q_u8_x4(s2r + 64);
+        uint8x16x4_t t2 = vld1q_u8_x4(s2r + 128), t3 = vld1q_u8_x4(s2r + 192);
         const uint8x16_t s64  = vdupq_n_u8(64);
         const uint8x16_t s128 = vdupq_n_u8(128);
         const uint8x16_t s192 = vdupq_n_u8(192);
