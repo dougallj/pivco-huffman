@@ -149,36 +149,86 @@ enum { PIVCOH__FULL = 0, PIVCOH__FLAT = 1, PIVCOH__LEAFL = 3 };
 typedef struct { uint8_t depth, bit, sym_idx; } pivcoh__chunk;
 
 /* Pre-order schedule from the depth-sorted chunk list: chunks are the
- * tree's left-to-right leaves, and a leaf-depth sequence determines the
- * tree.  Returns 0 on non-Kraft-complete lengths. */
-static int pivcoh__gen(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
-                       int *ci, int *rank, int depth, const uint8_t *items)
+ * tree's left-to-right leaves, and the leaf-depth sequence determines
+ * the tree.  Iterative, with an explicit stack of open internal nodes
+ * (port of the production build_schedule; the recursion this replaces
+ * was the dominant per-window table-build cost on ragged deep trees).
+ * The walk doubles as Kraft-completeness validation.  Returns 0, or -1
+ * on non-Kraft-complete lengths. */
+typedef struct { int my, rank0, mid_sched, mid_rank, state; } pivcoh__frame;
+
+static int pivcoh__sched(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
+                         const uint8_t *items)
 {
-    if (*ci >= nch || depth > PIVCOH__MAXLEN ||
-        t->sched_len >= (int)(sizeof t->sched / sizeof *t->sched)) return 0;
-    if (ch[*ci].depth == depth) {              /* chunk leaf */
-        const pivcoh__chunk *c = &ch[(*ci)++];
-        int n = 1 << c->bit, r0 = *rank;
-        memcpy(t->rank_to_sym + r0, items + c->sym_idx, (size_t)n);
-        *rank += n;
-        if (c->bit) {
-            pivcoh__rec *r = &t->sched[t->sched_len++];
-            r->kd = (uint8_t)(PIVCOH__FLAT | c->bit << 2);
-            r->param = (uint8_t)r0;
-            r->right = 0;
+    pivcoh__frame stk[PIVCOH__MAXLEN + 1];
+    const int cap = (int)(sizeof t->sched / sizeof *t->sched);
+    int sp = 0, ci = 0, rank = 0;
+
+    for (;;) {
+        if (ci >= nch) return -1;              /* under-subscribed lengths */
+
+        /* Descend the left spine until a chunk sits at this depth. */
+        while (ch[ci].depth != sp) {
+            if (sp > PIVCOH__MAXLEN || t->sched_len >= cap) return -1;
+            pivcoh__frame *f = &stk[sp++];
+            f->my    = t->sched_len++;
+            f->rank0 = rank;
+            f->state = 0;
         }
-        return 1;
+
+        /* Consume the chunk-leaf.  Width-1/2 chunks dominate skewed
+         * alphabets; keep their copies inline (a variable-size memcpy
+         * is a libc dispatch per chunk). */
+        {
+            const pivcoh__chunk *c = &ch[ci++];
+            int b = c->bit, r0 = rank;
+            uint8_t *dst = t->rank_to_sym + r0;
+            const uint8_t *s = items + c->sym_idx;
+            if (b == 0)      dst[0] = s[0];
+            else if (b == 1) { dst[0] = s[0]; dst[1] = s[1]; }
+            else             memcpy(dst, s, (size_t)1 << b);
+            rank += 1 << b;
+            if (b != 0) {
+                if (t->sched_len >= cap) return -1;
+                pivcoh__rec *r = &t->sched[t->sched_len++];
+                r->kd    = (uint8_t)(PIVCOH__FLAT | b << 2);
+                r->param = (uint8_t)r0;
+                r->right = 0;
+            }
+        }
+
+        /* Ascend, completing parents whose right child just finished. */
+        for (;;) {
+            if (sp == 0) {                     /* root subtree complete */
+                if (ci != nch) return -1;      /* over-subscribed */
+                t->num_ranks = (uint16_t)rank;
+                return 0;
+            }
+            pivcoh__frame *f = &stk[sp - 1];
+            if (f->state == 0) {               /* left done; do the right */
+                f->state     = 1;
+                f->mid_sched = t->sched_len;
+                f->mid_rank  = rank;
+                break;
+            }
+            /* Right done: finalize this internal node's record.  A lone
+             * leaf beside an internal sibling is always LEFT (chunk
+             * depths never decrease left-to-right under a node), and the
+             * optimized chunking emits at most one width-1 chunk per
+             * length so two lone siblings cannot meet — right_lone only
+             * flags malformed inputs. */
+            int left_lone  = f->mid_sched == f->my + 1 &&
+                             f->mid_rank == f->rank0 + 1;
+            int right_lone = t->sched_len == f->mid_sched &&
+                             rank == f->mid_rank + 1;
+            if (right_lone) return -1;
+            pivcoh__rec *r = &t->sched[f->my];
+            r->kd    = (uint8_t)(left_lone ? PIVCOH__LEAFL : PIVCOH__FULL);
+            r->param = (uint8_t)(f->mid_rank - 1); /* thr / rank_begin */
+            r->right = (uint8_t)(f->mid_sched - f->my);
+            sp--;
+        }
     }
-    int my = t->sched_len++, r0 = *rank;
-    if (!pivcoh__gen(t, ch, nch, ci, rank, depth + 1, items)) return 0;
-    int mid_s = t->sched_len, mid_r = *rank;
-    if (!pivcoh__gen(t, ch, nch, ci, rank, depth + 1, items)) return 0;
-    int ll = (mid_s == my + 1 && mid_r == r0 + 1);
-    pivcoh__rec *r = &t->sched[my];
-    r->kd    = (uint8_t)(ll ? PIVCOH__LEAFL : PIVCOH__FULL);
-    r->param = (uint8_t)(mid_r - 1);           /* thr / rank_begin */
-    r->right = (uint8_t)(mid_s - my);
-    return 1;
 }
 
 PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256])
@@ -250,9 +300,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
             ch[j + 1] = c;
         }
 
-        int ci = 0, rank = 0;
-        if (!pivcoh__gen(t, ch, nch, &ci, &rank, 0, items) || ci != nch) return 0;
-        t->num_ranks = (uint16_t)rank;
+        if (pivcoh__sched(t, ch, nch, items) != 0) return 0;
     }
 
     memset(t->sym_to_rank, 0, 256);
@@ -358,9 +406,21 @@ PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
              * shorter level: net -1 unit, so the loop lands on Kraft == 1
              * exactly.  A non-empty b always exists: 256 symbols all at
              * MAXLEN would be under-subscribed. */
-            int cnt[PIVCOH__MAXLEN + 2] = {0}, b;
+            int cnt[PIVCOH__MAXLEN + 2] = {0}, b, L;
             for (i = 0; i < 256; i++)
                 if (lens[i]) cnt[lens[i] < PIVCOH__MAXLEN ? lens[i] : PIVCOH__MAXLEN]++;
+            /* reassign order: stable by (capped old length, symbol) — one
+             * counting-sort scatter off the pre-repair histogram.  Comes
+             * first: the repair below rewrites the histogram and the
+             * assignments rewrite the sort keys.  (This replaces an
+             * 11x256 order-building sweep that dominated the build on
+             * exactly the windows deep enough to need limiting.) */
+            uint8_t order[256];
+            int cur[PIVCOH__MAXLEN + 1], no = 0;
+            for (L = 1; L <= PIVCOH__MAXLEN; L++) { cur[L] = no; no += cnt[L]; }
+            for (i = 0; i < 256; i++)
+                if (lens[i])
+                    order[cur[lens[i] < PIVCOH__MAXLEN ? lens[i] : PIVCOH__MAXLEN]++] = (uint8_t)i;
             long kraft = 0;
             for (i = 1; i <= PIVCOH__MAXLEN; i++) kraft += (long)cnt[i] << (PIVCOH__MAXLEN - i);
             for (; kraft > 1L << PIVCOH__MAXLEN; kraft--) {
@@ -369,14 +429,7 @@ PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
                 cnt[b + 1] += 2;
                 cnt[PIVCOH__MAXLEN]--;
             }
-            /* reassign: stable by (capped old length, symbol) — snapshot the
-             * order first, the assignments overwrite the sort keys */
-            uint8_t order[256];
-            int no = 0, cl = 1, left = cnt[1], cap;
-            for (cap = 1; cap <= PIVCOH__MAXLEN; cap++)
-                for (i = 0; i < 256; i++)
-                    if (lens[i] && (lens[i] < PIVCOH__MAXLEN ? lens[i] : PIVCOH__MAXLEN) == cap)
-                        order[no++] = (uint8_t)i;
+            int cl = 1, left = cnt[1];
             for (i = 0; i < no; i++) {
                 while (!left) left = cnt[++cl];
                 lens[order[i]] = (uint8_t)cl;
