@@ -1412,24 +1412,26 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
  *   L1 u8  {8-D, 0}:            u16 = pair  << (8-D)
  *   L2 u16 {8-D, -(8-D)}:       u32 = quad  << (16-2D)
  *   L3 u32 {16-2D, -(16-2D)}:   u64 = octet << (32-4D)
- *   >> (32-4D), compact shuffle.
- * 4 shift ops; the count vectors are vdups of computed constants.
+ * The compact shuffle absorbs the whole bytes of the final (32-4D)
+ * re-basing shift (its tables start at byte 1 for D=5/6), leaving a
+ * residual >> 4 for D=5/7 and NO final shift for D=6 -- 3-4 shift ops,
+ * count vectors are vdups of computed constants.
  * (History: ryg's multiply-as-shift vmull pyramid, then a 6-op
  * USHR+SLI ladder, each replaced in turn.)  Each 16-byte store carries
  * 16-2D trailing junk bytes, overwritten by the next iter / next
  * record (the caller's out_cap >= PIVCOH_ENCODE_BOUND keeps even the
  * last one in bounds). */
 static const uint8_t pivcoh__pack_compact_d5[16] = {
-    0, 1, 2, 3, 4,   8, 9, 10, 11, 12,  0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+    1, 2, 3, 4, 5,   9, 10, 11, 12, 13,  0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 };
 static const uint8_t pivcoh__pack_compact_d6[16] = {
-    0, 1, 2, 3, 4, 5,   8, 9, 10, 11, 12, 13,  0xff, 0xff, 0xff, 0xff
+    1, 2, 3, 4, 5, 6,   9, 10, 11, 12, 13, 14,  0xff, 0xff, 0xff, 0xff
 };
 static const uint8_t pivcoh__pack_compact_d7[16] = {
     0, 1, 2, 3, 4, 5, 6,   8, 9, 10, 11, 12, 13, 14,  0xff, 0xff
 };
 
-#define PIVCOH__PACK_DN(NAME, D_VAL, COMPACT_TAB)                                \
+#define PIVCOH__PACK_DN(NAME, D_VAL, BITSHR, COMPACT_TAB)                        \
 static inline int NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)  \
 {                                                                                \
     const int8x16_t s1 = vreinterpretq_s8_u16(vdupq_n_u16(8 - (D_VAL)));         \
@@ -1446,15 +1448,15 @@ static inline int NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base) 
         uint16x8_t w16 = vreinterpretq_u16_u8(vshlq_u8(cb, s1));                 \
         uint32x4_t w32 = vreinterpretq_u32_u16(vshlq_u16(w16, s2));              \
         uint64x2_t w64 = vreinterpretq_u64_u32(vshlq_u32(w32, s3));              \
-        w64 = vshrq_n_u64(w64, 32 - 4 * (D_VAL));                                \
+        if (BITSHR) w64 = vshrq_n_u64(w64, (BITSHR) ? (BITSHR) : 1);             \
         uint8x16_t packed = vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact);      \
         vst1q_u8(out + ((i * (D_VAL)) >> 3), packed);                            \
     }                                                                            \
     return i;                                                                    \
 }
-PIVCOH__PACK_DN(pivcoh__pack_d5, 5, pivcoh__pack_compact_d5)
-PIVCOH__PACK_DN(pivcoh__pack_d6, 6, pivcoh__pack_compact_d6)
-PIVCOH__PACK_DN(pivcoh__pack_d7, 7, pivcoh__pack_compact_d7)
+PIVCOH__PACK_DN(pivcoh__pack_d5, 5, 4, pivcoh__pack_compact_d5)
+PIVCOH__PACK_DN(pivcoh__pack_d6, 6, 0, pivcoh__pack_compact_d6)
+PIVCOH__PACK_DN(pivcoh__pack_d7, 7, 4, pivcoh__pack_compact_d7)
 #undef PIVCOH__PACK_DN
 
 /* D=8: byte-aligned. */
