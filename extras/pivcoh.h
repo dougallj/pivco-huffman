@@ -649,22 +649,27 @@ static int pivcoh__merge_cst_vec_x(const uint8_t *bm, int K, uint8_t left_sym,
 
 /* merge_cst_cst: both sides constant — a D=1 flat decode.  A 2-byte
  * (left, right) c2s replicated across 16 lanes, indexed by the bm bit
- * via the same dup-shuffle + per-lane shift as the D=2 unpack. */
+ * via the same dup-shuffle + per-lane shift as the D=2 unpack.  Two
+ * tails like the flat kernels: tf runs 16-wide chunks to K with
+ * save/restore (the last chunk reads <= 1 byte past the region, inside
+ * the stream); tf=0 (a 2-symbol flat root) finishes scalar. */
 static const uint8_t pivcoh__two_dup_tab[16]   = {0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1};
 static const int8_t  pivcoh__two_shift_tab[16] = {0,-1,-2,-3,-4,-5,-6,-7,
                                                   0,-1,-2,-3,-4,-5,-6,-7};
 static void pivcoh__merge_cst_cst(const uint8_t *bm, int K,
                                   uint8_t left_sym, uint8_t right_sym,
-                                  uint8_t *out)
+                                  uint8_t *out, int tf)
 {
     uint16_t lr_word = (uint16_t)left_sym | ((uint16_t)right_sym << 8);
     uint8x16_t c2s_vec = vreinterpretq_u8_u16(vdupq_n_u16(lr_word));
     uint8x16_t dup_v   = vld1q_u8(pivcoh__two_dup_tab);
     int8x16_t  shift_v = vld1q_s8(pivcoh__two_shift_tab);
     uint8x16_t one_v   = vdupq_n_u8(1);
+    uint8x16_t keep = vdupq_n_u8(0);
+    if (tf) keep = vld1q_u8(out + K);
 
-    int j = 0;
-    for (; j + 16 <= K; j += 16) {
+    int j = 0, lim = tf ? K : K - 15;
+    for (; j < lim; j += 16) {
         uint16_t bm_word; memcpy(&bm_word, bm + (j >> 3), 2);
         uint8x16_t bm_lo = vreinterpretq_u8_u16(
             vsetq_lane_u16(bm_word, vdupq_n_u16(0), 0));
@@ -673,23 +678,29 @@ static void pivcoh__merge_cst_cst(const uint8_t *bm, int K,
         uint8x16_t idx     = vandq_u8(shifted, one_v);
         vst1q_u8(out + j, vqtbl1q_u8(c2s_vec, idx));
     }
-    for (; j + 8 <= K; j += 8) {
-        uint8x8_t bm_v = vdup_n_u8(bm[j >> 3]);
-        uint8x8_t dup     = vtbl1_u8(bm_v, vget_low_u8(dup_v));
-        uint8x8_t shifted = vshl_u8(dup, vget_low_s8(shift_v));
-        uint8x8_t idx     = vand_u8(shifted, vget_low_u8(one_v));
-        vst1_u8(out + j, vtbl1_u8(vget_low_u8(c2s_vec), idx));
-    }
+    if (tf) { vst1q_u8(out + K, keep); return; }
     for (; j < K; j++) {
         int mb = (bm[j >> 3] >> (j & 7)) & 1;
         out[j] = mb ? right_sym : left_sym;
     }
 }
 
-/* ---- flat-subtree D-bit unpack helpers ----
- * Each reads packed D-bit codes into byte lanes.  _safe variants read
- * exactly the bytes they decode; the D=7 _fast variant does one 16-byte
- * load (bounded by its caller so it stays inside the flat region). */
+/* ---- flat-subtree D-bit decode helpers ----
+ *
+ * Every flat kernel below has two tails, chosen by `tf` (tail-free):
+ * the walk passes tf=1 when the input holds >= 16 readable bytes past
+ * the flat region AND out is arena-backed — which is (almost) every
+ * interior flat region: in decode order the last bytes of a block are
+ * the ROOT's merge bitmap, so an interior region is followed by its
+ * ancestors' records (a parent's bitmap alone exceeds 16 bytes once
+ * the region holds ~120 symbols).  tf kernels run whole vector chunks
+ * to the end — reading at most 16 bytes past the region (inside the
+ * stream), overwriting up to 15 bytes past out+n, saved and restored —
+ * so the byte-wise "safe" unpacks and per-code scalar tails are gone.
+ * tf=0 (a flat ROOT decoding into the caller's buffer — where the
+ * region really can end the stream — or a rare end-of-block interior
+ * region) keeps the region-bounded vector loops and finishes the last
+ * few codes with the scalar extractor below. */
 
 static inline uint32_t pivcoh__extract_bits(const uint8_t *in, int bit_pos, int D)
 {
@@ -711,19 +722,6 @@ static inline uint8x16_t pivcoh__d2_unpack(const uint8_t *bm_ptr)
     return vandq_u8(vshlq_u8(dup, vld1q_s8(pivcoh__d2_shift_tab)), vdupq_n_u8(0x03));
 }
 
-static const uint8_t pivcoh__d3_shuf_tab[16]  = {0,1, 0,1, 0,1, 0,1, 0,1, 1,2, 1,2, 1,2};
-static const int16_t pivcoh__d3_shift_tab[8]  = {0, -3, -6, -9, -12, -7, -10, -13};
-static inline uint8x8_t pivcoh__d3_unpack_safe(const uint8_t *bm_ptr)
-{
-    uint8x16_t bm_lo = vdupq_n_u8(0);
-    bm_lo = vsetq_lane_u8(bm_ptr[0], bm_lo, 0);
-    bm_lo = vsetq_lane_u8(bm_ptr[1], bm_lo, 1);
-    bm_lo = vsetq_lane_u8(bm_ptr[2], bm_lo, 2);
-    uint16x8_t w = vreinterpretq_u16_u8(vqtbl1q_u8(bm_lo, vld1q_u8(pivcoh__d3_shuf_tab)));
-    uint16x8_t shifted = vshlq_u16(w, vld1q_s16(pivcoh__d3_shift_tab));
-    return vmovn_u16(vandq_u16(shifted, vdupq_n_u16(0x07)));
-}
-
 static const uint8_t pivcoh__d4_dup_tab[16]   = {0,0, 1,1, 2,2, 3,3, 4,4, 5,5, 6,6, 7,7};
 static const int8_t  pivcoh__d4_shift_tab[16] = {0,-4, 0,-4, 0,-4, 0,-4,
                                                  0,-4, 0,-4, 0,-4, 0,-4};
@@ -736,57 +734,9 @@ static inline uint8x16_t pivcoh__d4_unpack(const uint8_t *bm_ptr)
     return vandq_u8(vshlq_u8(dup, vld1q_s8(pivcoh__d4_shift_tab)), vdupq_n_u8(0x0F));
 }
 
-static const uint8_t pivcoh__d5_shuf_tab[16] = {0,1, 0,1, 0,1, 1,2, 2,3, 2,3, 3,4, 3,4};
-static const int16_t pivcoh__d5_shift_tab[8] = {0, -5, -10, -7, -4, -9, -6, -11};
-/* Byte-wise lane inserts (not a 5-byte memcpy + vsetq_lane_u64): the
- * memcpy form round-trips through the stack and store-forward-stalls
- * ~20x on Neoverse-V2.  See the production header's D=5 note. */
-static inline uint8x8_t pivcoh__d5_unpack_safe(const uint8_t *bm_ptr)
-{
-    uint8x16_t bm_lo = vdupq_n_u8(0);
-    bm_lo = vsetq_lane_u8(bm_ptr[0], bm_lo, 0);
-    bm_lo = vsetq_lane_u8(bm_ptr[1], bm_lo, 1);
-    bm_lo = vsetq_lane_u8(bm_ptr[2], bm_lo, 2);
-    bm_lo = vsetq_lane_u8(bm_ptr[3], bm_lo, 3);
-    bm_lo = vsetq_lane_u8(bm_ptr[4], bm_lo, 4);
-    uint16x8_t w = vreinterpretq_u16_u8(vqtbl1q_u8(bm_lo, vld1q_u8(pivcoh__d5_shuf_tab)));
-    uint16x8_t shifted = vshlq_u16(w, vld1q_s16(pivcoh__d5_shift_tab));
-    return vmovn_u16(vandq_u16(shifted, vdupq_n_u16(0x1F)));
-}
-
-static const uint8_t pivcoh__d6_shuf_tab[16] = {0,1, 0,1, 1,2, 1,2, 3,4, 3,4, 4,5, 4,5};
-static const int16_t pivcoh__d6_shift_tab[8] = {0, -6, -4, -10, 0, -6, -4, -10};
-static inline uint8x8_t pivcoh__d6_unpack_safe(const uint8_t *bm_ptr)
-{
-    uint8x16_t bm_lo = vdupq_n_u8(0);
-    bm_lo = vsetq_lane_u8(bm_ptr[0], bm_lo, 0);
-    bm_lo = vsetq_lane_u8(bm_ptr[1], bm_lo, 1);
-    bm_lo = vsetq_lane_u8(bm_ptr[2], bm_lo, 2);
-    bm_lo = vsetq_lane_u8(bm_ptr[3], bm_lo, 3);
-    bm_lo = vsetq_lane_u8(bm_ptr[4], bm_lo, 4);
-    bm_lo = vsetq_lane_u8(bm_ptr[5], bm_lo, 5);
-    uint16x8_t w = vreinterpretq_u16_u8(vqtbl1q_u8(bm_lo, vld1q_u8(pivcoh__d6_shuf_tab)));
-    uint16x8_t shifted = vshlq_u16(w, vld1q_s16(pivcoh__d6_shift_tab));
-    return vmovn_u16(vandq_u16(shifted, vdupq_n_u16(0x3F)));
-}
-
 static const uint8_t pivcoh__d7_shuf_tab[16] = {0,1, 0,1, 1,2, 2,3, 3,4, 4,5, 5,6, 6,6};
 static const int16_t pivcoh__d7_shift_tab[8] = {0, -7, -6, -5, -4, -3, -2, -1};
-static inline uint8x8_t pivcoh__d7_unpack_safe(const uint8_t *bm_ptr)
-{
-    uint8x16_t bm_lo = vdupq_n_u8(0);
-    bm_lo = vsetq_lane_u8(bm_ptr[0], bm_lo, 0);
-    bm_lo = vsetq_lane_u8(bm_ptr[1], bm_lo, 1);
-    bm_lo = vsetq_lane_u8(bm_ptr[2], bm_lo, 2);
-    bm_lo = vsetq_lane_u8(bm_ptr[3], bm_lo, 3);
-    bm_lo = vsetq_lane_u8(bm_ptr[4], bm_lo, 4);
-    bm_lo = vsetq_lane_u8(bm_ptr[5], bm_lo, 5);
-    bm_lo = vsetq_lane_u8(bm_ptr[6], bm_lo, 6);
-    uint16x8_t w = vreinterpretq_u16_u8(vqtbl1q_u8(bm_lo, vld1q_u8(pivcoh__d7_shuf_tab)));
-    uint16x8_t shifted = vshlq_u16(w, vld1q_s16(pivcoh__d7_shift_tab));
-    return vmovn_u16(vandq_u16(shifted, vdupq_n_u16(0x7F)));
-}
-static inline uint8x8_t pivcoh__d7_unpack_fast(const uint8_t *bm_ptr)
+static inline uint8x8_t pivcoh__d7_unpack(const uint8_t *bm_ptr)
 {
     uint8x16_t bm_lo = vld1q_u8(bm_ptr);
     uint16x8_t w = vreinterpretq_u16_u8(vqtbl1q_u8(bm_lo, vld1q_u8(pivcoh__d7_shuf_tab)));
@@ -794,12 +744,54 @@ static inline uint8x8_t pivcoh__d7_unpack_fast(const uint8_t *bm_ptr)
     return vmovn_u16(vandq_u16(shifted, vdupq_n_u16(0x7F)));
 }
 
+/* One 16-output pair-gather chunk for the byte-crossing depths: a
+ * 16-byte load, one vqtbl1 placing two adjacent codes in each u16 lane,
+ * a u16 shift aligning the pair, a u8 shift + mask isolating each code,
+ * then the c2s scatter.  Consumes 2D input bytes of the 16 loaded. */
+static inline void pivcoh__d3_chunk16(uint8_t *dst, const uint8_t *src,
+                                      uint8x16_t c2s16, uint8x16_t m7)
+{
+    static const uint8_t pair_shuf_t[16] = { 0,1, 0,1, 1,2, 2,3, 3,4, 3,4, 4,5, 5,6 };
+    static const int16_t hshift_t[8]     = { 5,-1, 1, 3, 5,-1, 1, 3 };
+    static const int8_t  bshr_t[16]      = { -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0 };
+    uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(vld1q_u8(src), vld1q_u8(pair_shuf_t)));
+    x = vshlq_u16(x, vld1q_s16(hshift_t));
+    uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), vld1q_s8(bshr_t));
+    vst1q_u8(dst, vqtbl1q_u8(c2s16, vandq_u8(y, m7)));
+}
+
+static inline void pivcoh__d5_chunk16(uint8_t *dst, const uint8_t *src,
+                                      uint8x16x2_t c2s_vec)
+{
+    static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 2,3, 3,4, 5,6, 6,7, 7,8, 8,9 };
+    static const int16_t hshift_t[8]     = { 3, 1, -1, -3, 3, 1, -1, -3 };
+    static const int8_t  bshr_t[16]      = { -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0 };
+    uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(vld1q_u8(src), vld1q_u8(pair_shuf_t)));
+    x = vshlq_u16(x, vld1q_s16(hshift_t));
+    uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), vld1q_s8(bshr_t));
+    vst1q_u8(dst, vqtbl2q_u8(c2s_vec, vandq_u8(y, vdupq_n_u8(0x1f))));
+}
+
+static inline void pivcoh__d6_chunk16(uint8_t *dst, const uint8_t *src,
+                                      uint8x16x4_t c2s_vec)
+{
+    static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
+    static const int16_t hshift_t[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
+    static const int8_t  bshr_t[16]      = { -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0 };
+    uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(vld1q_u8(src), vld1q_u8(pair_shuf_t)));
+    x = vshlq_u16(x, vld1q_s16(hshift_t));
+    uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), vld1q_s8(bshr_t));
+    vst1q_u8(dst, vqtbl4q_u8(c2s_vec, vandq_u8(y, vdupq_n_u8(0x3f))));
+}
+
 /* ---- per-D flat decodes (contiguous output) ---- */
 
 /* D=2 (4 codes/byte): 64/iter maps each input nibble straight to a
- * symbol pair via two prepped tables, interleaved back with vst4q. */
-static void pivcoh__flat_d2(uint8_t *symbols, int n, const uint8_t *bm,
-                            const uint8_t *c2s)
+ * symbol pair via two prepped tables, interleaved back with vst4q;
+ * 16-wide chunks finish (the tf tail's last chunk reads <= 3 bytes
+ * past the region). */
+static void pivcoh__flat_d2(uint8_t *out, int n, const uint8_t *bm,
+                            const uint8_t *c2s, int tf)
 {
     int i = 0;
     if (n >= 64) {
@@ -813,38 +805,31 @@ static void pivcoh__flat_d2(uint8_t *symbols, int n, const uint8_t *bm,
             uint8x16_t lo = vandq_u8(v, m), hi = vshrq_n_u8(v, 4);
             uint8x16x4_t o = {{ vqtbl1q_u8(TL, lo), vqtbl1q_u8(TH, lo),
                                 vqtbl1q_u8(TL, hi), vqtbl1q_u8(TH, hi) }};
-            vst4q_u8(symbols + i, o);
+            vst4q_u8(out + i, o);
         }
     }
     uint8x16_t c2s_vec = vld1q_u8(c2s);
-    for (; i + 16 <= n; i += 16) {
-        uint8x16_t codes = pivcoh__d2_unpack(bm + (i >> 2));
-        vst1q_u8(symbols + i, vqtbl1q_u8(c2s_vec, codes));
-    }
-    for (; i + 4 <= n; i += 4) {
-        uint8_t b = bm[i >> 2];
-        symbols[i    ] = c2s[(b     ) & 3];
-        symbols[i + 1] = c2s[(b >> 2) & 3];
-        symbols[i + 2] = c2s[(b >> 4) & 3];
-        symbols[i + 3] = c2s[(b >> 6) & 3];
-    }
-    for (; i < n; i++) symbols[i] = c2s[pivcoh__extract_bits(bm, i * 2, 2)];
+    uint8x16_t keep = vdupq_n_u8(0);
+    if (tf) keep = vld1q_u8(out + n);
+    int lim = tf ? n : n - 15;
+    for (; i < lim; i += 16)
+        vst1q_u8(out + i, vqtbl1q_u8(c2s_vec, pivcoh__d2_unpack(bm + (i >> 2))));
+    if (tf) { vst1q_u8(out + n, keep); return; }
+    for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 2, 2)];
 }
 
 /* D=3: 32 codes/iter via the D=6 pair-gather (two D=3 codes per byte),
- * split lo/hi and interleave with vst2q.  One 16-wide pair-gather block
- * mops up the <32 remainder — its guard is region-safe (needs n-i >= 41
+ * split lo/hi and interleave with vst2q; 16-wide pair-gather chunks
+ * finish.  The tf=0 single-chunk guard is region-safe (needs n-i >= 41
  * so the 16-byte load stays inside ceil(3n/8); production guards only
  * against the output and can read 4 bytes past the region). */
-static void pivcoh__flat_d3(uint8_t *symbols, int n, const uint8_t *bm,
-                            const uint8_t *c2s)
+static void pivcoh__flat_d3(uint8_t *out, int n, const uint8_t *bm,
+                            const uint8_t *c2s, int tf)
 {
     const uint8x8_t  c2s8  = vld1_u8(c2s);
     const uint8x16_t c2s16 = vcombine_u8(c2s8, c2s8);
     const uint8x16_t m7    = vdupq_n_u8(7);
     int i = 0;
-    int fast_end = n >= 16 ? n - 16 : 0;
-    const uint8_t *bp = bm;
     if (n >= 48) {
         uint8x16x2_t c2s32; c2s32.val[0] = c2s16; c2s32.val[1] = c2s16;
         static const uint8_t pair6_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
@@ -853,7 +838,8 @@ static void pivcoh__flat_d3(uint8_t *symbols, int n, const uint8_t *bm,
         const uint8x16_t pair6_shuf = vld1q_u8(pair6_shuf_t);
         const int16x8_t  hshift6    = vld1q_s16(hshift6_t);
         const int8x16_t  bshr6      = vld1q_s8(bshr6_t);
-        for (; i + 32 <= fast_end; i += 32, bp += 12) {
+        const uint8_t *bp = bm;
+        for (; i + 48 <= n; i += 32, bp += 12) {   /* == i + 32 <= n - 16 */
             uint8x16_t packed = vld1q_u8(bp);
             uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair6_shuf));
             x = vshlq_u16(x, hshift6);
@@ -861,30 +847,27 @@ static void pivcoh__flat_d3(uint8_t *symbols, int n, const uint8_t *bm,
             uint8x16x2_t o;
             o.val[0] = vqtbl1q_u8(c2s16, vandq_u8(pair6, m7));
             o.val[1] = vqtbl2q_u8(c2s32, vshrq_n_u8(pair6, 3));
-            vst2q_u8(symbols + i, o);
+            vst2q_u8(out + i, o);
         }
     }
-    if (n - i >= 41) {   /* one 16-wide pair-gather block (region-safe guard) */
-        static const uint8_t pair_shuf_t[16] = { 0,1, 0,1, 1,2, 2,3, 3,4, 3,4, 4,5, 5,6 };
-        static const int16_t hshift_t[8]     = { 5,-1, 1, 3, 5,-1, 1, 3 };
-        static const int8_t  bshr_t[16]      = { -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0 };
-        uint8x16_t packed = vld1q_u8(bp);
-        uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, vld1q_u8(pair_shuf_t)));
-        x = vshlq_u16(x, vld1q_s16(hshift_t));
-        uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), vld1q_s8(bshr_t));
-        vst1q_u8(symbols + i, vqtbl1q_u8(c2s16, vandq_u8(y, m7)));
+    if (tf) {
+        uint8x16_t keep = vld1q_u8(out + n);
+        for (; i < n; i += 16)
+            pivcoh__d3_chunk16(out + i, bm + ((i * 3) >> 3), c2s16, m7);
+        vst1q_u8(out + n, keep);
+        return;
+    }
+    if (n - i >= 41) {   /* one region-safe chunk before the scalar tail */
+        pivcoh__d3_chunk16(out + i, bm + ((i * 3) >> 3), c2s16, m7);
         i += 16;
     }
-    for (; i + 8 <= n; i += 8) {
-        uint8x8_t codes = pivcoh__d3_unpack_safe(bm + ((i * 3) >> 3));
-        vst1_u8(symbols + i, vqtbl1_u8(c2s16, codes));
-    }
-    for (; i < n; i++) symbols[i] = c2s[pivcoh__extract_bits(bm, i * 3, 3)];
+    for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 3, 3)];
 }
 
-/* D=4: nibbles index c2s directly; 32/iter via vzip. */
-static void pivcoh__flat_d4(uint8_t *symbols, int n, const uint8_t *bm,
-                            const uint8_t *c2s)
+/* D=4: nibbles index c2s directly; 32/iter via vzip; 16-wide chunks
+ * finish (the tf tail's last chunk reads <= 7 bytes past the region). */
+static void pivcoh__flat_d4(uint8_t *out, int n, const uint8_t *bm,
+                            const uint8_t *c2s, int tf)
 {
     uint8x16_t c2s_vec = vld1q_u8(c2s);
     const uint8x16_t m = vdupq_n_u8(0x0F);
@@ -893,94 +876,59 @@ static void pivcoh__flat_d4(uint8_t *symbols, int n, const uint8_t *bm,
         uint8x16_t v  = vld1q_u8(bm + (i >> 1));
         uint8x16_t lo = vandq_u8(v, m), hi = vshrq_n_u8(v, 4);
         uint8x16_t a = vqtbl1q_u8(c2s_vec, lo), b = vqtbl1q_u8(c2s_vec, hi);
-        vst1q_u8(symbols + i,      vzip1q_u8(a, b));
-        vst1q_u8(symbols + i + 16, vzip2q_u8(a, b));
+        vst1q_u8(out + i,      vzip1q_u8(a, b));
+        vst1q_u8(out + i + 16, vzip2q_u8(a, b));
     }
-    for (; i + 16 <= n; i += 16) {
-        uint8x16_t codes = pivcoh__d4_unpack(bm + (i >> 1));
-        vst1q_u8(symbols + i, vqtbl1q_u8(c2s_vec, codes));
-    }
-    for (; i + 2 <= n; i += 2) {
-        uint8_t b = bm[i >> 1];
-        symbols[i    ] = c2s[b & 0x0F];
-        symbols[i + 1] = c2s[b >> 4];
-    }
-    for (; i < n; i++) symbols[i] = c2s[pivcoh__extract_bits(bm, i * 4, 4)];
+    uint8x16_t keep = vdupq_n_u8(0);
+    if (tf) keep = vld1q_u8(out + n);
+    int lim = tf ? n : n - 15;
+    for (; i < lim; i += 16)
+        vst1q_u8(out + i, vqtbl1q_u8(c2s_vec, pivcoh__d4_unpack(bm + (i >> 1))));
+    if (tf) { vst1q_u8(out + n, keep); return; }
+    for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 4, 4)];
 }
 
-/* D=5: pair-gather (two adjacent codes per u16 lane, positioned so the
- * byte reinterpret interleaves even/odd for free); vqtbl2 scatter. */
-static void pivcoh__flat_d5(uint8_t *symbols, int n, const uint8_t *bm,
-                            const uint8_t *c2s)
+/* D=5: pair-gather chunks (two adjacent codes per u16 lane, positioned
+ * so the byte reinterpret interleaves even/odd for free); vqtbl2
+ * scatter.  tf=0 keeps the region-safe block count. */
+static void pivcoh__flat_d5(uint8_t *out, int n, const uint8_t *bm,
+                            const uint8_t *c2s, int tf)
 {
     uint8x16x2_t c2s_vec;
     c2s_vec.val[0] = vld1q_u8(c2s);
     c2s_vec.val[1] = vld1q_u8(c2s + 16);
-    int i = 0;
-    if (n >= 25) {
-        static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 2,3, 3,4, 5,6, 6,7, 7,8, 8,9 };
-        static const int16_t hshift_t[8]     = { 3, 1, -1, -3, 3, 1, -1, -3 };
-        static const int8_t  bshr_t[16]      = { -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0 };
-        const uint8x16_t pair_shuf = vld1q_u8(pair_shuf_t);
-        const int16x8_t  hshift    = vld1q_s16(hshift_t);
-        const int8x16_t  bshr      = vld1q_s8(bshr_t);
-        const uint8x16_t m31       = vdupq_n_u8(0x1f);
-        int blocks = (n - 9) >> 4;
-        for (int b = 0; b < blocks; ++b) {
-            uint8x16_t packed = vld1q_u8(bm + b * 10);
-            uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair_shuf));
-            x = vshlq_u16(x, hshift);
-            uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), bshr);
-            vst1q_u8(symbols + (b << 4), vqtbl2q_u8(c2s_vec, vandq_u8(y, m31)));
-        }
-        i = blocks << 4;
-    }
-    for (; i + 8 <= n; i += 8) {
-        uint8x8_t codes = pivcoh__d5_unpack_safe(bm + ((i * 5) >> 3));
-        vst1_u8(symbols + i, vqtbl2_u8(c2s_vec, codes));
-    }
-    for (; i < n; i++) symbols[i] = c2s[pivcoh__extract_bits(bm, i * 5, 5)];
+    uint8x16_t keep = vdupq_n_u8(0);
+    if (tf) keep = vld1q_u8(out + n);
+    int i = 0, lim = tf ? n : (n >= 25 ? ((n - 9) >> 4) << 4 : 0);
+    for (; i < lim; i += 16)
+        pivcoh__d5_chunk16(out + i, bm + ((i * 5) >> 3), c2s_vec);
+    if (tf) { vst1q_u8(out + n, keep); return; }
+    for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 5, 5)];
 }
 
 /* D=6: same pair-gather as D=5 (12-bit pairs); 64-byte c2s => vqtbl4q. */
-static void pivcoh__flat_d6(uint8_t *symbols, int n, const uint8_t *bm,
-                            const uint8_t *c2s)
+static void pivcoh__flat_d6(uint8_t *out, int n, const uint8_t *bm,
+                            const uint8_t *c2s, int tf)
 {
     uint8x16x4_t c2s_vec;
     c2s_vec.val[0] = vld1q_u8(c2s);
     c2s_vec.val[1] = vld1q_u8(c2s + 16);
     c2s_vec.val[2] = vld1q_u8(c2s + 32);
     c2s_vec.val[3] = vld1q_u8(c2s + 48);
-    int i = 0;
-    if (n >= 24) {
-        static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
-        static const int16_t hshift_t[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
-        static const int8_t  bshr_t[16]      = { -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0 };
-        const uint8x16_t pair_shuf = vld1q_u8(pair_shuf_t);
-        const int16x8_t  hshift    = vld1q_s16(hshift_t);
-        const int8x16_t  bshr      = vld1q_s8(bshr_t);
-        const uint8x16_t m63       = vdupq_n_u8(0x3f);
-        int blocks = (n - 8) >> 4;
-        for (int b = 0; b < blocks; ++b) {
-            uint8x16_t packed = vld1q_u8(bm + b * 12);
-            uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair_shuf));
-            x = vshlq_u16(x, hshift);
-            uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), bshr);
-            vst1q_u8(symbols + (b << 4), vqtbl4q_u8(c2s_vec, vandq_u8(y, m63)));
-        }
-        i = blocks << 4;
-    }
-    for (; i + 8 <= n; i += 8) {
-        uint8x8_t codes = pivcoh__d6_unpack_safe(bm + ((i * 6) >> 3));
-        vst1_u8(symbols + i, vqtbl4_u8(c2s_vec, codes));
-    }
-    for (; i < n; i++) symbols[i] = c2s[pivcoh__extract_bits(bm, i * 6, 6)];
+    uint8x16_t keep = vdupq_n_u8(0);
+    if (tf) keep = vld1q_u8(out + n);
+    int i = 0, lim = tf ? n : (n >= 24 ? ((n - 8) >> 4) << 4 : 0);
+    for (; i < lim; i += 16)
+        pivcoh__d6_chunk16(out + i, bm + ((i * 6) >> 3), c2s_vec);
+    if (tf) { vst1q_u8(out + n, keep); return; }
+    for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 6, 6)];
 }
 
 /* D=7: 128-entry c2s = vqtbl4 low half + vqtbx4 high half (vqtbx keeps
- * the first result for out-of-range lanes — no OR-merge). */
-static void pivcoh__flat_d7(uint8_t *symbols, int n, const uint8_t *bm,
-                            const uint8_t *c2s)
+ * the first result for out-of-range lanes — no OR-merge).  16-wide
+ * while whole chunks fit, 8-wide finish. */
+static void pivcoh__flat_d7(uint8_t *out, int n, const uint8_t *bm,
+                            const uint8_t *c2s, int tf)
 {
     uint8x16x4_t lo, hi;
     lo.val[0] = vld1q_u8(c2s);       lo.val[1] = vld1q_u8(c2s + 16);
@@ -989,44 +937,41 @@ static void pivcoh__flat_d7(uint8_t *symbols, int n, const uint8_t *bm,
     hi.val[2] = vld1q_u8(c2s + 96);  hi.val[3] = vld1q_u8(c2s + 112);
     uint8x16_t sub64q = vdupq_n_u8(64);
     uint8x8_t  sub64  = vdup_n_u8(64);
-    int i = 0;
-    int fast_end = n >= 24 ? n - 24 : 0;
-    for (; i + 16 <= fast_end; i += 16) {
-        uint8x8_t cl = pivcoh__d7_unpack_fast(bm + ((i      * 7) >> 3));
-        uint8x8_t ch = pivcoh__d7_unpack_fast(bm + (((i + 8) * 7) >> 3));
+    uint8x16_t keep = vdupq_n_u8(0);
+    if (tf) keep = vld1q_u8(out + n);
+    int i = 0, fast_end = tf ? n : (n >= 24 ? n - 24 : 0);
+    for (; i < fast_end - 15; i += 16) {
+        uint8x8_t cl = pivcoh__d7_unpack(bm + ((i      * 7) >> 3));
+        uint8x8_t ch = pivcoh__d7_unpack(bm + (((i + 8) * 7) >> 3));
         uint8x16_t codes = vcombine_u8(cl, ch);
         uint8x16_t s = vqtbl4q_u8(lo, codes);
         s = vqtbx4q_u8(s, hi, vsubq_u8(codes, sub64q));
-        vst1q_u8(symbols + i, s);
+        vst1q_u8(out + i, s);
     }
-    for (; i + 8 <= fast_end; i += 8) {
-        uint8x8_t codes = pivcoh__d7_unpack_fast(bm + ((i * 7) >> 3));
+    for (; i < (tf ? n : fast_end - 7); i += 8) {
+        uint8x8_t codes = pivcoh__d7_unpack(bm + ((i * 7) >> 3));
         uint8x8_t s = vqtbl4_u8(lo, codes);
         s = vqtbx4_u8(s, hi, vsub_u8(codes, sub64));
-        vst1_u8(symbols + i, s);
+        vst1_u8(out + i, s);
     }
-    for (; i + 8 <= n; i += 8) {
-        uint8x8_t codes = pivcoh__d7_unpack_safe(bm + ((i * 7) >> 3));
-        uint8x8_t s = vqtbl4_u8(lo, codes);
-        s = vqtbx4_u8(s, hi, vsub_u8(codes, sub64));
-        vst1_u8(symbols + i, s);
-    }
-    for (; i < n; i++) symbols[i] = c2s[pivcoh__extract_bits(bm, i * 7, 7)];
+    if (tf) { vst1q_u8(out + n, keep); return; }
+    for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 7, 7)];
 }
 
 /* Dispatcher.  D=8 is a full-alphabet equal-length code: c2s is the
- * identity, so the byte-aligned codes ARE the symbols — memcpy. */
+ * identity, so the byte-aligned codes ARE the symbols — memcpy (exact
+ * either way; tf is moot). */
 static void pivcoh__merge_flat(uint8_t *out, int n, const uint8_t *bm, int D,
-                               const uint8_t *c2s)
+                               const uint8_t *c2s, int tf)
 {
     switch (D) {
-    case 1: pivcoh__merge_cst_cst(bm, n, c2s[0], c2s[1], out); break;
-    case 2: pivcoh__flat_d2(out, n, bm, c2s); break;
-    case 3: pivcoh__flat_d3(out, n, bm, c2s); break;
-    case 4: pivcoh__flat_d4(out, n, bm, c2s); break;
-    case 5: pivcoh__flat_d5(out, n, bm, c2s); break;
-    case 6: pivcoh__flat_d6(out, n, bm, c2s); break;
-    case 7: pivcoh__flat_d7(out, n, bm, c2s); break;
+    case 1: pivcoh__merge_cst_cst(bm, n, c2s[0], c2s[1], out, tf); break;
+    case 2: pivcoh__flat_d2(out, n, bm, c2s, tf); break;
+    case 3: pivcoh__flat_d3(out, n, bm, c2s, tf); break;
+    case 4: pivcoh__flat_d4(out, n, bm, c2s, tf); break;
+    case 5: pivcoh__flat_d5(out, n, bm, c2s, tf); break;
+    case 6: pivcoh__flat_d6(out, n, bm, c2s, tf); break;
+    case 7: pivcoh__flat_d7(out, n, bm, c2s, tf); break;
     case 8: memcpy(out, bm, (size_t)n); break;
     default:
         for (int i = 0; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * D, D)];
@@ -1087,7 +1032,12 @@ static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K,
         int D = rec->kd >> 2;
         size_t nb = ((size_t)K * (size_t)D + 7) >> 3;
         if ((size_t)(end - p) < nb) return NULL;
-        pivcoh__merge_flat(out, K, p, D, t->rank_to_sym + rec->param);
+        /* tf whenever the stream holds 16 readable bytes past the
+         * region — true for essentially every interior flat (the walk's
+         * out is always arena-backed; a parent's bitmap alone covers it
+         * once K is non-tiny, since the root's bitmap ends the block). */
+        pivcoh__merge_flat(out, K, p, D, t->rank_to_sym + rec->param,
+                           (size_t)(end - p) >= nb + 16);
         return p + nb;
     }
     if (end - p < 2) return NULL;
@@ -1144,7 +1094,9 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
         int D = root->kd >> 2;
         size_t nb = ((size_t)N * (size_t)D + 7) >> 3;
         if ((size_t)(end - p) < nb) return -1;
-        pivcoh__merge_flat(out, N, p, D, t->rank_to_sym + root->param);
+        /* tf=0: out is the caller's buffer (no scribble allowed), and a
+         * flat root's region really can end the stream. */
+        pivcoh__merge_flat(out, N, p, D, t->rank_to_sym + root->param, 0);
         if (consumed) *consumed = (size_t)(p + nb - in);
         return N;
     }
