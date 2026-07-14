@@ -693,10 +693,12 @@ static void pivcoh__merge_cst_cst(const uint8_t *bm, int K,
  * interior flat region: in decode order the last bytes of a block are
  * the ROOT's merge bitmap, so an interior region is followed by its
  * ancestors' records (a parent's bitmap alone exceeds 16 bytes once
- * the region holds ~120 symbols).  tf kernels run whole vector chunks
- * to the end — reading at most 16 bytes past the region (inside the
- * stream), overwriting up to 15 bytes past out+n, saved and restored —
- * so the byte-wise "safe" unpacks and per-code scalar tails are gone.
+ * the region holds ~120 symbols).  tf kernels simply run their MAIN
+ * loop past n — same shape, same constants, no separate tail pipeline —
+ * reading at most 16 bytes past the region (inside the stream) and
+ * scribbling up to one iteration's width minus one (15..63 bytes,
+ * kernel-dependent) past out+n, saved and restored at loop width — so
+ * the byte-wise "safe" unpacks and per-code scalar tails are gone.
  * tf=0 (a flat ROOT decoding into the caller's buffer — where the
  * region really can end the stream — or a rare end-of-block interior
  * region) keeps the region-bounded vector loops and finishes the last
@@ -708,30 +710,6 @@ static inline uint32_t pivcoh__extract_bits(const uint8_t *in, int bit_pos, int 
     uint32_t val = (uint32_t)in[byte_idx];
     if (bit_off + D > 8) val |= ((uint32_t)in[byte_idx + 1]) << 8;
     return (val >> bit_off) & ((1u << D) - 1);
-}
-
-static const uint8_t pivcoh__d2_dup_tab[16]   = {0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3};
-static const int8_t  pivcoh__d2_shift_tab[16] = {0,-2,-4,-6, 0,-2,-4,-6,
-                                                 0,-2,-4,-6, 0,-2,-4,-6};
-static inline uint8x16_t pivcoh__d2_unpack(const uint8_t *bm_ptr)
-{
-    uint32_t packed;
-    memcpy(&packed, bm_ptr, 4);
-    uint8x16_t bm_lo = vreinterpretq_u8_u32(vsetq_lane_u32(packed, vdupq_n_u32(0), 0));
-    uint8x16_t dup = vqtbl1q_u8(bm_lo, vld1q_u8(pivcoh__d2_dup_tab));
-    return vandq_u8(vshlq_u8(dup, vld1q_s8(pivcoh__d2_shift_tab)), vdupq_n_u8(0x03));
-}
-
-static const uint8_t pivcoh__d4_dup_tab[16]   = {0,0, 1,1, 2,2, 3,3, 4,4, 5,5, 6,6, 7,7};
-static const int8_t  pivcoh__d4_shift_tab[16] = {0,-4, 0,-4, 0,-4, 0,-4,
-                                                 0,-4, 0,-4, 0,-4, 0,-4};
-static inline uint8x16_t pivcoh__d4_unpack(const uint8_t *bm_ptr)
-{
-    uint64_t packed;
-    memcpy(&packed, bm_ptr, 8);
-    uint8x16_t bm_lo = vreinterpretq_u8_u64(vsetq_lane_u64(packed, vdupq_n_u64(0), 0));
-    uint8x16_t dup = vqtbl1q_u8(bm_lo, vld1q_u8(pivcoh__d4_dup_tab));
-    return vandq_u8(vshlq_u8(dup, vld1q_s8(pivcoh__d4_shift_tab)), vdupq_n_u8(0x0F));
 }
 
 static const uint8_t pivcoh__d7_shuf_tab[16] = {0,1, 0,1, 1,2, 2,3, 3,4, 4,5, 5,6, 6,6};
@@ -747,19 +725,9 @@ static inline uint8x8_t pivcoh__d7_unpack(const uint8_t *bm_ptr)
 /* One 16-output pair-gather chunk for the byte-crossing depths: a
  * 16-byte load, one vqtbl1 placing two adjacent codes in each u16 lane,
  * a u16 shift aligning the pair, a u8 shift + mask isolating each code,
- * then the c2s scatter.  Consumes 2D input bytes of the 16 loaded. */
-static inline void pivcoh__d3_chunk16(uint8_t *dst, const uint8_t *src,
-                                      uint8x16_t c2s16, uint8x16_t m7)
-{
-    static const uint8_t pair_shuf_t[16] = { 0,1, 0,1, 1,2, 2,3, 3,4, 3,4, 4,5, 5,6 };
-    static const int16_t hshift_t[8]     = { 5,-1, 1, 3, 5,-1, 1, 3 };
-    static const int8_t  bshr_t[16]      = { -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0, -5,0 };
-    uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(vld1q_u8(src), vld1q_u8(pair_shuf_t)));
-    x = vshlq_u16(x, vld1q_s16(hshift_t));
-    uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), vld1q_s8(bshr_t));
-    vst1q_u8(dst, vqtbl1q_u8(c2s16, vandq_u8(y, m7)));
-}
-
+ * then the c2s scatter.  Consumes 2D input bytes of the 16 loaded.
+ * These ARE the D=5/6 main-loop bodies — main loop and tf tail share
+ * one shape and one constant set per kernel. */
 static inline void pivcoh__d5_chunk16(uint8_t *dst, const uint8_t *src,
                                       uint8x16x2_t c2s_vec)
 {
@@ -787,50 +755,55 @@ static inline void pivcoh__d6_chunk16(uint8_t *dst, const uint8_t *src,
 /* ---- per-D flat decodes (contiguous output) ---- */
 
 /* D=2 (4 codes/byte): 64/iter maps each input nibble straight to a
- * symbol pair via two prepped tables, interleaved back with vst4q;
- * 16-wide chunks finish (the tf tail's last chunk reads <= 3 bytes
- * past the region). */
+ * symbol pair via two prepped tables, interleaved back with vst4q.
+ * The tf tail is the same loop run past n (scribbling < 64 bytes past
+ * out+n, saved and restored) — one shape, one constant set. */
 static void pivcoh__flat_d2(uint8_t *out, int n, const uint8_t *bm,
                             const uint8_t *c2s, int tf)
 {
     int i = 0;
-    if (n >= 64) {
+    if (tf || n >= 64) {
         static const uint8_t th_idx[16] = {0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3};
         uint32_t w; memcpy(&w, c2s, 4);
         const uint8x16_t TL = vreinterpretq_u8_u32(vdupq_n_u32(w));   /* c2s[n&3] */
         const uint8x16_t TH = vqtbl1q_u8(TL, vld1q_u8(th_idx));       /* c2s[(n>>2)&3] */
         const uint8x16_t m  = vdupq_n_u8(0x0F);
-        for (; i + 64 <= n; i += 64) {
+        uint8x16_t k0 = vdupq_n_u8(0), k1 = k0, k2 = k0, k3 = k0;
+        if (tf) {
+            k0 = vld1q_u8(out + n);      k1 = vld1q_u8(out + n + 16);
+            k2 = vld1q_u8(out + n + 32); k3 = vld1q_u8(out + n + 48);
+        }
+        int lim = tf ? n : n - 63;
+        for (; i < lim; i += 64) {
             uint8x16_t v  = vld1q_u8(bm + (i >> 2));
             uint8x16_t lo = vandq_u8(v, m), hi = vshrq_n_u8(v, 4);
             uint8x16x4_t o = {{ vqtbl1q_u8(TL, lo), vqtbl1q_u8(TH, lo),
                                 vqtbl1q_u8(TL, hi), vqtbl1q_u8(TH, hi) }};
             vst4q_u8(out + i, o);
         }
+        if (tf) {
+            vst1q_u8(out + n, k0);      vst1q_u8(out + n + 16, k1);
+            vst1q_u8(out + n + 32, k2); vst1q_u8(out + n + 48, k3);
+            return;
+        }
     }
-    uint8x16_t c2s_vec = vld1q_u8(c2s);
-    uint8x16_t keep = vdupq_n_u8(0);
-    if (tf) keep = vld1q_u8(out + n);
-    int lim = tf ? n : n - 15;
-    for (; i < lim; i += 16)
-        vst1q_u8(out + i, vqtbl1q_u8(c2s_vec, pivcoh__d2_unpack(bm + (i >> 2))));
-    if (tf) { vst1q_u8(out + n, keep); return; }
     for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 2, 2)];
 }
 
 /* D=3: 32 codes/iter via the D=6 pair-gather (two D=3 codes per byte),
- * split lo/hi and interleave with vst2q; 16-wide pair-gather chunks
- * finish.  The tf=0 single-chunk guard is region-safe (needs n-i >= 41
- * so the 16-byte load stays inside ceil(3n/8); production guards only
- * against the output and can read 4 bytes past the region). */
+ * split lo/hi and interleave with vst2q.  The tf tail is the same loop
+ * run past n (scribbling < 32 bytes past out+n, saved and restored;
+ * the tf=0 main-loop bound i+48 <= n keeps its 16-byte loads inside
+ * ceil(3n/8) — production guards only against the output and can read
+ * 4 bytes past the region). */
 static void pivcoh__flat_d3(uint8_t *out, int n, const uint8_t *bm,
                             const uint8_t *c2s, int tf)
 {
-    const uint8x8_t  c2s8  = vld1_u8(c2s);
-    const uint8x16_t c2s16 = vcombine_u8(c2s8, c2s8);
-    const uint8x16_t m7    = vdupq_n_u8(7);
     int i = 0;
-    if (n >= 48) {
+    if (tf || n >= 48) {
+        const uint8x8_t  c2s8  = vld1_u8(c2s);
+        const uint8x16_t c2s16 = vcombine_u8(c2s8, c2s8);
+        const uint8x16_t m7    = vdupq_n_u8(7);
         uint8x16x2_t c2s32; c2s32.val[0] = c2s16; c2s32.val[1] = c2s16;
         static const uint8_t pair6_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
         static const int16_t hshift6_t[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
@@ -838,8 +811,11 @@ static void pivcoh__flat_d3(uint8_t *out, int n, const uint8_t *bm,
         const uint8x16_t pair6_shuf = vld1q_u8(pair6_shuf_t);
         const int16x8_t  hshift6    = vld1q_s16(hshift6_t);
         const int8x16_t  bshr6      = vld1q_s8(bshr6_t);
+        uint8x16_t k0 = vdupq_n_u8(0), k1 = k0;
+        if (tf) { k0 = vld1q_u8(out + n); k1 = vld1q_u8(out + n + 16); }
+        int lim = tf ? n : n - 47;
         const uint8_t *bp = bm;
-        for (; i + 48 <= n; i += 32, bp += 12) {   /* == i + 32 <= n - 16 */
+        for (; i < lim; i += 32, bp += 12) {
             uint8x16_t packed = vld1q_u8(bp);
             uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(packed, pair6_shuf));
             x = vshlq_u16(x, hshift6);
@@ -849,42 +825,38 @@ static void pivcoh__flat_d3(uint8_t *out, int n, const uint8_t *bm,
             o.val[1] = vqtbl2q_u8(c2s32, vshrq_n_u8(pair6, 3));
             vst2q_u8(out + i, o);
         }
-    }
-    if (tf) {
-        uint8x16_t keep = vld1q_u8(out + n);
-        for (; i < n; i += 16)
-            pivcoh__d3_chunk16(out + i, bm + ((i * 3) >> 3), c2s16, m7);
-        vst1q_u8(out + n, keep);
-        return;
-    }
-    if (n - i >= 41) {   /* one region-safe chunk before the scalar tail */
-        pivcoh__d3_chunk16(out + i, bm + ((i * 3) >> 3), c2s16, m7);
-        i += 16;
+        if (tf) {
+            vst1q_u8(out + n, k0);
+            vst1q_u8(out + n + 16, k1);
+            return;
+        }
     }
     for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 3, 3)];
 }
 
-/* D=4: nibbles index c2s directly; 32/iter via vzip; 16-wide chunks
- * finish (the tf tail's last chunk reads <= 7 bytes past the region). */
+/* D=4: nibbles index c2s directly; 32/iter via vzip.  The tf tail is
+ * the same loop run past n (scribbling < 32 bytes past out+n, saved
+ * and restored) — one shape, one constant set. */
 static void pivcoh__flat_d4(uint8_t *out, int n, const uint8_t *bm,
                             const uint8_t *c2s, int tf)
 {
     uint8x16_t c2s_vec = vld1q_u8(c2s);
     const uint8x16_t m = vdupq_n_u8(0x0F);
-    int i = 0;
-    for (; i + 32 <= n; i += 32) {
+    uint8x16_t k0 = vdupq_n_u8(0), k1 = k0;
+    if (tf) { k0 = vld1q_u8(out + n); k1 = vld1q_u8(out + n + 16); }
+    int i = 0, lim = tf ? n : n - 31;
+    for (; i < lim; i += 32) {
         uint8x16_t v  = vld1q_u8(bm + (i >> 1));
         uint8x16_t lo = vandq_u8(v, m), hi = vshrq_n_u8(v, 4);
         uint8x16_t a = vqtbl1q_u8(c2s_vec, lo), b = vqtbl1q_u8(c2s_vec, hi);
         vst1q_u8(out + i,      vzip1q_u8(a, b));
         vst1q_u8(out + i + 16, vzip2q_u8(a, b));
     }
-    uint8x16_t keep = vdupq_n_u8(0);
-    if (tf) keep = vld1q_u8(out + n);
-    int lim = tf ? n : n - 15;
-    for (; i < lim; i += 16)
-        vst1q_u8(out + i, vqtbl1q_u8(c2s_vec, pivcoh__d4_unpack(bm + (i >> 1))));
-    if (tf) { vst1q_u8(out + n, keep); return; }
+    if (tf) {
+        vst1q_u8(out + n, k0);
+        vst1q_u8(out + n + 16, k1);
+        return;
+    }
     for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 4, 4)];
 }
 
