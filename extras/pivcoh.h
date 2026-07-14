@@ -163,8 +163,11 @@ typedef struct {
                                 what the encoder transmits to the decoder. */
     /* internals */
     uint16_t num_ranks, sched_len;
-    uint8_t enc_ready;       /* sym_to_rank valid (filled lazily on first
+    uint8_t enc_ready;       /* encoder view valid (filled lazily on first
                                 encode; decode never needs it) */
+    uint8_t enc_umin;        /* used-symbol window: min symbol and span-1;
+                                a span < 128 halves enc_init's lookup */
+    uint8_t enc_span1;
     uint8_t rank_to_sym[256], sym_to_rank[256];
     pivcoh__rec sched[60];   /* Kraft-complete max is 59 records (33 chunks,
                                 27 with bit >= 1); +1 so the schedule render's
@@ -2010,12 +2013,35 @@ static inline uint64_t pivcoh__masks64(uint8x16_t v0, uint8x16_t v1,
 
 /* ranks[i] = s2r[sym[i]]: the s2r table lives in 16 NEON regs; each
  * 16-lane input does one vqtbl4 + three vqtbx4, with 4 extra GPR
- * gathers interleaved into the idle scalar slots (20 sym/iter). */
-static void pivcoh__enc_init(uint8_t *ranks, int n,
-                             const uint8_t *sym, const uint8_t *s2r)
+ * gathers interleaved into the idle scalar slots (20 sym/iter).
+ * Tables whose used symbols span < 128 values (statically known --
+ * every ASCII-ish window qualifies) take a half-size path: two tables
+ * indexed by sym - umin, one vqtbl4 + one vqtbx4.  Out-of-window
+ * symbols (frequency zero) index past both tables and map to rank 0 --
+ * the same valid-but-meaningless-stream contract as the full path. */
+static void pivcoh__enc_init(uint8_t *ranks, int n, const uint8_t *sym,
+                             const uint8_t *s2r, unsigned umin, unsigned span1)
 {
     int i = 0;
-    if (n >= 20) {
+    if (n >= 20 && span1 < 128) {
+        const uint8_t *w = s2r + umin;         /* umin + 128 <= 256 */
+        uint8x16x4_t t0 = vld1q_u8_x4(w), t1 = vld1q_u8_x4(w + 64);
+        const uint8x16_t vmin = vdupq_n_u8((uint8_t)umin);
+        const uint8x16_t s64  = vdupq_n_u8(64);
+        for (; i + 20 <= n; i += 20) {
+            uint8x16_t c = vsubq_u8(vld1q_u8(sym + i), vmin);
+            uint32_t a; memcpy(&a, sym + i + 16, 4);
+            uint8x16_t r = vqtbl4q_u8(t0, c);
+            unsigned r0 = s2r[(uint8_t)a];
+            unsigned r1 = s2r[(uint8_t)(a >> 8)];
+            r = vqtbx4q_u8(r, t1, vsubq_u8(c, s64));
+            unsigned r2 = s2r[(uint8_t)(a >> 16)];
+            unsigned r3 = s2r[(uint8_t)(a >> 24)];
+            vst1q_u8(ranks + i, r);
+            uint32_t h = r0 | (r1 << 8) | (r2 << 16) | (r3 << 24);
+            memcpy(ranks + i + 16, &h, 4);
+        }
+    } else if (n >= 20) {
         uint8x16x4_t t0 = vld1q_u8_x4(s2r), t1 = vld1q_u8_x4(s2r + 64);
         uint8x16x4_t t2 = vld1q_u8_x4(s2r + 128), t3 = vld1q_u8_x4(s2r + 192);
         const uint8x16_t s64  = vdupq_n_u8(64);
@@ -2540,6 +2566,11 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
         memset(tw->sym_to_rank, 0, 256);
         for (int s = t->num_ranks - 1; s >= 0; s--)
             tw->sym_to_rank[t->rank_to_sym[s]] = (uint8_t)s;
+        int lo = 255, hi = 0;
+        for (int s = 0; s < 256; s++)
+            if (t->code_len[s]) { if (s < lo) lo = s; if (s > hi) hi = s; }
+        tw->enc_umin  = (uint8_t)lo;
+        tw->enc_span1 = (uint8_t)(hi - lo);
         tw->enc_ready = 1;
     }
     uint8_t *sc = scratch ? (uint8_t *)scratch : (uint8_t *)malloc(PIVCOH_SCRATCH_SIZE(n));
@@ -2549,7 +2580,8 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
                                                   strays <= 63 B past a ranks
                                                   region; children get the same
                                                   gap in enc_node) */
-    pivcoh__enc_init(ranks, (int)n, in, t->sym_to_rank);
+    pivcoh__enc_init(ranks, (int)n, in, t->sym_to_rank,
+                     t->enc_umin, t->enc_span1);
     uint8_t *p = out;
     *p++ = (uint8_t)n;
     *p++ = (uint8_t)(n >> 8);
