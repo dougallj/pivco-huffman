@@ -1415,7 +1415,12 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
  * The compact shuffle absorbs the whole bytes of the final (32-4D)
  * re-basing shift (its tables start at byte 1 for D=5/6), leaving a
  * residual >> 4 for D=5/7 and NO final shift for D=6 -- 3-4 shift ops,
- * count vectors are vdups of computed constants.
+ * count vectors are vdups of computed constants.  (Byte-aligning the
+ * fields EARLY so the tbl can also do the u64 level -- e.g. D=6's
+ * 24-bit quad at [0,24) -- costs a shr+sli pair per level, one op
+ * more: a sub-lane field can't cross its own byte/lane boundary with
+ * a single per-lane shift, which is exactly what the converging
+ * meet-at-the-boundary placement avoids.)
  * (History: ryg's multiply-as-shift vmull pyramid, then a 6-op
  * USHR+SLI ladder, each replaced in turn.)  Each 16-byte store carries
  * 16-2D trailing junk bytes, overwritten by the next iter / next
