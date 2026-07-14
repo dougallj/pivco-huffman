@@ -1370,7 +1370,16 @@ int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
     return n_right;
 }
 
-/* ---- flat pack: (rank - base) is already the D-bit local code ---- */
+/* ---- flat pack: (rank - base) is already the D-bit local code ----
+ *
+ * Every kernel packs ALL n codes by running its vector loop past n:
+ * the final vector loads up to 15 garbage ranks past the region
+ * (inside the partition gaps/slack) and packs garbage bits, which land
+ * only where they don't matter — bytes past ceil(n*D/8) are junk under
+ * the usual contract (overwritten by the next record; inside out_cap
+ * at stream end), and the padding bits inside the last partial byte
+ * are zeroed by one byte RMW in the dispatcher, store-forwarded from
+ * the final vector store. */
 
 /* D=2: 64 ranks -> 16 bytes (4 ranks per byte, no byte crossings) —
  * unrolled x4 so both vpaddq_u8 reduction levels pair full vectors and
@@ -1380,7 +1389,7 @@ int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
  * sum (r_i - b) 4^i = r0 + 4r1 + 16r2 + 64r3 - 85b (mod 256, exact
  * since the true byte is in range).  The 16-rank remainder keeps the
  * self-pairing quarter-width form. */
-static inline int pivcoh__pack_d2(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
+static inline void pivcoh__pack_d2(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
     static const int8_t shifts_d2[16] = { 0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6 };
     const int8x16_t sh = vld1q_s8(shifts_d2);
@@ -1394,21 +1403,20 @@ static inline int pivcoh__pack_d2(uint8_t *out, const uint8_t *ranks, int n, uin
         uint8x16_t r  = vpaddq_u8(vpaddq_u8(b0, b1), vpaddq_u8(b2, b3));
         vst1q_u8(out + (i >> 2), vsubq_u8(r, b85));
     }
-    for (; i + 16 <= n; i += 16) {
+    for (; i < n; i += 16) {
         uint8x16_t b  = vshlq_u8(vld1q_u8(ranks + i), sh);
         uint8x16_t s1 = vpaddq_u8(b, b);
         uint8x16_t s2 = vsubq_u8(vpaddq_u8(s1, s1), b85);
         uint32_t packed4 = vgetq_lane_u32(vreinterpretq_u32_u8(s2), 0);
         memcpy(out + (i >> 2), &packed4, 4);
     }
-    return i;
 }
 
 /* D=4: 32 ranks -> 16 bytes, pairing (r[2k], r[2k+1]) into one byte —
  * unrolled once so the vpaddq_u8 pairs two full input vectors, with
  * the base subtract distributed like D=2's:
  * (r0 - b) + 16(r1 - b) = r0 + 16r1 - 17b (mod 256, exact). */
-static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
+static inline void pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
     static const int8_t shifts_d4[16] = { 0,4, 0,4, 0,4, 0,4, 0,4, 0,4, 0,4, 0,4 };
     const int8x16_t sh = vld1q_s8(shifts_d4);
@@ -1419,12 +1427,11 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
         uint8x16_t b1 = vshlq_u8(vld1q_u8(ranks + i + 16), sh);
         vst1q_u8(out + (i >> 1), vsubq_u8(vpaddq_u8(b0, b1), b17));
     }
-    for (; i + 16 <= n; i += 16) {
+    for (; i < n; i += 16) {
         uint8x16_t b = vshlq_u8(vld1q_u8(ranks + i), sh);
         vst1_u8(out + (i >> 1),
                 vget_low_u8(vsubq_u8(vpaddq_u8(b, b), b17)));
     }
-    return i;
 }
 
 /* D=5/6/7: variable-shift pack, 16 codes/iter (D=3 pairs itself into
@@ -1462,7 +1469,7 @@ static const uint8_t pivcoh__pack_compact_d7[16] = {
 };
 
 #define PIVCOH__PACK_DN(NAME, D_VAL, BITSHR, COMPACT_TAB)                        \
-static inline int NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)  \
+static inline void NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base) \
 {                                                                                \
     const int8x16_t s1 = vreinterpretq_s8_u16(vdupq_n_u16(8 - (D_VAL)));         \
     const int16x8_t s2 = vreinterpretq_s16_u32(vdupq_n_u32(                      \
@@ -1472,17 +1479,15 @@ static inline int NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base) 
         (uint64_t)(uint32_t)(16 - 2 * (D_VAL)) |                                 \
         ((uint64_t)(uint32_t)-(16 - 2 * (D_VAL)) << 32)));                       \
     const uint8x16_t compact = vld1q_u8(COMPACT_TAB);                            \
-    int i = 0;                                                                   \
-    for (; i + 16 <= n; i += 16) {                                               \
+    for (int i = 0; i < n; i += 16) {                                            \
         uint8x16_t cb = vsubq_u8(vld1q_u8(ranks + i), vdupq_n_u8(base));         \
         uint16x8_t w16 = vreinterpretq_u16_u8(vshlq_u8(cb, s1));                 \
         uint32x4_t w32 = vreinterpretq_u32_u16(vshlq_u16(w16, s2));              \
         uint64x2_t w64 = vreinterpretq_u64_u32(vshlq_u32(w32, s3));              \
         if (BITSHR) w64 = vshrq_n_u64(w64, (BITSHR) ? (BITSHR) : 1);             \
-        uint8x16_t packed = vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact);      \
-        vst1q_u8(out + ((i * (D_VAL)) >> 3), packed);                            \
+        vst1q_u8(out + ((i * (D_VAL)) >> 3),                                     \
+                 vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact));                \
     }                                                                            \
-    return i;                                                                    \
 }
 PIVCOH__PACK_DN(pivcoh__pack_d5, 5, 4, pivcoh__pack_compact_d5)
 PIVCOH__PACK_DN(pivcoh__pack_d6, 6, 0, pivcoh__pack_compact_d6)
@@ -1498,7 +1503,7 @@ PIVCOH__PACK_DN(pivcoh__pack_d7, 7, 4, pivcoh__pack_compact_d7)
  * needs no final shift.  32 codes in 11 uops; a 16-code remainder
  * runs the same body self-paired (6 valid output bytes, junk store
  * contract as everywhere). */
-static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
+static inline void pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
     static const int8_t shifts_p[16] = { 0,3, 0,3, 0,3, 0,3, 0,3, 0,3, 0,3, 0,3 };
     const int8x16_t shp = vld1q_s8(shifts_p);
@@ -1520,7 +1525,7 @@ static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uin
         vst1q_u8(out + ((i * 3) >> 3),
                  vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact));
     }
-    if (i + 16 <= n) {
+    for (; i < n; i += 16) {           /* <= 2 self-paired half-blocks */
         uint8x16_t b = vshlq_u8(vld1q_u8(ranks + i), shp);
         uint8x16_t pair = vsubq_u8(vpaddq_u8(b, b), b9);
         uint16x8_t w16 = vreinterpretq_u16_u8(vshlq_u8(pair, s1));
@@ -1528,63 +1533,41 @@ static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uin
         uint64x2_t w64 = vreinterpretq_u64_u32(vshlq_u32(w32, s3));
         vst1q_u8(out + ((i * 3) >> 3),
                  vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact));
-        i += 16;
     }
-    return i;
 }
 
-/* D=8: byte-aligned. */
-static inline int pivcoh__pack_d8(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
+/* D=8: byte-aligned; no blend needed — the junk bytes past n are all
+ * beyond the region, and there is no partial byte to zero-pad. */
+static inline void pivcoh__pack_d8(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
     uint8x16_t vb = vdupq_n_u8(base);
-    int i = 0;
-    for (; i + 16 <= n; i += 16)
+    for (int i = 0; i < n; i += 16)
         vst1q_u8(out + i, vsubq_u8(vld1q_u8(ranks + i), vb));
-    return i;
 }
 
-/* Dispatcher: SIMD per-D path + scalar tail (packs (rank - base) LSB-first). */
+/* Dispatcher: D is structural (1..8); every kernel packs all n codes. */
 static void pivcoh__pack_dN(uint8_t *out, const uint8_t *ranks,
                             int n, int D, uint8_t base)
 {
-    int total_bytes = (n * D + 7) >> 3;
-    if (total_bytes > 0) out[total_bytes - 1] = 0;
-
-    int i = 0;
     switch (D) {
     case 1: /* the D=1 bit IS the partition bit: reuse the bitmap build
              * (EMIT_RIGHT=0 never writes ranks; the cast is sound) */
             (void)pivcoh__part_core((uint8_t *)(uintptr_t)ranks, n, base,
                                     out, NULL, 0);
-            return;
-    case 2: i = pivcoh__pack_d2(out, ranks, n, base); break;
-    case 3: i = pivcoh__pack_d3(out, ranks, n, base); break;
-    case 4: i = pivcoh__pack_d4(out, ranks, n, base); break;
-    case 5: i = pivcoh__pack_d5(out, ranks, n, base); break;
-    case 6: i = pivcoh__pack_d6(out, ranks, n, base); break;
-    case 7: i = pivcoh__pack_d7(out, ranks, n, base); break;
-    case 8: i = pivcoh__pack_d8(out, ranks, n, base); break;
-    default: break;
+            break;
+    case 2: pivcoh__pack_d2(out, ranks, n, base); break;
+    case 3: pivcoh__pack_d3(out, ranks, n, base); break;
+    case 4: pivcoh__pack_d4(out, ranks, n, base); break;
+    case 5: pivcoh__pack_d5(out, ranks, n, base); break;
+    case 6: pivcoh__pack_d6(out, ranks, n, base); break;
+    case 7: pivcoh__pack_d7(out, ranks, n, base); break;
+    case 8: pivcoh__pack_d8(out, ranks, n, base); break;
     }
-    if (i >= n) return;
-
-    int bit_pos = i * D;
-    int byte_idx = bit_pos >> 3;
-    int bits_in_buf = bit_pos & 7;
-    uint64_t buf = bits_in_buf > 0
-        ? (uint64_t)out[byte_idx] & ((1u << bits_in_buf) - 1)
-        : 0;
-    for (; i < n; i++) {
-        uint32_t local = (uint32_t)(uint8_t)(ranks[i] - base);
-        buf |= (uint64_t)local << bits_in_buf;
-        bits_in_buf += D;
-        while (bits_in_buf >= 8) {
-            out[byte_idx++] = (uint8_t)(buf & 0xff);
-            buf >>= 8;
-            bits_in_buf -= 8;
-        }
-    }
-    if (bits_in_buf > 0) out[byte_idx] = (uint8_t)(buf & ((1u << bits_in_buf) - 1));
+    /* Zero the padding bits of the last partial byte (the kernels'
+     * final vector packed garbage there); one store-forwarded RMW,
+     * idempotent for D=1/8 whose padding is already exact. */
+    int rem_bits = (n * D) & 7;
+    if (rem_bits) out[(n * D) >> 3] &= (uint8_t)((1u << rem_bits) - 1);
 }
 
 /* ---- encode tree walk ----
