@@ -1450,16 +1450,20 @@ PIVCOH__PACK_DN(pivcoh__pack_d6, 6, 0, pivcoh__pack_compact_d6)
 PIVCOH__PACK_DN(pivcoh__pack_d7, 7, 4, pivcoh__pack_compact_d7)
 #undef PIVCOH__PACK_DN
 
-/* D=3: pair adjacent codes into 6-bit values (uzp1/uzp2 split even and
- * odd codes, one SLI fuses each pair), then run the D=6 pyramid on the
- * pairs -- the 3-bit LSB-first stream IS the 6-bit LSB-first stream of
- * its pairs, so the wire is unchanged, and D=6 needs no final shift.
- * 32 codes/iter at 12 ops vs 16 for two D=3 pyramid passes; a 16-code
- * remainder runs the same body self-paired (6 valid output bytes, junk
- * store contract as everywhere). */
+/* D=3: pair adjacent codes into 6-bit values the D=4 way — per-lane
+ * {0,3} shifts + one vpaddq (pair = c_even + 8 c_odd, one pair per
+ * byte), with the base subtract distributed through the mod-256
+ * pairing (- 9b, exact since the true pair < 64) — then run the D=6
+ * pyramid on the pairs: a 3-bit LSB-first stream IS the 6-bit
+ * LSB-first stream of its pairs, so the wire is unchanged, and D=6
+ * needs no final shift.  32 codes in 11 uops; a 16-code remainder
+ * runs the same body self-paired (6 valid output bytes, junk store
+ * contract as everywhere). */
 static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
-    const uint8x16_t vb = vdupq_n_u8(base);
+    static const int8_t shifts_p[16] = { 0,3, 0,3, 0,3, 0,3, 0,3, 0,3, 0,3, 0,3 };
+    const int8x16_t shp = vld1q_s8(shifts_p);
+    const uint8x16_t b9 = vdupq_n_u8((uint8_t)(9 * base));
     const int8x16_t s1 = vreinterpretq_s8_u16(vdupq_n_u16(2));
     const int16x8_t s2 = vreinterpretq_s16_u32(vdupq_n_u32(
         (uint32_t)(uint16_t)2 | ((uint32_t)(uint16_t)-2 << 16)));
@@ -1468,9 +1472,9 @@ static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uin
     const uint8x16_t compact = vld1q_u8(pivcoh__pack_compact_d6);
     int i = 0;
     for (; i + 32 <= n; i += 32) {
-        uint8x16_t a = vsubq_u8(vld1q_u8(ranks + i),      vb);
-        uint8x16_t b = vsubq_u8(vld1q_u8(ranks + i + 16), vb);
-        uint8x16_t pair = vsliq_n_u8(vuzp1q_u8(a, b), vuzp2q_u8(a, b), 3);
+        uint8x16_t b0 = vshlq_u8(vld1q_u8(ranks + i),      shp);
+        uint8x16_t b1 = vshlq_u8(vld1q_u8(ranks + i + 16), shp);
+        uint8x16_t pair = vsubq_u8(vpaddq_u8(b0, b1), b9);
         uint16x8_t w16 = vreinterpretq_u16_u8(vshlq_u8(pair, s1));
         uint32x4_t w32 = vreinterpretq_u32_u16(vshlq_u16(w16, s2));
         uint64x2_t w64 = vreinterpretq_u64_u32(vshlq_u32(w32, s3));
@@ -1478,8 +1482,8 @@ static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uin
                  vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact));
     }
     if (i + 16 <= n) {
-        uint8x16_t a = vsubq_u8(vld1q_u8(ranks + i), vb);
-        uint8x16_t pair = vsliq_n_u8(vuzp1q_u8(a, a), vuzp2q_u8(a, a), 3);
+        uint8x16_t b = vshlq_u8(vld1q_u8(ranks + i), shp);
+        uint8x16_t pair = vsubq_u8(vpaddq_u8(b, b), b9);
         uint16x8_t w16 = vreinterpretq_u16_u8(vshlq_u8(pair, s1));
         uint32x4_t w32 = vreinterpretq_u32_u16(vshlq_u16(w16, s2));
         uint64x2_t w64 = vreinterpretq_u64_u32(vshlq_u32(w32, s3));
