@@ -1489,44 +1489,6 @@ static int pivcoh__merge_cst_vec_x(const uint8_t *bm, int K, uint8_t left_sym,
                                    const uint8_t *r, int KR, uint8_t *out)
 { return pivcoh__mcv(bm, K, left_sym, r, KR, out, 1); }
 
-/* merge_cst_cst: both sides constant — a D=1 flat decode.  A 2-byte
- * (left, right) c2s replicated across 16 lanes, indexed by the bm bit
- * via the same dup-shuffle + per-lane shift as the D=2 unpack.  Two
- * tails like the flat kernels: tf runs 16-wide chunks to K with
- * save/restore (the last chunk reads <= 1 byte past the region, inside
- * the stream); tf=0 (a 2-symbol flat root) finishes scalar. */
-static const uint8_t pivcoh__two_dup_tab[16]   = {0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1};
-static const int8_t  pivcoh__two_shift_tab[16] = {0,-1,-2,-3,-4,-5,-6,-7,
-                                                  0,-1,-2,-3,-4,-5,-6,-7};
-static void pivcoh__merge_cst_cst(const uint8_t *bm, int K,
-                                  uint8_t left_sym, uint8_t right_sym,
-                                  uint8_t *out, int tf)
-{
-    uint16_t lr_word = (uint16_t)left_sym | ((uint16_t)right_sym << 8);
-    uint8x16_t c2s_vec = vreinterpretq_u8_u16(vdupq_n_u16(lr_word));
-    uint8x16_t dup_v   = vld1q_u8(pivcoh__two_dup_tab);
-    int8x16_t  shift_v = vld1q_s8(pivcoh__two_shift_tab);
-    uint8x16_t one_v   = vdupq_n_u8(1);
-    uint8x16_t keep = vdupq_n_u8(0);
-    if (tf) keep = vld1q_u8(out + K);
-
-    int j = 0, lim = tf ? K : K - 15;
-    for (; j < lim; j += 16) {
-        uint16_t bm_word; memcpy(&bm_word, bm + (j >> 3), 2);
-        uint8x16_t bm_lo = vreinterpretq_u8_u16(
-            vsetq_lane_u16(bm_word, vdupq_n_u16(0), 0));
-        uint8x16_t dup     = vqtbl1q_u8(bm_lo, dup_v);
-        uint8x16_t shifted = vshlq_u8(dup, shift_v);
-        uint8x16_t idx     = vandq_u8(shifted, one_v);
-        vst1q_u8(out + j, vqtbl1q_u8(c2s_vec, idx));
-    }
-    if (tf) { vst1q_u8(out + K, keep); return; }
-    for (; j < K; j++) {
-        int mb = (bm[j >> 3] >> (j & 7)) & 1;
-        out[j] = mb ? right_sym : left_sym;
-    }
-}
-
 /* ---- flat-subtree D-bit decode helpers ----
  *
  * Every flat kernel below has two tails, chosen by `tf` (tail-free):
@@ -1595,6 +1557,39 @@ static inline void pivcoh__d6_chunk16(uint8_t *dst, const uint8_t *src,
 }
 
 /* ---- per-D flat decodes (contiguous output) ---- */
+
+/* D=1 (8 codes/byte): the two symbols replicated across 16 lanes,
+ * indexed by the bm bit via the same dup-shuffle + per-lane shift as
+ * the D=2 unpack.  The tf chunks read <= 1 byte past the region
+ * (inside the stream); tf=0 (a 2-symbol flat root) finishes scalar. */
+static const uint8_t pivcoh__d1_dup_tab[16]   = {0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1};
+static const int8_t  pivcoh__d1_shift_tab[16] = {0,-1,-2,-3,-4,-5,-6,-7,
+                                                 0,-1,-2,-3,-4,-5,-6,-7};
+static void pivcoh__flat_d1(uint8_t *out, int n, const uint8_t *bm,
+                            const uint8_t *c2s, int tf)
+{
+    uint16_t lr_word; memcpy(&lr_word, c2s, 2);
+    uint8x16_t c2s_vec = vreinterpretq_u8_u16(vdupq_n_u16(lr_word));
+    uint8x16_t dup_v   = vld1q_u8(pivcoh__d1_dup_tab);
+    int8x16_t  shift_v = vld1q_s8(pivcoh__d1_shift_tab);
+    uint8x16_t one_v   = vdupq_n_u8(1);
+    uint8x16_t keep = vdupq_n_u8(0);
+    if (tf) keep = vld1q_u8(out + n);
+
+    int j = 0, lim = tf ? n : n - 15;
+    for (; j < lim; j += 16) {
+        uint16_t bm_word; memcpy(&bm_word, bm + (j >> 3), 2);
+        uint8x16_t bm_lo = vreinterpretq_u8_u16(
+            vsetq_lane_u16(bm_word, vdupq_n_u16(0), 0));
+        uint8x16_t dup     = vqtbl1q_u8(bm_lo, dup_v);
+        uint8x16_t shifted = vshlq_u8(dup, shift_v);
+        uint8x16_t idx     = vandq_u8(shifted, one_v);
+        vst1q_u8(out + j, vqtbl1q_u8(c2s_vec, idx));
+    }
+    if (tf) { vst1q_u8(out + n, keep); return; }
+    for (; j < n; j++)
+        out[j] = c2s[(bm[j >> 3] >> (j & 7)) & 1];
+}
 
 /* D=2 (4 codes/byte): 64/iter maps each input nibble straight to a
  * symbol pair via two prepped tables, interleaved back with vst4q.
@@ -1769,7 +1764,7 @@ static void pivcoh__merge_flat(uint8_t *out, int n, const uint8_t *bm, int D,
                                const uint8_t *c2s, int tf)
 {
     switch (D) {
-    case 1: pivcoh__merge_cst_cst(bm, n, c2s[0], c2s[1], out, tf); break;
+    case 1: pivcoh__flat_d1(out, n, bm, c2s, tf); break;
     case 2: pivcoh__flat_d2(out, n, bm, c2s, tf); break;
     case 3: pivcoh__flat_d3(out, n, bm, c2s, tf); break;
     case 4: pivcoh__flat_d4(out, n, bm, c2s, tf); break;
