@@ -1,20 +1,25 @@
-/* pivcoh.h - v2.0 - single-file PIVCO-Huffman block codec, NEON edition
+/* pivcoh.h - v3.0 - single-file PIVCO-Huffman block codec, NEON edition
  *
- * A minimal, allocation-free-capable implementation of the
+ * A minimal, allocation-free-capable, VLA-free implementation of the
  * PIVCO-Huffman wire format (https://github.com/MarcinZukowski/pivco-huffman).
- * This edition is aarch64-only: it carries straight ports of the
+ * This edition is aarch64-only: it began as straight ports of the
  * production library's NEON kernels (SABD two-table merge, per-D flat
- * decode, p16rev partition, ryg flat pack) and the production decoder's
- * bump-arena buffer placement, so decode/encode speed tracks the real
- * library rather than a portable-scalar floor.  ~53 KiB of static
- * shuffle tables build lazily on first use — the writes are idempotent,
- * so concurrent first calls are benign.
+ * decode, p16rev partition) and has since evolved past them — every
+ * kernel is fully tail-free (whole vectors end to end; the only scalar
+ * remnants are the root merge's exact stores into the caller's buffer
+ * and the flat-root extractor), decode ping-pongs two buffers instead
+ * of growing an arena, and the flat pack runs a converging-shift
+ * pyramid.  Encode and decode meet or beat the production codec on
+ * every measured distribution.  ~24 KiB of static shuffle tables build
+ * lazily on first use — the writes are idempotent, so concurrent first
+ * calls are benign.
  * Streams are byte-identical to the full library's PH-only mode (wire
  * v0.7 decode-order layout; raw bitmaps —
  * pivco_huffman_set_fse_enabled(0), which is also what the pivcohuf
  * tool's default non-ANS format uses; "optimized" tree shaping, max
- * code length 11).  FSE/ANS-coded blocks are not supported and are
- * rejected on decode.
+ * code length 11) for histograms totalling < 4 GiB — see
+ * pivcoh_table_from_freqs.  FSE/ANS-coded blocks are not supported and
+ * are rejected on decode.
  *
  * Do this in ONE C file to create the implementation:
  *     #define PIVCOH_IMPLEMENTATION
@@ -101,8 +106,9 @@ typedef struct {
     uint16_t num_ranks, sched_len;
     uint8_t rank_to_sym[256], sym_to_rank[256];
     pivcoh__rec sched[60];   /* Kraft-complete max is 59 records (33 chunks,
-                                27 with bit >= 1); +1 so gen's overflow guard
-                                can't fire mid-walk on a maximal table */
+                                27 with bit >= 1); +1 so the schedule render's
+                                cap check can't fire mid-walk on a maximal
+                                table */
 } pivcoh_table;
 
 /* Build a table from symbol frequencies (encoder side).  Derives optimal
@@ -1640,7 +1646,11 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
     pivcoh__init_enc();
     uint8_t *sc = scratch ? (uint8_t *)scratch : (uint8_t *)malloc(PIVCOH_SCRATCH_SIZE(n));
     if (!sc) return -1;
-    uint8_t *ranks = sc, *tmp = sc + n + 64;   /* +64: partition tail overstore */
+    uint8_t *ranks = sc, *tmp = sc + n + 64;   /* +64: the root ranks' overshoot
+                                                  gap (the tail-free partition
+                                                  strays <= 63 B past a ranks
+                                                  region; children get the same
+                                                  gap in enc_node) */
     pivcoh__enc_init(ranks, (int)n, in, t->sym_to_rank);
     uint8_t *p = out;
     *p++ = (uint8_t)n;
