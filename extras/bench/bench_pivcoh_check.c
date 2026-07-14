@@ -255,6 +255,79 @@ int main(void)
              n_solve, n_adopt);
     }
 
+    /* One-shot frame API: roundtrip across sizes and efforts, scratch/
+     * malloc determinism, packed-lens equivalence, histogram vs naive,
+     * hostile frame fuzz. */
+    { const char *tag = "frame"; int id = 0;
+      enum { FN_MAX = 1 << 20 };
+      static uint8_t fsrc[FN_MAX], fdst[PIVCOH_COMPRESS_BOUND(FN_MAX)];
+      static uint8_t fdst2[PIVCOH_COMPRESS_BOUND(FN_MAX)], fout[FN_MAX];
+      static uint8_t cscratch[PIVCOH_COMPRESS_SCRATCH_SIZE];
+      static uint8_t dscratch2[PIVCOH_DECOMPRESS_SCRATCH_SIZE];
+      static const size_t FNS[] = { 0, 1, 2, 100, 4096, 32768, 32769,
+                                    100000, FN_MAX };
+      static const pivcoh_effort EF[] = { PIVCOH_FASTEST_COMPRESS,
+                                          PIVCOH_BALANCED,
+                                          PIVCOH_FASTER_DECOMPRESS,
+                                          PIVCOH_FASTEST_DECOMPRESS };
+      int n_frames = 0;
+      for (size_t fi = 0; fi < sizeof(FNS) / sizeof(*FNS); fi++) {
+          const size_t N = FNS[fi];
+          id = (int)N;
+          int nsym = 1 + (int)(rng() % 255);
+          for (size_t i = 0; i < N; i++)
+              fsrc[i] = (uint8_t)(rng() % (uint64_t)nsym);
+          for (size_t ei = 0; ei < sizeof(EF) / sizeof(*EF); ei++) {
+              ptrdiff_t c = pivcoh_compress(fdst, sizeof(fdst), fsrc, N,
+                                            EF[ei], cscratch);
+              if (c < 0) FAIL("compress effort=%d", (int)EF[ei]);
+              ptrdiff_t c2 = pivcoh_compress(fdst2, sizeof(fdst2), fsrc, N,
+                                             EF[ei], NULL);
+              if (c2 != c || memcmp(fdst, fdst2, (size_t)c))
+                  FAIL("compress scratch/malloc differ effort=%d", (int)EF[ei]);
+              if (pivcoh_decompressed_size(fdst, (size_t)c) != N)
+                  FAIL("decompressed_size");
+              memset(fout, 0xAA, N ? N : 1);
+              ptrdiff_t r = pivcoh_decompress(fout, N, fdst, (size_t)c,
+                                              dscratch2);
+              if (r != (ptrdiff_t)N || memcmp(fout, fsrc, N))
+                  FAIL("frame roundtrip effort=%d", (int)EF[ei]);
+              if (pivcoh_decompress(fout, N, fdst, (size_t)c, NULL)
+                      != (ptrdiff_t)N)
+                  FAIL("frame roundtrip (malloc)");
+              n_frames++;
+              /* hostile: bit flips + truncations must never crash and
+               * never write past raw_size (ASan enforces both) */
+              for (int f = 0; f < 30; f++) {
+                  memcpy(fdst2, fdst, (size_t)c);
+                  fdst2[rng() % (uint64_t)c] ^= (uint8_t)(1u << (rng() & 7));
+                  (void)pivcoh_decompress(fout, N, fdst2, (size_t)c, dscratch2);
+                  (void)pivcoh_decompress(fout, N, fdst,
+                                          rng() % ((uint64_t)c + 1), dscratch2);
+              }
+          }
+      }
+      /* utilities: packed lens roundtrip + fused build; histogram */
+      { id = 0;
+        uint8_t packed[128], lens[256];
+        pivcoh_lens_pack(packed, mini.code_len);
+        pivcoh_lens_unpack(lens, packed);
+        if (memcmp(lens, mini.code_len, 256)) FAIL("lens pack/unpack");
+        pivcoh_table pt, lt;
+        memset(&pt, 0, sizeof(pt)); memset(&lt, 0, sizeof(lt));
+        if (!pivcoh_table_from_packed_lens(&pt, packed) ||
+            !pivcoh_table_from_lens(&lt, mini.code_len) ||
+            memcmp(&pt, &lt, sizeof(pt)))
+            FAIL("from_packed_lens != from_lens");
+        uint64_t h1[256] = {0}, h4[256];
+        for (size_t i = 0; i < 100000; i++) h1[fsrc[i]]++;
+        pivcoh_histogram(h4, fsrc, 100000);
+        if (memcmp(h1, h4, sizeof(h1))) FAIL("histogram mismatch");
+      }
+      printf("pivcoh frame: %d frames round-tripped (all efforts), "
+             "utilities consistent\n", n_frames);
+    }
+
     printf("pivcoh check PASS: %d tables, %d blocks wire-identical + cross-decoded, "
            "%d hostile decodes survived\n", n_tables, n_blocks, n_fuzz);
     return 0;
