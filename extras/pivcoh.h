@@ -1980,12 +1980,15 @@ static void pivcoh__init_enc(void)
     built = 1;
 }
 
-/* 8 partition mask bytes for 64 ranks, packed LE into a u64 via one
- * vpaddq reduction tree (each lane holds its bit-weight after the
- * vcgt+and, so 4 pairwise adds collapse every chunk to one byte). */
-static inline uint64_t pivcoh__masks64(uint8x16_t v0, uint8x16_t v1,
-                                       uint8x16_t v2, uint8x16_t v3,
-                                       uint8x16_t vt, uint8x16_t bw)
+/* 8 partition mask bytes for 64 ranks via one vpaddq reduction tree
+ * (each lane holds its bit-weight after the vcgt+and, so 4 pairwise
+ * adds collapse every chunk to one byte).  Returned SIMD-side: the
+ * callers vcnt the byte popcounts BEFORE the lane move, so the cursor
+ * chain never round-trips GPR->SIMD (that fmov costs a load-port uop
+ * and ~6 cycles mid-chain). */
+static inline uint8x8_t pivcoh__masks64v(uint8x16_t v0, uint8x16_t v1,
+                                         uint8x16_t v2, uint8x16_t v3,
+                                         uint8x16_t vt, uint8x16_t bw)
 {
     uint8x16_t w0 = vandq_u8(vcgtq_u8(v0, vt), bw);
     uint8x16_t w1 = vandq_u8(vcgtq_u8(v1, vt), bw);
@@ -1994,8 +1997,15 @@ static inline uint64_t pivcoh__masks64(uint8x16_t v0, uint8x16_t v1,
     uint8x16_t t0 = vpaddq_u8(w0, w1);
     uint8x16_t t1 = vpaddq_u8(w2, w3);
     uint8x16_t u0 = vpaddq_u8(t0, t1);
-    uint8x16_t r  = vpaddq_u8(u0, u0);
-    return vget_lane_u64(vreinterpret_u64_u8(vget_low_u8(r)), 0);
+    return vget_low_u8(vpaddq_u8(u0, u0));
+}
+
+static inline uint64_t pivcoh__masks64(uint8x16_t v0, uint8x16_t v1,
+                                       uint8x16_t v2, uint8x16_t v3,
+                                       uint8x16_t vt, uint8x16_t bw)
+{
+    return vget_lane_u64(vreinterpret_u64_u8(
+               pivcoh__masks64v(v0, v1, v2, v3, vt, bw)), 0);
 }
 
 /* ranks[i] = s2r[sym[i]]: the s2r table lives in 16 NEON regs; each
@@ -2054,11 +2064,9 @@ static inline uint32_t pivcoh__movemask16(uint8x16_t cm)
  * Returns the group-set's right count. */
 __attribute__((always_inline)) static inline
 int pivcoh__part64_full(uint8x16_t v0, uint8x16_t v1, uint8x16_t v2,
-                        uint8x16_t v3, uint64_t mask_word,
+                        uint8x16_t v3, uint64_t mask_word, uint64_t pcw,
                         uint8_t *ldst, uint8_t *rdst)
 {
-    uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(
-                       vcnt_u8(vcreate_u8(mask_word))), 0);
     uint64_t pfx = pcw * 0x0101010101010101ULL;
     uint8x16_t vg[4] = { v0, v1, v2, v3 };
     static const uint8_t rev16_a[16] = {15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0};
@@ -2094,17 +2102,37 @@ static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
     uint8x16_t vt = vdupq_n_u8(thr);
     static const uint8_t bw_a[16] = {1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
     uint8x16_t bw = vld1q_u8(bw_a);
-    for (; j + 64 <= n; j += 64) {
-        uint8x16_t v0 = vld1q_u8(ranks + j);
-        uint8x16_t v1 = vld1q_u8(ranks + j + 16);
-        uint8x16_t v2 = vld1q_u8(ranks + j + 32);
-        uint8x16_t v3 = vld1q_u8(ranks + j + 48);
-        uint64_t w = pivcoh__masks64(v0, v1, v2, v3, vt, bw);
+    /* Software-pipelined one iteration deep, like the decode merges:
+     * the carried chain (loads -> cgt -> three serial vpaddq -> lane
+     * moves -> multiply -> cursors) is ~2x the loop's port work, so
+     * the NEXT group-set's masks and popcounts start under the current
+     * scatter. */
+    if (j + 64 <= n) {
+        uint8x16_t c0 = vld1q_u8(ranks + j),      c1 = vld1q_u8(ranks + j + 16);
+        uint8x16_t c2 = vld1q_u8(ranks + j + 32), c3 = vld1q_u8(ranks + j + 48);
+        uint8x8_t mv = pivcoh__masks64v(c0, c1, c2, c3, vt, bw);
+        uint64_t w   = vget_lane_u64(vreinterpret_u64_u8(mv), 0);
+        uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(mv)), 0);
+        for (; j + 128 <= n; j += 64) {
+            uint8x16_t n0 = vld1q_u8(ranks + j + 64), n1 = vld1q_u8(ranks + j + 80);
+            uint8x16_t n2 = vld1q_u8(ranks + j + 96), n3 = vld1q_u8(ranks + j + 112);
+            uint8x8_t nmv = pivcoh__masks64v(n0, n1, n2, n3, vt, bw);
+            uint64_t nw   = vget_lane_u64(vreinterpret_u64_u8(nmv), 0);
+            uint64_t npcw = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(nmv)), 0);
+            memcpy(bm + (j >> 3), &w, 8);
+            int tr = pivcoh__part64_full(c0, c1, c2, c3, w, pcw,
+                                         ranks + n_left, tmp + n_right);
+            n_right += tr;
+            n_left  += 64 - tr;
+            c0 = n0; c1 = n1; c2 = n2; c3 = n3;
+            w = nw; pcw = npcw;
+        }
         memcpy(bm + (j >> 3), &w, 8);
-        int tr = pivcoh__part64_full(v0, v1, v2, v3, w,
+        int tr = pivcoh__part64_full(c0, c1, c2, c3, w, pcw,
                                      ranks + n_left, tmp + n_right);
         n_right += tr;
         n_left  += 64 - tr;
+        j += 64;
     }
     /* Narrow tail: one 16-rank group per step (the 64-wide group-set is
      * heavy for the 1..20-rank tails deep trees are made of).  The
@@ -2136,10 +2164,9 @@ static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
  * Returns the group-set's right count. */
 __attribute__((always_inline)) static inline
 int pivcoh__part64_right(uint8x16_t v0, uint8x16_t v1, uint8x16_t v2,
-                         uint8x16_t v3, uint64_t mask_word, uint8_t *rdst)
+                         uint8x16_t v3, uint64_t mask_word, uint64_t pcw,
+                         uint8_t *rdst)
 {
-    uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(
-                       vcnt_u8(vcreate_u8(mask_word))), 0);
     uint64_t pfx = pcw * 0x0101010101010101ULL;
     uint8x8_t cv[8] = {
         vget_low_u8(v0), vget_high_u8(v0),
@@ -2158,30 +2185,37 @@ int pivcoh__part64_right(uint8x16_t v0, uint8x16_t v1, uint8x16_t v2,
     return (int)(pfx >> 56);
 }
 
-/* One-sided (right/none) partition: bitmap always, right side compacted
- * into tmp when EMIT_RIGHT (the left side of a LEAF_LEFT node is dead).
- * EMIT_RIGHT=0 folds to a pure bitmap build (the D=1 flat pack, whose
- * `bm` is the STREAM: the tail's whole-word store rides the packs'
- * junk-byte contract there).  Tail-free like part_full. */
-__attribute__((always_inline)) static inline
-int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
-                      uint8_t *bm, uint8_t *tmp, int EMIT_RIGHT)
+/* One-sided partition: bitmap + the right side compacted into tmp (a
+ * LEAF_LEFT node's left side is dead).  Tail-free and pipelined like
+ * part_full.  (The old EMIT_RIGHT=0 pure-bitmap mode moved into the
+ * dedicated pack_d1.) */
+static int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
+                             uint8_t *bm, uint8_t *tmp)
 {
     int n_right = 0, j = 0;
     uint8x16_t vt = vdupq_n_u8(thr);
     static const uint8_t bw_a[16] = {1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
     uint8x16_t bw = vld1q_u8(bw_a);
-    for (; j + 64 <= n; j += 64) {
-        uint8x16_t v0 = vld1q_u8(ranks + j);
-        uint8x16_t v1 = vld1q_u8(ranks + j + 16);
-        uint8x16_t v2 = vld1q_u8(ranks + j + 32);
-        uint8x16_t v3 = vld1q_u8(ranks + j + 48);
-        uint64_t w = pivcoh__masks64(v0, v1, v2, v3, vt, bw);
+    if (j + 64 <= n) {
+        uint8x16_t c0 = vld1q_u8(ranks + j),      c1 = vld1q_u8(ranks + j + 16);
+        uint8x16_t c2 = vld1q_u8(ranks + j + 32), c3 = vld1q_u8(ranks + j + 48);
+        uint8x8_t mv = pivcoh__masks64v(c0, c1, c2, c3, vt, bw);
+        uint64_t w   = vget_lane_u64(vreinterpret_u64_u8(mv), 0);
+        uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(mv)), 0);
+        for (; j + 128 <= n; j += 64) {
+            uint8x16_t n0 = vld1q_u8(ranks + j + 64), n1 = vld1q_u8(ranks + j + 80);
+            uint8x16_t n2 = vld1q_u8(ranks + j + 96), n3 = vld1q_u8(ranks + j + 112);
+            uint8x8_t nmv = pivcoh__masks64v(n0, n1, n2, n3, vt, bw);
+            uint64_t nw   = vget_lane_u64(vreinterpret_u64_u8(nmv), 0);
+            uint64_t npcw = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(nmv)), 0);
+            memcpy(bm + (j >> 3), &w, 8);
+            n_right += pivcoh__part64_right(c0, c1, c2, c3, w, pcw, tmp + n_right);
+            c0 = n0; c1 = n1; c2 = n2; c3 = n3;
+            w = nw; pcw = npcw;
+        }
         memcpy(bm + (j >> 3), &w, 8);
-        if (EMIT_RIGHT)
-            n_right += pivcoh__part64_right(v0, v1, v2, v3, w, tmp + n_right);
-        else
-            n_right += __builtin_popcountll(w);
+        n_right += pivcoh__part64_right(c0, c1, c2, c3, w, pcw, tmp + n_right);
+        j += 64;
     }
     /* Narrow tail, as in part_full. */
     for (; j < n; j += 16) {
@@ -2190,16 +2224,12 @@ int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
         uint32_t m = pivcoh__movemask16(vcgtq_u8(v, vt)) & ((1u << keep) - 1);
         uint16_t m16 = (uint16_t)m;
         memcpy(bm + (j >> 3), &m16, 2);
-        if (EMIT_RIGHT) {
-            vst1_u8(tmp + n_right,
-                    vtbl1_u8(vget_low_u8(v), vld1_u8(pivcoh__ctab8[m & 0xFF])));
-            n_right += __builtin_popcount(m & 0xFF);
-            vst1_u8(tmp + n_right,
-                    vtbl1_u8(vget_high_u8(v), vld1_u8(pivcoh__ctab8[m >> 8])));
-            n_right += __builtin_popcount(m >> 8);
-        } else {
-            n_right += __builtin_popcount(m);
-        }
+        vst1_u8(tmp + n_right,
+                vtbl1_u8(vget_low_u8(v), vld1_u8(pivcoh__ctab8[m & 0xFF])));
+        n_right += __builtin_popcount(m & 0xFF);
+        vst1_u8(tmp + n_right,
+                vtbl1_u8(vget_high_u8(v), vld1_u8(pivcoh__ctab8[m >> 8])));
+        n_right += __builtin_popcount(m >> 8);
     }
     return n_right;
 }
@@ -2471,7 +2501,7 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
     uint8_t *bm_stage = tmp;
     uint8_t *rout = tmp + nbytes + 8;
     int n_right = (kind == PIVCOH__LEAFL)
-        ? pivcoh__part_core(ranks, n, rec->param, bm_stage, rout, 1)
+        ? pivcoh__part_core(ranks, n, rec->param, bm_stage, rout)
         : pivcoh__part_full(ranks, n, rec->param, bm_stage, rout);
     int n_left = n - n_right;
     *p++ = (uint8_t)n_right;                   /* K_right, u16 LE */
