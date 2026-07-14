@@ -1388,7 +1388,8 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
     return i;
 }
 
-/* D=3/5/6/7: variable-shift pack, 16 codes/iter.  At each width the two
+/* D=5/6/7: variable-shift pack, 16 codes/iter (D=3 pairs itself into
+ * D=6 below and rides the same pyramid).  At each width the two
  * halves of a lane pair are shifted TOWARD each other with one USHL of
  * {+s, -s} per-lane counts — the even half's top bit and the odd
  * half's bottom bit meet at the lane boundary — so each pairing level
@@ -1399,8 +1400,7 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
  *   L3 u32 {16-2D, -(16-2D)}:   u64 = octet << (32-4D)
  * The compact shuffle absorbs the whole bytes of the final (32-4D)
  * re-basing shift (its tables start at byte 1 for D=5/6), leaving a
- * residual >> 4 for D=3/5/7 (D=3's tables start at byte 2: 32-4D = 20
- * bits) and NO final shift for D=6 -- 3-4 shift ops,
+ * residual >> 4 for D=5/7 and NO final shift for D=6 -- 3-4 shift ops,
  * count vectors are vdups of computed constants.  (Byte-aligning the
  * fields EARLY so the tbl can also do the u64 level -- e.g. D=6's
  * 24-bit quad at [0,24) -- costs a shr+sli pair per level, one op
@@ -1412,10 +1412,6 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
  * 16-2D trailing junk bytes, overwritten by the next iter / next
  * record (the caller's out_cap >= PIVCOH_ENCODE_BOUND keeps even the
  * last one in bounds). */
-static const uint8_t pivcoh__pack_compact_d3[16] = {
-    2, 3, 4,   10, 11, 12,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
-};
 static const uint8_t pivcoh__pack_compact_d5[16] = {
     1, 2, 3, 4, 5,   9, 10, 11, 12, 13,  0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 };
@@ -1449,11 +1445,50 @@ static inline int NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base) 
     }                                                                            \
     return i;                                                                    \
 }
-PIVCOH__PACK_DN(pivcoh__pack_d3, 3, 4, pivcoh__pack_compact_d3)
 PIVCOH__PACK_DN(pivcoh__pack_d5, 5, 4, pivcoh__pack_compact_d5)
 PIVCOH__PACK_DN(pivcoh__pack_d6, 6, 0, pivcoh__pack_compact_d6)
 PIVCOH__PACK_DN(pivcoh__pack_d7, 7, 4, pivcoh__pack_compact_d7)
 #undef PIVCOH__PACK_DN
+
+/* D=3: pair adjacent codes into 6-bit values (uzp1/uzp2 split even and
+ * odd codes, one SLI fuses each pair), then run the D=6 pyramid on the
+ * pairs -- the 3-bit LSB-first stream IS the 6-bit LSB-first stream of
+ * its pairs, so the wire is unchanged, and D=6 needs no final shift.
+ * 32 codes/iter at 12 ops vs 16 for two D=3 pyramid passes; a 16-code
+ * remainder runs the same body self-paired (6 valid output bytes, junk
+ * store contract as everywhere). */
+static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
+{
+    const uint8x16_t vb = vdupq_n_u8(base);
+    const int8x16_t s1 = vreinterpretq_s8_u16(vdupq_n_u16(2));
+    const int16x8_t s2 = vreinterpretq_s16_u32(vdupq_n_u32(
+        (uint32_t)(uint16_t)2 | ((uint32_t)(uint16_t)-2 << 16)));
+    const int32x4_t s3 = vreinterpretq_s32_u64(vdupq_n_u64(
+        (uint64_t)(uint32_t)4 | ((uint64_t)(uint32_t)-4 << 32)));
+    const uint8x16_t compact = vld1q_u8(pivcoh__pack_compact_d6);
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        uint8x16_t a = vsubq_u8(vld1q_u8(ranks + i),      vb);
+        uint8x16_t b = vsubq_u8(vld1q_u8(ranks + i + 16), vb);
+        uint8x16_t pair = vsliq_n_u8(vuzp1q_u8(a, b), vuzp2q_u8(a, b), 3);
+        uint16x8_t w16 = vreinterpretq_u16_u8(vshlq_u8(pair, s1));
+        uint32x4_t w32 = vreinterpretq_u32_u16(vshlq_u16(w16, s2));
+        uint64x2_t w64 = vreinterpretq_u64_u32(vshlq_u32(w32, s3));
+        vst1q_u8(out + ((i * 3) >> 3),
+                 vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact));
+    }
+    if (i + 16 <= n) {
+        uint8x16_t a = vsubq_u8(vld1q_u8(ranks + i), vb);
+        uint8x16_t pair = vsliq_n_u8(vuzp1q_u8(a, a), vuzp2q_u8(a, a), 3);
+        uint16x8_t w16 = vreinterpretq_u16_u8(vshlq_u8(pair, s1));
+        uint32x4_t w32 = vreinterpretq_u32_u16(vshlq_u16(w16, s2));
+        uint64x2_t w64 = vreinterpretq_u64_u32(vshlq_u32(w32, s3));
+        vst1q_u8(out + ((i * 3) >> 3),
+                 vqtbl1q_u8(vreinterpretq_u8_u64(w64), compact));
+        i += 16;
+    }
+    return i;
+}
 
 /* D=8: byte-aligned. */
 static inline int pivcoh__pack_d8(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
