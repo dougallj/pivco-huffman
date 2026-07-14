@@ -115,9 +115,13 @@ typedef struct {
                           pass entirely (plain Huffman lengths) */
     int   gran;        /* solve tier: 0 auto (exact DP to 64 symbols, then
                           grouped; always ~<= 10 us), 1 exact DP (~100 us
-                          worst case), 2/4/8 fixed grouping, -1 greedy
-                          nudger (~2 us, no DP, about half the win).
-                          Other values behave as 0. */
+                          worst case), 2/4/8 fixed grouping, -1 coarse auto
+                          (one grouping step chunkier, ~2-4 us: most of
+                          auto's decode win at a fraction of its encode
+                          cost -- it replaced a greedy nudger that the
+                          coarse DP dominated once the guard's near-
+                          incompressible waiver landed).  Other values
+                          behave as 0. */
     float guard_bits;  /* adopt only if modeled bits <= guard_bits * baseline */
     float guard_time;  /* ... and modeled decode time <= guard_time * baseline;
                           otherwise the plain Huffman lengths are kept */
@@ -761,8 +765,8 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
          * runs first (it holds the only same-row read). */
         /* NB the production source declares this constant and then never
          * adds it — its DP under-prices b = 0 takes by the per-record
-         * gamma surcharge (the nudge scorer and the guard both charge
-         * it).  Fixed here: the fold's take cost carries + tcz. */
+         * gamma surcharge, which the guard then charges.  Fixed here:
+         * the fold's take cost carries + tcz. */
         const float a0 = (float)((double)L * (1.0 + lam) + lam * kap[0]);
         const float tcz = (float)tc0;
         for (int tp = thi[L + 1]; tp >= tlo[L + 1]; tp--) {
@@ -833,150 +837,6 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
     }
     free(own);
     return J;
-}
-
-/* ---- greedy boundary nudger (gran -1): no DP ----
- *
- * The DP acts as a boundary nudger that rounds class counts to few
- * powers of two on a nearly degenerate objective.  Do that directly:
- * one shallow-to-deep walk with the slot ledger, at each level choosing
- * among a handful of low-popcount roundings of the baseline class
- * count inside the feasibility window, scored by the exact chunk cost
- * of this level plus a clamped-baseline rollout of the rest (a
- * one-level lookahead systematically walks into corners).  ~2 us; the
- * adoption guard rejects any bad pick.
- *
- * Feasibility window at level L (h levels below, s open slots, rest
- * symbols unplaced): capacity below needs c <= (s*2^h - rest)/(2^h - 1)
- * (leaves taken now eat slots the remainder needs); completeness
- * (every open slot must eventually host >= 1 leaf) needs c >= 2s - rest.
- * Given the invariants s <= rest <= s*2^h the window is provably
- * nonempty at every level, and any in-window choice preserves them, so
- * the walk cannot die.  At h = 0 it collapses to c = rest = s. */
-static inline int pivcoh__jl_clamp(int c, int s, int rest, int h)
-{
-    int hi = s < rest ? s : rest;
-    int lo = 0;
-    if (h == 0)
-        return rest <= hi ? rest : -1;
-    const long cap = (((long)s << h) - rest) / ((1l << h) - 1);
-    if (cap < hi) hi = (int)cap;
-    const long l2 = 2l * s - rest;
-    if (l2 > 0) lo = (int)l2;
-    if (lo > hi) return -1;
-    return c < lo ? lo : c > hi ? hi : c;
-}
-
-/* Exact chunk cost of placing count c at level L on prefix [k, k+c);
- * bits are dealt in the within-level cost order ord[0..nord). */
-static inline double pivcoh__jl_ccost(const double *P, int k, int c, int L,
-                                      double lam, const double *kap,
-                                      const int *ord, int nord,
-                                      double tc0, double tc1)
-{
-    double sc = 0;
-    int off = 0;
-    for (int oi = 0; oi < nord; oi++) {
-        const int b = ord[oi];
-        if (c & (1 << b)) {
-            sc += (P[k + off + (1 << b)] - P[k + off])
-                * ((double)L + lam * ((double)(L - b) + kap[b]))
-                + (b == 0 ? tc0 : tc1);
-            off += 1 << b;
-        }
-    }
-    return sc;
-}
-
-/* Complete the walk from (k, s) at level L0 following the clamped
- * baseline counts; the exact modeled cost of that completion is the
- * lookahead score for candidate choices. */
-static double pivcoh__jl_rollout(const double *P, int sigma, double lam,
-                                 const double *kap, const int *ord, int nord,
-                                 double tc0, double tc1,
-                                 const int cls_n[PIVCOH__MAXLEN + 1],
-                                 int k, int s, int L0)
-{
-    double cost = 0;
-    for (int L = L0; L <= PIVCOH__MAXLEN; L++) {
-        const int c = pivcoh__jl_clamp(cls_n[L], s, sigma - k,
-                                       PIVCOH__MAXLEN - L);
-        if (c < 0) return INFINITY;
-        cost += pivcoh__jl_ccost(P, k, c, L, lam, kap, ord, nord, tc0, tc1);
-        k += c;
-        s = 2 * (s - c);
-    }
-    return cost;
-}
-
-static double pivcoh__jl_nudge(const double *P, int sigma, double lam,
-                               const double *kap, double tc0, double tc1,
-                               const int base[PIVCOH__MAXLEN + 1],
-                               uint16_t out_BL[PIVCOH__MAXLEN + 1])
-{
-    /* Within-level deal order under kappa: all b in 0..8 by ascending
-     * g(b) = lam*(kap[b] - b) — no validity condition; the nudger is a
-     * heuristic and the guard re-scores its output. */
-    int ord[9];
-    int n = 0;
-    for (int b = 0; b <= 8; b++) {
-        double gb = lam * (kap[b] - (double)b);
-        int i = n++;
-        while (i > 0) {
-            double gp = lam * (kap[ord[i - 1]] - (double)ord[i - 1]);
-            if (gp > gb || (gp == gb && ord[i - 1] < b)) {
-                ord[i] = ord[i - 1];
-                i--;
-            } else break;
-        }
-        ord[i] = b;
-    }
-    /* Score with lambda inflated 1.5x: greedy under-commits to
-     * flattening relative to the DP, and the guard judges with the
-     * REAL lambda anyway, so biasing the search toward flatter shapes
-     * raises adoption without risking quality.  (tc0/tc1 stay honest.) */
-    lam *= 1.5;
-    double total = 0;
-    int k = 0, s = 2;
-    for (int L = 1; L <= PIVCOH__MAXLEN; L++) {
-        const int c0 = pivcoh__jl_clamp(base[L], s, sigma - k,
-                                        PIVCOH__MAXLEN - L);
-        if (c0 < 0) return -1.0;             /* cannot happen from a
-                                              * valid baseline */
-        /* candidates: clamped baseline, its 1- and 2-bit
-         * down-roundings, the next power of two up, and 0 (kill the
-         * level), each re-clamped */
-        int cand[5], nc = 0;
-        cand[nc++] = c0;
-        if (c0 > 0) {
-            const int top = 1 << (31 - __builtin_clz((unsigned)c0));
-            const int lowmask = c0 & ~top;
-            cand[nc++] = top;
-            if (lowmask)
-                cand[nc++] = top | (1 << (31 - __builtin_clz((unsigned)lowmask)));
-            if (top != c0)
-                cand[nc++] = top << 1;
-            cand[nc++] = 0;
-        }
-        double bestsc = INFINITY;
-        int bestc = c0;
-        int prev = -1;
-        for (int i = 0; i < nc; i++) {
-            int c = pivcoh__jl_clamp(cand[i], s, sigma - k, PIVCOH__MAXLEN - L);
-            if (c < 0 || c == prev) continue;
-            prev = c;
-            const double sc = pivcoh__jl_ccost(P, k, c, L, lam, kap,
-                                               ord, n, tc0, tc1)
-                + pivcoh__jl_rollout(P, sigma, lam, kap, ord, n, tc0, tc1,
-                                     base, k + c, 2 * (s - c), L + 1);
-            if (sc < bestsc) { bestsc = sc; bestc = c; }
-        }
-        out_BL[L] = (uint16_t)bestc;   /* binary decomposition == bits */
-        total += pivcoh__jl_ccost(P, k, bestc, L, lam, kap, ord, n, tc0, tc1);
-        k += bestc;
-        s = 2 * (s - bestc);
-    }
-    return total;
 }
 
 /* Core over the build's leaf array (ascending — reversed in place
@@ -1058,8 +918,10 @@ static int pivcoh__jl_core(pivcoh__leaf *sf, int sigma,
     int gran = jp->gran;
     if (gran != -1 && gran != 1 && gran != 2 && gran != 4 && gran != 8)
         gran = 0;
-    if (gran == 0)   /* auto: keep the solve ~<= 10 us at every sigma */
+    if (gran == 0)        /* auto: keep the solve ~<= 10 us at every sigma */
         gran = sigma <= 64 ? 1 : sigma <= 128 ? 2 : 4;
+    else if (gran == -1)  /* coarse auto: one granularity step chunkier */
+        gran = sigma <= 64 ? 2 : sigma <= 128 ? 4 : 8;
     int obuf[8], on;
     if (gran > 1 && (sigma < 8 * gran
                      || !pivcoh__jl_order(lam,
@@ -1082,10 +944,7 @@ static int pivcoh__jl_core(pivcoh__leaf *sf, int sigma,
     }
 
     uint16_t BL[PIVCOH__MAXLEN + 1] = {0};
-    if (gran == -1) {
-        if (pivcoh__jl_nudge(P, sigma, lam, kap, tc0, tc1, cls_n, BL) < 0)
-            return -1;
-    } else if (glog) {
+    if (glog) {
         double Pg[130];
         const int sp = sigma_pad / gran;
         for (int i = 0; i <= sp; i++) Pg[i] = P[i * gran];

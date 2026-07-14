@@ -27,7 +27,7 @@
  *                          [--lambda=F] [--gamma=F] [--profile=m1|m4] file...
  *   --G given: that window size only.  Default: sweep G = 4/16/64/128K
  *   with per-file rows and a geomean summary per G.
- *   --joint: off (default) | nudge | auto | exact | 2 | 4 | 8 — run the
+ *   --joint: off (default) | coarse | auto | exact | 2 | 4 | 8 — run the
  *   pivcoh side with the joint length/shape pass at that tier.  Joint
  *   lengths diverge from production's by design, so the byte-identity
  *   gate is replaced by cross-decode both ways, and each row gains the
@@ -310,7 +310,8 @@ int main(int argc, char **argv)
             jname = argv[argi] + 8;
             JOINT = 1;
             if      (!strcmp(jname, "off"))   JOINT = 0;
-            else if (!strcmp(jname, "nudge")) JP.gran = -1;
+            else if (!strcmp(jname, "coarse") ||
+                     !strcmp(jname, "nudge"))  JP.gran = -1;
             else if (!strcmp(jname, "auto"))  JP.gran = 0;
             else if (!strcmp(jname, "exact")) JP.gran = 1;
             else if (!strcmp(jname, "2"))     JP.gran = 2;
