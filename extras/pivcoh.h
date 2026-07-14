@@ -1565,9 +1565,12 @@ static void pivcoh__pack_dN(uint8_t *out, const uint8_t *ranks,
     }
     /* Zero the padding bits of the last partial byte (the kernels'
      * final vector packed garbage there); one store-forwarded RMW,
-     * idempotent for D=1/8 whose padding is already exact. */
+     * idempotent for D=1/8 whose padding is already exact.
+     * Unconditional: at rem_bits == 0 the mask is 0 and the target is
+     * the first junk byte PAST the region, zeroed harmlessly under the
+     * usual contract — cheaper than a per-node data-dependent branch. */
     int rem_bits = (n * D) & 7;
-    if (rem_bits) out[(n * D) >> 3] &= (uint8_t)((1u << rem_bits) - 1);
+    out[(n * D) >> 3] &= (uint8_t)((1u << rem_bits) - 1);
 }
 
 /* ---- encode tree walk ----
