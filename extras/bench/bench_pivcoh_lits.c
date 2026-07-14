@@ -24,7 +24,7 @@
  *                 build_decode_table is decode-only.
  *
  * Usage: bench_pivcoh_lits [--G=KB] [--reps=N] [--joint=TIER]
- *                          [--lambda=F] [--gamma=F] file...
+ *                          [--lambda=F] [--gamma=F] [--profile=m4] file...
  *   --G given: that window size only.  Default: sweep G = 4/16/64/128K
  *   with per-file rows and a geomean summary per G.
  *   --joint: off (default) | nudge | auto | exact | 2 | 4 | 8 — run the
@@ -317,6 +317,17 @@ int main(int argc, char **argv)
             else if (!strcmp(jname, "4"))     JP.gran = 4;
             else if (!strcmp(jname, "8"))     JP.gran = 8;
             else { fprintf(stderr, "bad --joint tier\n"); return 1; }
+        } else if (!strcmp(argv[argi], "--profile=m4")) {
+            /* apple-m4 fitted cost profile (upstream 93b5a7e).  NB the
+             * fit is of the PRODUCTION kernels; pivcoh has no prefill
+             * pass and slightly faster kernels, so this is a transfer
+             * test, not a native fit. */
+            static const float m4kap[9] = { 0, 0.64f, 0.49f, 0.63f,
+                                            0.53f, 0.70f, 0.91f, 1.80f, 0.41f };
+            memcpy(JP.kappa, m4kap, sizeof m4kap);
+            JP.mu_cst = 0.897f;
+            JP.prefill = 0.235f;
+            JP.gamma = 210.0f;
         } else if (!strncmp(argv[argi], "--lambda=", 9)) {
             JP.lambda = (float)atof(argv[argi] + 9);
         } else if (!strncmp(argv[argi], "--gamma=", 8)) {

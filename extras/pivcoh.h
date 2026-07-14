@@ -474,6 +474,15 @@ static double pivcoh__jl_sim(const pivcoh__jl_ch *ch, int n, int *i, int d,
                              const double *kap, int *recs,
                              double *Wout, int *kind)
 {
+    if (d > PIVCOH__MAXLEN) {   /* non-tiling multiset: cut the recursion;
+                                 * the caller's i != n check reports -1.
+                                 * Unreachable from the in-header callers
+                                 * (their multisets are Kraft-exact by
+                                 * construction) — pure stack-safety.
+                                 * Upstream fix 93b5a7e. */
+        *Wout = 0; *kind = 1;
+        return 0.0;
+    }
     if (*i < n && ch[*i].r == d) {
         const pivcoh__jl_ch *c = &ch[(*i)++];
         *Wout = c->W;
