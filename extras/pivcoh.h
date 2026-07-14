@@ -2315,8 +2315,8 @@ static inline void pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, ui
  *   L3 u32 {16-2D, -(16-2D)}:   u64 = octet << (32-4D)
  * The compact shuffle absorbs the whole bytes of the final (32-4D)
  * re-basing shift (its tables start at byte 1 for D=5/6), leaving a
- * residual >> 4 for D=5/7 and NO final shift for D=6 -- 3-4 shift ops,
- * count vectors are vdups of computed constants.  (Byte-aligning the
+ * residual >> 4 for D=5/7 and NO final shift for D=6 -- 3-4 shift ops
+ * off tiny static count tables.  (Byte-aligning the
  * fields EARLY so the tbl can also do the u64 level -- e.g. D=6's
  * 24-bit quad at [0,24) -- costs a shr+sli pair per level, one op
  * more: a sub-lane field can't cross its own byte/lane boundary with
@@ -2340,13 +2340,18 @@ static const uint8_t pivcoh__pack_compact_d7[16] = {
 #define PIVCOH__PACK_DN(NAME, D_VAL, BITSHR, COMPACT_TAB)                        \
 static inline void NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base) \
 {                                                                                \
-    const int8x16_t s1 = vreinterpretq_s8_u16(vdupq_n_u16(8 - (D_VAL)));         \
-    const int16x8_t s2 = vreinterpretq_s16_u32(vdupq_n_u32(                      \
-        (uint32_t)(uint16_t)(8 - (D_VAL)) |                                      \
-        ((uint32_t)(uint16_t)-(8 - (D_VAL)) << 16)));                            \
-    const int32x4_t s3 = vreinterpretq_s32_u64(vdupq_n_u64(                      \
-        (uint64_t)(uint32_t)(16 - 2 * (D_VAL)) |                                 \
-        ((uint64_t)(uint32_t)-(16 - 2 * (D_VAL)) << 32)));                       \
+    static const int8_t  sh1[16] = { 8-(D_VAL),0, 8-(D_VAL),0, 8-(D_VAL),0,      \
+                                     8-(D_VAL),0, 8-(D_VAL),0, 8-(D_VAL),0,      \
+                                     8-(D_VAL),0, 8-(D_VAL),0 };                 \
+    static const int16_t sh2[8]  = { 8-(D_VAL), -(8-(D_VAL)),                    \
+                                     8-(D_VAL), -(8-(D_VAL)),                    \
+                                     8-(D_VAL), -(8-(D_VAL)),                    \
+                                     8-(D_VAL), -(8-(D_VAL)) };                  \
+    static const int32_t sh3[4]  = { 16-2*(D_VAL), -(16-2*(D_VAL)),              \
+                                     16-2*(D_VAL), -(16-2*(D_VAL)) };            \
+    const int8x16_t s1 = vld1q_s8(sh1);                                          \
+    const int16x8_t s2 = vld1q_s16(sh2);                                         \
+    const int32x4_t s3 = vld1q_s32(sh3);                                         \
     const uint8x16_t compact = vld1q_u8(COMPACT_TAB);                            \
     for (int i = 0; i < n; i += 16) {                                            \
         uint8x16_t cb = vsubq_u8(vld1q_u8(ranks + i), vdupq_n_u8(base));         \
@@ -2374,14 +2379,15 @@ PIVCOH__PACK_DN(pivcoh__pack_d7, 7, 4, pivcoh__pack_compact_d7)
  * contract as everywhere). */
 static inline void pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
-    static const int8_t shifts_p[16] = { 0,3, 0,3, 0,3, 0,3, 0,3, 0,3, 0,3, 0,3 };
+    static const int8_t  shifts_p[16] = { 0,3, 0,3, 0,3, 0,3, 0,3, 0,3, 0,3, 0,3 };
+    static const int8_t  shifts_1[16] = { 2,0, 2,0, 2,0, 2,0, 2,0, 2,0, 2,0, 2,0 };
+    static const int16_t shifts_2[8]  = { 2,-2, 2,-2, 2,-2, 2,-2 };
+    static const int32_t shifts_4[4]  = { 4,-4, 4,-4 };
     const int8x16_t shp = vld1q_s8(shifts_p);
     const uint8x16_t b9 = vdupq_n_u8((uint8_t)(9 * base));
-    const int8x16_t s1 = vreinterpretq_s8_u16(vdupq_n_u16(2));
-    const int16x8_t s2 = vreinterpretq_s16_u32(vdupq_n_u32(
-        (uint32_t)(uint16_t)2 | ((uint32_t)(uint16_t)-2 << 16)));
-    const int32x4_t s3 = vreinterpretq_s32_u64(vdupq_n_u64(
-        (uint64_t)(uint32_t)4 | ((uint64_t)(uint32_t)-4 << 32)));
+    const int8x16_t s1 = vld1q_s8(shifts_1);
+    const int16x8_t s2 = vld1q_s16(shifts_2);
+    const int32x4_t s3 = vld1q_s32(shifts_4);
     const uint8x16_t compact = vld1q_u8(pivcoh__pack_compact_d6);
     int i = 0;
     for (; i + 32 <= n; i += 32) {
