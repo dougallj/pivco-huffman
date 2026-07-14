@@ -1,9 +1,11 @@
-/* bench_pivcoh_speed: decode throughput of extras/pivcoh.h (the stb-style
- * single-header codec) vs the production dispatch decoder, on the MAIN
- * bench distributions.  Streams are encoded once with the production
- * encoder (FSE off — the shared raw-bitmap subset), then each decoder
- * sweeps all blocks.  Methodology: >=100 ms hot-loop DVFS warmup per
- * engine, rep count auto-calibrated to ~120 ms per run, median of 7. */
+/* bench_pivcoh_speed: decode + encode throughput of extras/pivcoh.h (the
+ * stb-style single-header codec) vs the production dispatch codec, on
+ * the MAIN bench distributions.  Streams are encoded once with the
+ * production encoder (FSE off — the shared raw-bitmap subset) and
+ * pivcoh's re-encode is gated byte-identical before any timing; then
+ * each engine sweeps all blocks.  Methodology: >=100 ms hot-loop DVFS
+ * warmup per engine, rep count auto-calibrated to ~120 ms per run,
+ * median of 7. */
 #define PIVCOH_IMPLEMENTATION
 #include "../pivcoh.h"
 #include "pivco_huffman.h"
@@ -40,6 +42,8 @@ static uint8_t buf[TOTAL], dec[TOTAL + 64];
 static uint8_t enc[(TOTAL / BLK) * (2 * BLK)];
 static size_t  off[TOTAL / BLK + 1];
 static uint8_t mscratch[PIVCOH_DECODE_SCRATCH_SIZE(BLK)];
+static uint8_t encout[PIVCOH_ENCODE_BOUND(BLK)];
+static uint8_t escratch[PIVCOH_SCRATCH_SIZE(BLK)];
 
 typedef void (*sweep_fn)(const pivco_huffman_table_t *, const pivcoh_table *,
                          int nblk);
@@ -65,6 +69,28 @@ static void sweep_mini(const pivco_huffman_table_t *T, const pivcoh_table *M,
         if (pivcoh_decode(M, enc + off[b], off[b + 1] - off[b],
                           dec + (size_t)b * BLK, BLK, NULL, mscratch) != BLK)
             exit(fprintf(stderr, "pivcoh decode failed blk %d\n", b));
+}
+
+static void sweep_prod_enc(const pivco_huffman_table_t *T, const pivcoh_table *M,
+                           int nblk)
+{
+    (void)M;
+    for (int b = 0; b < nblk; b++) {
+        size_t elen = 0;
+        if (pivco_huffman_encode(buf + (size_t)b * BLK, BLK, T,
+                                 encout, &elen) != PIVCO_OK)
+            exit(fprintf(stderr, "prod encode failed blk %d\n", b));
+    }
+}
+
+static void sweep_mini_enc(const pivco_huffman_table_t *T, const pivcoh_table *M,
+                           int nblk)
+{
+    (void)T;
+    for (int b = 0; b < nblk; b++)
+        if (pivcoh_encode(M, buf + (size_t)b * BLK, BLK,
+                          encout, sizeof(encout), escratch) < 0)
+            exit(fprintf(stderr, "pivcoh encode failed blk %d\n", b));
 }
 
 /* >=100 ms hot loop (DVFS ramp), calibrate reps to ~120 ms/run, median-of-7. */
@@ -96,7 +122,9 @@ int main(void)
     static pivco_huffman_table_t T;
     static pivcoh_table M;
 
-    printf("%-14s | %9s %9s | %6s\n", "DIST", "pivcoh", "prod", "ratio");
+    printf("%-14s | %28s | %28s\n", "", "decode MB/s", "encode MB/s");
+    printf("%-14s | %9s %9s %6s | %9s %9s %6s\n",
+           "DIST", "pivcoh", "prod", "ratio", "pivcoh", "prod", "ratio");
 
     for (int d = 0; d < bench_num_distributions(); d++) {
         if (!bench_dist_is_main(d)) continue;
@@ -121,17 +149,30 @@ int main(void)
             off[b + 1] = off[b] + elen;
         }
 
-        /* correctness gate before timing */
+        /* correctness gates before timing: pivcoh decode round-trips the
+         * prod streams, pivcoh encode reproduces them byte-identically */
         memset(dec, 0, (size_t)nblk * BLK);
         sweep_mini(&T, &M, nblk);
         if (memcmp(dec, buf, (size_t)nblk * BLK) != 0)
             return fprintf(stderr, "%s: pivcoh output differs\n",
                            bench_dist_name(d));
+        for (int b = 0; b < nblk; b++) {
+            ptrdiff_t el = pivcoh_encode(&M, buf + (size_t)b * BLK, BLK,
+                                         encout, sizeof(encout), escratch);
+            if (el != (ptrdiff_t)(off[b + 1] - off[b]) ||
+                memcmp(encout, enc + off[b], (size_t)el) != 0)
+                return fprintf(stderr, "%s: pivcoh encode wire differs blk %d\n",
+                               bench_dist_name(d), b);
+        }
 
-        double mini = bench_engine(sweep_mini, &T, &M, nblk, (size_t)nblk * BLK);
-        double prod = bench_engine(sweep_prod, &T, &M, nblk, (size_t)nblk * BLK);
-        printf("%-14s | %9.0f %9.0f | %5.2fx\n",
-               bench_dist_name(d), mini, prod, mini / prod);
+        size_t bytes = (size_t)nblk * BLK;
+        double mini  = bench_engine(sweep_mini,     &T, &M, nblk, bytes);
+        double prod  = bench_engine(sweep_prod,     &T, &M, nblk, bytes);
+        double minie = bench_engine(sweep_mini_enc, &T, &M, nblk, bytes);
+        double prode = bench_engine(sweep_prod_enc, &T, &M, nblk, bytes);
+        printf("%-14s | %9.0f %9.0f %5.2fx | %9.0f %9.0f %5.2fx\n",
+               bench_dist_name(d), mini, prod, mini / prod,
+               minie, prode, minie / prode);
     }
     return 0;
 }
