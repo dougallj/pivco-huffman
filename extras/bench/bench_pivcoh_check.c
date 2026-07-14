@@ -266,10 +266,11 @@ int main(void)
       static uint8_t dscratch2[PIVCOH_DECOMPRESS_SCRATCH_SIZE];
       static const size_t FNS[] = { 0, 1, 2, 100, 4096, 32768, 32769,
                                     100000, FN_MAX };
-      static const pivcoh_effort EF[] = { PIVCOH_FASTEST_COMPRESS,
+      static const pivcoh_effort EF[] = { PIVCOH_SIMPLEST_COMPRESS,
                                           PIVCOH_BALANCED,
                                           PIVCOH_FASTER_DECOMPRESS,
-                                          PIVCOH_FASTEST_DECOMPRESS };
+                                          PIVCOH_FASTEST_DECOMPRESS,
+                                          PIVCOH_FASTEST_COMPRESS };
       int n_frames = 0;
       for (size_t fi = 0; fi < sizeof(FNS) / sizeof(*FNS); fi++) {
           const size_t N = FNS[fi];
@@ -295,6 +296,11 @@ int main(void)
               if (pivcoh_decompress(fout, N, fdst, (size_t)c, NULL)
                       != (ptrdiff_t)N)
                   FAIL("frame roundtrip (malloc)");
+              size_t msz = 12345;
+              uint8_t *mbuf = pivcoh_decompress_malloc(fdst, (size_t)c, &msz);
+              if (!mbuf || msz != N || memcmp(mbuf, fsrc, N))
+                  FAIL("decompress_malloc");
+              free(mbuf);
               n_frames++;
               /* hostile: bit flips + truncations must never crash and
                * never write past raw_size (ASan enforces both) */
@@ -307,6 +313,31 @@ int main(void)
               }
           }
       }
+      /* decoder accepts blocks beyond the encoder's 32768 -- any u16
+       * size the codec can express: hand-build a 65535-symbol frame */
+      { id = 65535;
+        pivcoh_table bt;
+        uint64_t bfreq[256] = {0};
+        for (size_t i = 0; i < 65535; i++) {
+            fsrc[i] = (uint8_t)(rng() & 63);
+            bfreq[fsrc[i]]++;
+        }
+        if (!pivcoh_table_from_freqs(&bt, bfreq)) FAIL("big-block table");
+        for (int b = 0; b < 8; b++)
+            fdst[b] = (uint8_t)((uint64_t)65535 >> (8 * b));
+        pivcoh_lens_pack(fdst + 8, bt.code_len);
+        static uint8_t bscratch[PIVCOH_SCRATCH_SIZE(65535)];
+        ptrdiff_t el = pivcoh_encode(&bt, fsrc, 65535, fdst + 140,
+                                     PIVCOH_ENCODE_BOUND(65535), bscratch);
+        if (el < 0) FAIL("big-block encode");
+        fdst[136] = (uint8_t)el;        fdst[137] = (uint8_t)(el >> 8);
+        fdst[138] = (uint8_t)(el >> 16); fdst[139] = (uint8_t)(el >> 24);
+        memset(fout, 0xAA, 65535);
+        if (pivcoh_decompress(fout, 65535, fdst, 140 + (size_t)el, dscratch2)
+                != 65535 || memcmp(fout, fsrc, 65535))
+            FAIL("65535-symbol block rejected or wrong");
+      }
+
       /* utilities: packed lens roundtrip + fused build; histogram */
       { id = 0;
         uint8_t packed[128], lens[256];

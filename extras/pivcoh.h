@@ -31,8 +31,9 @@
  *     ptrdiff_t c = pivcoh_compress(dst, PIVCOH_COMPRESS_BOUND(n),
  *                                   src, n, PIVCOH_BALANCED, NULL);
  *     ...
- *     uint64_t raw = pivcoh_decompressed_size(dst, (size_t)c);
- *     ptrdiff_t r = pivcoh_decompress(out, raw, dst, (size_t)c, NULL);
+ *     size_t raw;
+ *     unsigned char *out = pivcoh_decompress_malloc(dst, (size_t)c, &raw);
+ *     // or size the buffer yourself: pivcoh_decompressed_size + pivcoh_decompress
  *
  * Usage — encoder side:
  *     pivcoh_table t;
@@ -211,20 +212,21 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
 
 /* ---- one-shot frame API ----
  *
- * FRAME = [u64 raw_size LE]
+ * FRAME = [u64 decompressed_size LE]
  *         [128 B code lengths, 4-bit nibbles LSB-first: symbol 2i in
  *          the low nibble of byte i — the pivcohuf_file.h layout]
- *         [BLOCK...]                       (raw_size = 0: header only)
+ *         [BLOCK...]             (decompressed_size = 0: header only)
  * BLOCK = [u32 comp_len LE] [comp_len bytes: one pivcoh block]
  *
  * One table serves the whole frame (for windowed retraining use the
  * low-level API).  This encoder writes 32768-symbol blocks — the
  * measured decode-throughput plateau on Apple Silicon is 24..40 K —
- * and decoders accept any block size <= 32768.  The u32 makes blocks
- * checkable and skippable without decoding: a streaming reader can
- * tell when a whole block is buffered, and blocks can decode in
- * parallel (a block's output offset is the sum of the earlier blocks'
- * symbol counts, read from their 2-byte headers). */
+ * and decoders accept any block size the codec can express (the
+ * block's own u16 caps it at 65535).  The u32 makes blocks checkable
+ * and skippable without decoding: a streaming reader can tell when a
+ * whole block is buffered, and blocks can decode in parallel (a
+ * block's output offset is the sum of the earlier blocks' symbol
+ * counts, read from their 2-byte headers). */
 
 /* Compression effort: how much table-build time pivcoh_compress spends
  * shaping the code for DECOMPRESSION speed (the joint pass below).
@@ -234,14 +236,21 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
  * rates.  The superlatives are the extremes; most callers want the
  * middle. */
 typedef enum {
-    PIVCOH_FASTEST_COMPRESS   = 0,  /* plain Huffman lengths: no shaping
-                                       time at all, but decompression
+    PIVCOH_SIMPLEST_COMPRESS  = 0,  /* plain Huffman lengths: never any
+                                       shaping time, but decompression
                                        leaves 25..50% speed unclaimed */
     PIVCOH_BALANCED           = 1,  /* the default: ~2-4 us of shaping
                                        buys most of the decompress win */
     PIVCOH_FASTER_DECOMPRESS  = 2,  /* <= ~10 us: nearly all of the win */
     PIVCOH_FASTEST_DECOMPRESS = 3,  /* ~100 us, provably optimal shape:
                                        encode-once-decode-forever data */
+    PIVCOH_FASTEST_COMPRESS   = 4,  /* SIMPLEST below 256 KiB of input,
+                                       BALANCED above: past that point a
+                                       flatter tree ENCODES faster than
+                                       the shaping solve costs (+10..30%
+                                       measured; and when shaping can't
+                                       help, its <3% cost keeps
+                                       shrinking as 1/n) */
 } pivcoh_effort;
 
 /* Worst-case frame size (frame header + per-block headers/rounding). */
@@ -252,7 +261,7 @@ typedef enum {
  * so these are input-size-independent). */
 #define PIVCOH_COMPRESS_SCRATCH_SIZE \
     (PIVCOH_SCRATCH_SIZE(32768) + PIVCOH_JOINT_SCRATCH_SIZE)
-#define PIVCOH_DECOMPRESS_SCRATCH_SIZE  PIVCOH_DECODE_SCRATCH_SIZE(32768)
+#define PIVCOH_DECOMPRESS_SCRATCH_SIZE  PIVCOH_DECODE_SCRATCH_SIZE(65535)
 
 /* Compress src[0..n) into a self-describing frame.  Requires dst_cap >=
  * PIVCOH_COMPRESS_BOUND(n).  Returns the frame's byte length, or -1 on
@@ -269,17 +278,24 @@ PIVCOHDEF ptrdiff_t pivcoh_compress_joint(uint8_t *dst, size_t dst_cap,
                                           const pivcoh_joint *j,
                                           void *scratch);
 
-/* Decompress a whole frame.  Returns the raw byte count written to dst,
- * or -1 on malformed input, dst_cap too small, or malloc failure.
- * Strict: the frame must parse exactly to its declared raw_size with no
- * trailing bytes.  scratch: NULL or PIVCOH_DECOMPRESS_SCRATCH_SIZE. */
+/* Decompress a whole frame.  Returns the byte count written to dst, or
+ * -1 on malformed input, dst_cap too small, or malloc failure.  Strict:
+ * the frame must parse exactly to its declared decompressed size with
+ * no trailing bytes.  scratch: NULL or PIVCOH_DECOMPRESS_SCRATCH_SIZE. */
 PIVCOHDEF ptrdiff_t pivcoh_decompress(uint8_t *dst, size_t dst_cap,
                                       const uint8_t *src, size_t n,
                                       void *scratch);
 
-/* Read a frame's declared raw size (for sizing dst).  Returns
- * UINT64_MAX if src is too short to hold a frame header. */
+/* Read a frame's declared decompressed size (for sizing dst).
+ * Returns UINT64_MAX if src is too short to hold a frame header. */
 PIVCOHDEF uint64_t pivcoh_decompressed_size(const uint8_t *src, size_t n);
+
+/* pivcoh_decompress into a malloc'd buffer of exactly the frame's
+ * decompressed size (an empty frame yields a freeable 1-byte buffer).
+ * Returns the buffer, or NULL on malformed input / malloc failure; on
+ * success *size receives the byte count (size may be NULL). */
+PIVCOHDEF uint8_t *pivcoh_decompress_malloc(const uint8_t *src, size_t n,
+                                            size_t *size);
 
 /* ---- utilities (also used by the frame API) ---- */
 
@@ -2579,12 +2595,15 @@ PIVCOHDEF ptrdiff_t pivcoh_compress(uint8_t *dst, size_t dst_cap,
                                     const uint8_t *src, size_t n,
                                     pivcoh_effort effort, void *scratch)
 {
+    if (effort == PIVCOH_FASTEST_COMPRESS)
+        effort = n < (size_t)262144 ? PIVCOH_SIMPLEST_COMPRESS
+                                    : PIVCOH_BALANCED;
     pivcoh_joint j = PIVCOH_JOINT_DEFAULTS;
     j.gran = effort == PIVCOH_FASTER_DECOMPRESS  ? 0
            : effort == PIVCOH_FASTEST_DECOMPRESS ? 1
            : -1;                     /* anything else: PIVCOH_BALANCED */
     return pivcoh_compress_joint(dst, dst_cap, src, n,
-                                 effort == PIVCOH_FASTEST_COMPRESS ? NULL : &j,
+                                 effort == PIVCOH_SIMPLEST_COMPRESS ? NULL : &j,
                                  scratch);
 }
 
@@ -2618,10 +2637,11 @@ PIVCOHDEF ptrdiff_t pivcoh_decompress(uint8_t *dst, size_t dst_cap,
                   | (size_t)src[off + 2] << 16 | (size_t)src[off + 3] << 24;
         off += 4;
         if (bl < 2 || bl > n - off) { ok = 0; break; }
-        /* the block's own symbol count, checked BEFORE decoding: it must
-         * fit the fixed 32K decode scratch and the remaining raw span */
+        /* the block's own symbol count, checked BEFORE decoding: it
+         * must fit the remaining declared span (scratch covers the u16
+         * maximum, so any expressible block size is accepted) */
         size_t bn = (size_t)src[off] | (size_t)src[off + 1] << 8;
-        if (bn == 0 || bn > 32768 || bn > raw - dof) { ok = 0; break; }
+        if (bn == 0 || bn > raw - dof) { ok = 0; break; }
         size_t consumed = 0;
         ptrdiff_t dn = pivcoh_decode(&t, src + off, bl, dst + dof,
                                      (size_t)raw - dof, &consumed, sc);
@@ -2632,6 +2652,21 @@ PIVCOHDEF ptrdiff_t pivcoh_decompress(uint8_t *dst, size_t dst_cap,
     if (dof != raw || off != n) ok = 0;       /* strict: no trailing bytes */
     if (!scratch) free(sc);
     return ok ? (ptrdiff_t)raw : -1;
+}
+
+PIVCOHDEF uint8_t *pivcoh_decompress_malloc(const uint8_t *src, size_t n,
+                                            size_t *size)
+{
+    uint64_t raw = pivcoh_decompressed_size(src, n);
+    if (raw > (uint64_t)(PTRDIFF_MAX - 1)) return NULL;   /* incl. UINT64_MAX */
+    uint8_t *buf = (uint8_t *)malloc(raw ? (size_t)raw : 1);
+    if (!buf) return NULL;
+    if (pivcoh_decompress(buf, (size_t)raw, src, n, NULL) != (ptrdiff_t)raw) {
+        free(buf);
+        return NULL;
+    }
+    if (size) *size = (size_t)raw;
+    return buf;
 }
 
 #endif /* PIVCOH_IMPLEMENTATION */
