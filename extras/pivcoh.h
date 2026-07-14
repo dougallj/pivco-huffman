@@ -1335,50 +1335,55 @@ int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
 
 /* D=2: 64 ranks -> 16 bytes (4 ranks per byte, no byte crossings) —
  * unrolled x4 so both vpaddq_u8 reduction levels pair full vectors and
- * the result is a whole 16-byte store; the 16-rank remainder keeps the
- * self-pairing quarter-width form.  Local codes in [0,2^D); no mask. */
+ * the result is a whole 16-byte store.  The pipeline is linear mod 256
+ * (shifts multiply, vpaddq adds, u8 wrap IS the target modulus), so
+ * the base subtract distributes to one op at the end:
+ * sum (r_i - b) 4^i = r0 + 4r1 + 16r2 + 64r3 - 85b (mod 256, exact
+ * since the true byte is in range).  The 16-rank remainder keeps the
+ * self-pairing quarter-width form. */
 static inline int pivcoh__pack_d2(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
     static const int8_t shifts_d2[16] = { 0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6 };
     const int8x16_t sh = vld1q_s8(shifts_d2);
-    uint8x16_t vb = vdupq_n_u8(base);
+    const uint8x16_t b85 = vdupq_n_u8((uint8_t)(85 * base));
     int i = 0;
     for (; i + 64 <= n; i += 64) {
-        uint8x16_t b0 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i),      vb), sh);
-        uint8x16_t b1 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i + 16), vb), sh);
-        uint8x16_t b2 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i + 32), vb), sh);
-        uint8x16_t b3 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i + 48), vb), sh);
-        vst1q_u8(out + (i >> 2),
-                 vpaddq_u8(vpaddq_u8(b0, b1), vpaddq_u8(b2, b3)));
+        uint8x16_t b0 = vshlq_u8(vld1q_u8(ranks + i),      sh);
+        uint8x16_t b1 = vshlq_u8(vld1q_u8(ranks + i + 16), sh);
+        uint8x16_t b2 = vshlq_u8(vld1q_u8(ranks + i + 32), sh);
+        uint8x16_t b3 = vshlq_u8(vld1q_u8(ranks + i + 48), sh);
+        uint8x16_t r  = vpaddq_u8(vpaddq_u8(b0, b1), vpaddq_u8(b2, b3));
+        vst1q_u8(out + (i >> 2), vsubq_u8(r, b85));
     }
     for (; i + 16 <= n; i += 16) {
-        uint8x16_t b = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i), vb), sh);
+        uint8x16_t b  = vshlq_u8(vld1q_u8(ranks + i), sh);
         uint8x16_t s1 = vpaddq_u8(b, b);
-        uint8x16_t s2 = vpaddq_u8(s1, s1);
+        uint8x16_t s2 = vsubq_u8(vpaddq_u8(s1, s1), b85);
         uint32_t packed4 = vgetq_lane_u32(vreinterpretq_u32_u8(s2), 0);
         memcpy(out + (i >> 2), &packed4, 4);
     }
     return i;
 }
 
-/* D=4: 32 ranks -> 16 bytes, pairing (r[2k], r[2k+1]) into one byte
- * each — unrolled once so the vpaddq_u8 pairs two full input vectors
- * instead of wasting its high half; a 16-rank remainder iteration
- * keeps the half-width store.  Local codes are in [0,2^D); no mask. */
+/* D=4: 32 ranks -> 16 bytes, pairing (r[2k], r[2k+1]) into one byte —
+ * unrolled once so the vpaddq_u8 pairs two full input vectors, with
+ * the base subtract distributed like D=2's:
+ * (r0 - b) + 16(r1 - b) = r0 + 16r1 - 17b (mod 256, exact). */
 static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
     static const int8_t shifts_d4[16] = { 0,4, 0,4, 0,4, 0,4, 0,4, 0,4, 0,4, 0,4 };
     const int8x16_t sh = vld1q_s8(shifts_d4);
-    uint8x16_t vb = vdupq_n_u8(base);
+    const uint8x16_t b17 = vdupq_n_u8((uint8_t)(17 * base));
     int i = 0;
     for (; i + 32 <= n; i += 32) {
-        uint8x16_t b0 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i),      vb), sh);
-        uint8x16_t b1 = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i + 16), vb), sh);
-        vst1q_u8(out + (i >> 1), vpaddq_u8(b0, b1));
+        uint8x16_t b0 = vshlq_u8(vld1q_u8(ranks + i),      sh);
+        uint8x16_t b1 = vshlq_u8(vld1q_u8(ranks + i + 16), sh);
+        vst1q_u8(out + (i >> 1), vsubq_u8(vpaddq_u8(b0, b1), b17));
     }
     for (; i + 16 <= n; i += 16) {
-        uint8x16_t b = vshlq_u8(vsubq_u8(vld1q_u8(ranks + i), vb), sh);
-        vst1_u8(out + (i >> 1), vget_low_u8(vpaddq_u8(b, b)));
+        uint8x16_t b = vshlq_u8(vld1q_u8(ranks + i), sh);
+        vst1_u8(out + (i >> 1),
+                vget_low_u8(vsubq_u8(vpaddq_u8(b, b), b17)));
     }
     return i;
 }
