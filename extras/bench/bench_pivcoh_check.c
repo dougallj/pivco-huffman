@@ -127,11 +127,29 @@ int main(void)
     /* uniform 256: full-alphabet flat tree (D=8 root) */
     for (int s = 0; s < 256; s++) freq[s] = 7;
     one_case(freq, "uniform256", 0);
-    /* deep skew: exercises length limiting */
+    /* deep skew: exercises length limiting.  45 Fibonacci frequencies
+     * total fib(47)-1 < 2^32: pivcoh sums frequencies mod 2^32
+     * (documented), so production parity is only promised below 4 GiB
+     * histogram totals. */
     memset(freq, 0, sizeof(freq));
     { uint64_t a = 1, b = 1;
-      for (int s = 0; s < 90; s++) { freq[s] = a; uint64_t t = a + b; a = b; b = t; } }
-    one_case(freq, "fib90", 0);
+      for (int s = 0; s < 45; s++) { freq[s] = a; uint64_t t = a + b; a = b; b = t; } }
+    one_case(freq, "fib45", 0);
+
+    /* huge-histogram wrap: >= 4 GiB totals derive different-but-valid
+     * tables; verify build + self-roundtrip only (no parity). */
+    { const char *tag = "hugefreq"; int id = 0;
+      memset(freq, 0, sizeof(freq));
+      uint64_t a = 1, b = 1;
+      for (int s = 0; s < 90; s++) { freq[s] = a; uint64_t t = a + b; a = b; b = t; }
+      if (!pivcoh_table_from_freqs(&mini, freq)) FAIL("build failed");
+      for (int i = 0; i < 100; i++) blk[i] = (uint8_t)(i % 90);
+      ptrdiff_t el = pivcoh_encode(&mini, blk, 100, enc_mini, sizeof(enc_mini), scratch);
+      if (el < 0) FAIL("encode failed");
+      memset(dec_buf, 0, 100);
+      if (pivcoh_decode(&mini, enc_mini, (size_t)el, dec_buf, sizeof(dec_buf),
+                        NULL, dscratch) != 100 || memcmp(dec_buf, blk, 100))
+          FAIL("roundtrip"); }
 
     /* invalid lengths must be rejected */
     { const char *tag = "badlens"; int id = 0;

@@ -106,7 +106,9 @@ typedef struct {
 } pivcoh_table;
 
 /* Build a table from symbol frequencies (encoder side).  Derives optimal
- * length-limited code lengths into t->code_len.  Returns 1, or 0 if every
+ * length-limited code lengths into t->code_len.  Frequencies are treated
+ * mod 2^32 internally: a histogram totalling >= 4 GiB may derive
+ * different — still valid — lengths.  Returns 1, or 0 if every
  * frequency is zero. */
 PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256]);
 
@@ -311,7 +313,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
     return 1;
 }
 
-typedef struct { uint64_t freq; uint16_t sym; } pivcoh__leaf;
+typedef struct { uint32_t freq; uint16_t sym; } pivcoh__leaf;
 
 /* Stable ascending (freq, sym) sort of the leaves.  They arrive in
  * symbol order (the stable seed), so a stable freq sort IS the (freq,
@@ -323,7 +325,7 @@ typedef struct { uint64_t freq; uint16_t sym; } pivcoh__leaf;
  * its dominant-bin scatter specialization); the O(n^2) insertion sort
  * this replaces was 3-5x the whole production table build on
  * fresh-tables-every-4K workloads over near-full alphabets. */
-static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint64_t vary)
+static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint32_t vary)
 {
     int i, j;
     if (n <= 40) {
@@ -335,11 +337,16 @@ static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint64_t vary)
         }
         return;
     }
-    int shift[8], npass = 0;
-    for (int b = 0; b < 64; b += 8)
+    int shift[4], npass = 0;
+    for (int b = 0; b < 32; b += 8)
         if ((vary >> b) & 0xFF) shift[npass++] = b;
     if (npass == 0) return;                    /* all frequencies equal */
-    uint16_t cnt[8][256];
+    /* u8 bins cannot go wrong at n <= 256: a bin could only reach 256
+     * if every leaf shared that byte, but such a plane does not vary
+     * and is skipped, so varying-plane bins are <= 255.  A prefix that
+     * wraps to 0 is only stored for an empty bin (never indexed), and
+     * the final in-scatter increment that wraps is never read again. */
+    uint8_t cnt[4][256];
     memset(cnt, 0, (size_t)npass * sizeof(cnt[0]));
     for (i = 0; i < n; i++)                    /* all planes in one pass */
         for (int p = 0; p < npass; p++)
@@ -349,7 +356,7 @@ static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint64_t vary)
         unsigned sum = 0;
         for (int k = 0; k < 256; k++) {
             unsigned c = cnt[p][k];
-            cnt[p][k] = (uint16_t)sum;
+            cnt[p][k] = (uint8_t)sum;
             sum += c;
         }
         for (i = 0; i < n; i++)
@@ -361,16 +368,22 @@ static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint64_t vary)
 
 PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
 {
+    /* Frequencies narrow to u32 (and internal sums wrap mod 2^32): a
+     * histogram totalling >= 4 GiB may derive different -- still valid,
+     * still Kraft-exact, but no longer production-identical -- code
+     * lengths.  Correctness-only: every index below is bounded
+     * structurally, never by frequency values. */
     pivcoh__leaf leaf[256];
-    uint64_t orv = 0, andv = ~(uint64_t)0;
+    uint32_t orv = 0, andv = ~(uint32_t)0;
     int n = 0, i;
     for (i = 0; i < 256; i++)
         if (freq[i]) {
-            leaf[n].freq = freq[i];
+            uint32_t f = (uint32_t)freq[i];
+            leaf[n].freq = f;
             leaf[n].sym  = (uint16_t)i;
             n++;
-            orv |= freq[i];
-            andv &= freq[i];
+            orv |= f;
+            andv &= f;
         }
     if (n == 0) return 0;
     pivcoh__sort_leaves(leaf, n, orv ^ andv);
@@ -380,15 +393,16 @@ PIVCOHDEF int pivcoh_table_from_freqs(pivcoh_table *t, const uint64_t freq[256])
         lens[leaf[0].sym] = 1;
     } else {
         /* van Leeuwen two-queue: sorted leaves + FIFO of made internals */
-        uint64_t nf[512];
-        int parent[512], li = 0, ih = n, ni = n, rem;
+        uint32_t nf[512];
+        int16_t parent[512];
+        int li = 0, ih = n, ni = n, rem;
         for (i = 0; i < n; i++) nf[i] = leaf[i].freq;
         for (rem = n; rem > 1; rem--) {
             int a, b;
             if (li < n && (ih == ni || nf[li] <= nf[ih])) a = li++; else a = ih++;
             if (li < n && (ih == ni || nf[li] <= nf[ih])) b = li++; else b = ih++;
             nf[ni] = nf[a] + nf[b];
-            parent[a] = parent[b] = ni++;
+            parent[a] = parent[b] = (int16_t)ni++;
         }
         uint8_t depth[512];
         int maxd = 1;
