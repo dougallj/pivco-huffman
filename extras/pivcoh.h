@@ -1361,26 +1361,6 @@ static inline int pivcoh__pack_d2(uint8_t *out, const uint8_t *ranks, int n, uin
     return i;
 }
 
-/* D=3: 8 ranks -> 24 bits, u32 horizontal accumulator. */
-static inline int pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
-{
-    static const int32_t shifts_lo[4] = { 0, 3, 6, 9 };
-    static const int32_t shifts_hi[4] = { 12, 15, 18, 21 };
-    uint8x8_t vb = vdup_n_u8(base);
-    int i = 0;
-    for (; i + 8 <= n; i += 8) {
-        uint16x8_t v = vmovl_u8(vsub_u8(vld1_u8(ranks + i), vb));
-        uint32x4_t lo = vshlq_u32(vmovl_u16(vget_low_u16(v)),  vld1q_s32(shifts_lo));
-        uint32x4_t hi = vshlq_u32(vmovl_u16(vget_high_u16(v)), vld1q_s32(shifts_hi));
-        uint32_t packed = vaddvq_u32(vaddq_u32(lo, hi));
-        int bi = i * 3 / 8;
-        out[bi]     = (uint8_t)(packed        & 0xff);
-        out[bi + 1] = (uint8_t)((packed >> 8 ) & 0xff);
-        out[bi + 2] = (uint8_t)((packed >> 16) & 0xff);
-    }
-    return i;
-}
-
 /* D=4: 32 ranks -> 16 bytes, pairing (r[2k], r[2k+1]) into one byte
  * each — unrolled once so the vpaddq_u8 pairs two full input vectors
  * instead of wasting its high half; a 16-rank remainder iteration
@@ -1403,7 +1383,7 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
     return i;
 }
 
-/* D=5/6/7: variable-shift pack, 16 codes/iter.  At each width the two
+/* D=3/5/6/7: variable-shift pack, 16 codes/iter.  At each width the two
  * halves of a lane pair are shifted TOWARD each other with one USHL of
  * {+s, -s} per-lane counts — the even half's top bit and the odd
  * half's bottom bit meet at the lane boundary — so each pairing level
@@ -1414,7 +1394,8 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
  *   L3 u32 {16-2D, -(16-2D)}:   u64 = octet << (32-4D)
  * The compact shuffle absorbs the whole bytes of the final (32-4D)
  * re-basing shift (its tables start at byte 1 for D=5/6), leaving a
- * residual >> 4 for D=5/7 and NO final shift for D=6 -- 3-4 shift ops,
+ * residual >> 4 for D=3/5/7 (D=3's tables start at byte 2: 32-4D = 20
+ * bits) and NO final shift for D=6 -- 3-4 shift ops,
  * count vectors are vdups of computed constants.  (Byte-aligning the
  * fields EARLY so the tbl can also do the u64 level -- e.g. D=6's
  * 24-bit quad at [0,24) -- costs a shr+sli pair per level, one op
@@ -1426,6 +1407,10 @@ static inline int pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, uin
  * 16-2D trailing junk bytes, overwritten by the next iter / next
  * record (the caller's out_cap >= PIVCOH_ENCODE_BOUND keeps even the
  * last one in bounds). */
+static const uint8_t pivcoh__pack_compact_d3[16] = {
+    2, 3, 4,   10, 11, 12,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+};
 static const uint8_t pivcoh__pack_compact_d5[16] = {
     1, 2, 3, 4, 5,   9, 10, 11, 12, 13,  0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 };
@@ -1459,6 +1444,7 @@ static inline int NAME(uint8_t *out, const uint8_t *ranks, int n, uint8_t base) 
     }                                                                            \
     return i;                                                                    \
 }
+PIVCOH__PACK_DN(pivcoh__pack_d3, 3, 4, pivcoh__pack_compact_d3)
 PIVCOH__PACK_DN(pivcoh__pack_d5, 5, 4, pivcoh__pack_compact_d5)
 PIVCOH__PACK_DN(pivcoh__pack_d6, 6, 0, pivcoh__pack_compact_d6)
 PIVCOH__PACK_DN(pivcoh__pack_d7, 7, 4, pivcoh__pack_compact_d7)
