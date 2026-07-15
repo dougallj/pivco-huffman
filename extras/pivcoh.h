@@ -1966,58 +1966,113 @@ static inline const uint8_t *pivcoh__read_bm(const uint8_t **bm, int K,
  * absorbs a lying bitmap's bounded pre-detection strays (kernel section
  * comment).  A FLAT node never touches tmp (so a flat root runs
  * scratch-free). */
-static const uint8_t *pivcoh__dec(const pivcoh_table *t, int idx, int K,
-                                  uint8_t *out, uint8_t *tmp,
-                                  const uint8_t *p, const uint8_t *end)
-{
-    const pivcoh__rec *rec = &t->sched[idx];
-    int kind = rec->kd & 3;
+static const uint8_t *pivcoh__dec_internal(const pivcoh_table *t, int idx, int K,
+                                           uint8_t *out, uint8_t *tmp,
+                                           const uint8_t *p, const uint8_t *end);
 
-    if (kind == PIVCOH__FLAT) {
-        int D = rec->kd >> 2;
+/* Decode one child subtree.  Flat children are dispatched here in the
+ * parent (no recursive entry).  Only the root's children come through
+ * here; dec_internal handles its own descendants iteratively. */
+static inline const uint8_t *pivcoh__dec_child(const pivcoh_table *t, int idx,
+                                               int K, uint8_t *out, uint8_t *tmp,
+                                               const uint8_t *p, const uint8_t *end)
+{
+    if (K == 0) return p;
+    const pivcoh__rec *rec = &t->sched[idx];
+    unsigned kd = rec->kd;
+    if ((kd & 3) == PIVCOH__FLAT) {
+        unsigned D = kd >> 2;
         size_t nb = ((size_t)K * (size_t)D + 7) >> 3;
-        if ((size_t)(end - p) < nb) return NULL;
-        /* tf whenever the stream holds 16 readable bytes past the
-         * region — true for essentially every interior flat (the walk's
-         * out is always arena-backed; a parent's bitmap alone covers it
-         * once K is non-tiny, since the root's bitmap ends the block). */
-        pivcoh__merge_flat(out, K, p, D, t->rank_to_sym + rec->param,
-                           (size_t)(end - p) >= nb + 16);
+        size_t avail = (size_t)(end - p);
+        if (avail < nb) return NULL;
+        pivcoh__merge_flat(out, K, p, (int)D, t->rank_to_sym + rec->param,
+                           avail - nb >= 16);
         return p + nb;
     }
-    if (end - p < 2) return NULL;
-    int KR = p[0] | p[1] << 8;
-    if (KR > K) return NULL;
-    p += 2;
-    int KL = K - KR;
+    return pivcoh__dec_internal(t, idx, K, out, tmp, p, end);
+}
 
-    if (kind == PIVCOH__LEAFL) {               /* left = lone leaf */
-        uint8_t *rbuf = out + KL;              /* the one child, in place */
-        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, rbuf, tmp, p, end)))
-            return NULL;
-        const uint8_t *bm;
-        if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
-        if (pivcoh__merge_cst_vec(bm, K, t->rank_to_sym[rec->param], rbuf, KR, out))
-            return NULL;
-        return p;
+/* Iterative interior walk (exp 5): an explicit continuation stack replaces
+ * recursion.  t, p, end and the rank map stay live in registers across the
+ * loop instead of being reshuffled through call arguments; flat children
+ * are decoded inline.  Two states — descend (open a node, start its big
+ * child) and complete (a child finished: start the sibling, else read the
+ * post-order bitmap, merge, pop).  Depth is bounded by the tree height. */
+static const uint8_t *pivcoh__dec_internal(const pivcoh_table *t, int idx, int K,
+                                           uint8_t *out, uint8_t *tmp,
+                                           const uint8_t *p, const uint8_t *end)
+{
+    struct cont { int K, KR, KL, small_idx, small_K; uint8_t *out, *tmp;
+                  uint8_t kind, phase, right_big, sym; } stk[PIVCOH__MAXLEN + 2];
+    int sp = 0;
+    int cidx = 0, cK = 0; uint8_t *cout = out, *ctmp = tmp;
+
+descend:            /* (idx, K, out, tmp) is an INTERNAL subtree */
+    if (sp >= (int)(sizeof stk / sizeof *stk)) return NULL;   /* defensive */
+    {
+        const pivcoh__rec *rec = &t->sched[idx];
+        if (end - p < 2) return NULL;
+        int KR = p[0] | p[1] << 8;
+        if (KR > K) return NULL;
+        p += 2;
+        int KL = K - KR;
+        int kind = rec->kd & 3;
+        struct cont *f = &stk[sp++];
+        f->K = K; f->KR = KR; f->KL = KL; f->out = out; f->tmp = tmp;
+        f->kind = (uint8_t)kind; f->phase = 0;
+        if (kind == PIVCOH__LEAFL) {
+            f->sym = t->rank_to_sym[rec->param];   /* the one child, in place */
+            cidx = idx + rec->right; cK = KR; cout = out + KL; ctmp = tmp;
+        } else {                                   /* FULL: larger child first */
+            int rb = (KR > KL);
+            f->right_big = (uint8_t)rb;
+            f->small_idx = rb ? idx + 1 : idx + rec->right;
+            f->small_K   = rb ? KL : KR;
+            cidx = rb ? idx + rec->right : idx + 1;
+            cK   = rb ? KR : KL;
+            cout = out + (rb ? KL : KR);           /* big child in out's tail */
+            ctmp = tmp;
+        }
     }
-    /* FULL: both children internal, larger first on the wire. */
-    if (KR > KL) {
-        if (!(p = pivcoh__dec(t, idx + rec->right, KR, out + KL, tmp, p, end)))
-            return NULL;
-        if (KL > 0 && !(p = pivcoh__dec(t, idx + 1, KL, tmp, out, p, end)))
-            return NULL;
+try_child:          /* decode child (cidx, cK, cout, ctmp) */
+    if (cK != 0) {
+        const pivcoh__rec *crec = &t->sched[cidx];
+        unsigned ckd = crec->kd;
+        if ((ckd & 3) == PIVCOH__FLAT) {
+            unsigned D = ckd >> 2;
+            size_t nb = ((size_t)cK * (size_t)D + 7) >> 3;
+            size_t avail = (size_t)(end - p);
+            if (avail < nb) return NULL;
+            pivcoh__merge_flat(cout, cK, p, (int)D, t->rank_to_sym + crec->param,
+                               avail - nb >= 16);
+            p += nb;
+        } else {                                   /* internal: descend */
+            idx = cidx; K = cK; out = cout; tmp = ctmp;
+            goto descend;
+        }
+    }
+    /* child finished: advance the frames that are now complete */
+    while (sp > 0) {
+        struct cont *f = &stk[sp - 1];
+        if (f->kind == PIVCOH__FULL && f->phase == 0) {   /* big done; do small */
+            f->phase = 1;
+            cidx = f->small_idx; cK = f->small_K; cout = f->tmp; ctmp = f->out;
+            goto try_child;
+        }
         const uint8_t *bm;
-        if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
-        if (pivcoh__merge_vec_vec(bm, K, tmp, KL, out + KL, KR, out)) return NULL;
-    } else {
-        if (!(p = pivcoh__dec(t, idx + 1, KL, out + KR, tmp, p, end)))
-            return NULL;
-        if (KR > 0 && !(p = pivcoh__dec(t, idx + rec->right, KR, tmp, out, p, end)))
-            return NULL;
-        const uint8_t *bm;
-        if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
-        if (pivcoh__merge_vec_vec(bm, K, out + KR, KL, tmp, KR, out)) return NULL;
+        if (!(p = pivcoh__read_bm(&bm, f->K, p, end))) return NULL;
+        if (f->kind == PIVCOH__LEAFL) {
+            if (pivcoh__merge_cst_vec(bm, f->K, f->sym, f->out + f->KL, f->KR, f->out))
+                return NULL;
+        } else {
+            int smallK = f->right_big ? f->KL : f->KR;
+            uint8_t *big_out = f->out + smallK;
+            uint8_t *lbuf = f->right_big ? f->tmp : big_out;
+            uint8_t *rbuf = f->right_big ? big_out : f->tmp;
+            if (pivcoh__merge_vec_vec(bm, f->K, lbuf, f->KL, rbuf, f->KR, f->out))
+                return NULL;
+        }
+        sp--;
     }
     return p;
 }
@@ -2065,7 +2120,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
     if (kind == PIVCOH__LEAFL) {
         /* One internal child: it decodes at the arena base with the
          * space after it as ping-pong partner. */
-        if (KR > 0) p = pivcoh__dec(t, root->right, KR, sc, sc + KR, p, end);
+        if (KR > 0) p = pivcoh__dec_child(t, root->right, KR, sc, sc + KR, p, end);
         if (p && (p = pivcoh__read_bm(&bm, N, p, end)) != NULL &&
             pivcoh__merge_cst_vec_x(bm, N, t->rank_to_sym[root->param], sc, KR, out))
             p = NULL;
@@ -2079,12 +2134,12 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
         uint8_t *lbuf, *rbuf;
         if (KR > KL) {
             rbuf = sc; lbuf = sc + KR;
-            p = pivcoh__dec(t, root->right, KR, rbuf, lbuf, p, end);
-            if (p && KL > 0) p = pivcoh__dec(t, 1, KL, lbuf, sc + N, p, end);
+            p = pivcoh__dec_child(t, root->right, KR, rbuf, lbuf, p, end);
+            if (p && KL > 0) p = pivcoh__dec_child(t, 1, KL, lbuf, sc + N, p, end);
         } else {
             lbuf = sc; rbuf = sc + KL;
-            p = pivcoh__dec(t, 1, KL, lbuf, rbuf, p, end);
-            if (p && KR > 0) p = pivcoh__dec(t, root->right, KR, rbuf, sc + N, p, end);
+            p = pivcoh__dec_child(t, 1, KL, lbuf, rbuf, p, end);
+            if (p && KR > 0) p = pivcoh__dec_child(t, root->right, KR, rbuf, sc + N, p, end);
         }
         if (p && (p = pivcoh__read_bm(&bm, N, p, end)) != NULL &&
             pivcoh__merge_vec_vec_x(bm, N, lbuf, KL, rbuf, KR, out))
