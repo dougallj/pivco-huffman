@@ -887,11 +887,18 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
                 const int k1 = 2 * jp2 + pp;
                 const int t1 = t0 + jp2;
                 const int d = (t1 ^ k1) & 1;
-                const float *src = cost + (size_t)t1 * W
-                                 + (size_t)((k1 - d - (t1 & 1)) >> 1);
+                /* Signed source index into cost[]: at the odd branch's
+                 * degenerate k = 0 cell the offset (k1 - d - (t1 & 1)) >> 1
+                 * is negative.  The net cell is in-bounds and never read
+                 * there, but casting that lone offset to size_t would wrap
+                 * the pointer backwards (UB); keeping the whole index
+                 * signed and indexing cost[]/dP0[] avoids forming any
+                 * out-of-array pointer (a negative sentinel index is just
+                 * an integer). */
+                ptrdiff_t si = (ptrdiff_t)t1 * W + ((k1 - d - (t1 & 1)) >> 1);
                 if (d == 0) {
-                    for (; jp2 >= jlo; jp2 -= 2, src -= 2 * W + 2)
-                        nrow[jp2] = *src;
+                    for (; jp2 >= jlo; jp2 -= 2, si -= 2 * W + 2)
+                        nrow[jp2] = cost[si];
                 } else {
                     /* k = 0 has no lone-leaf predecessor: if this
                      * chain reaches cell (jp2 = 0, k = 0), stop above
@@ -901,9 +908,9 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
                         floor2 = 2;
                         patch0 = 1;
                     }
-                    const float *dp0 = dP0 + k1;
-                    for (; jp2 >= floor2; jp2 -= 2, src -= 2 * W + 2, dp0 -= 4)
-                        nrow[jp2] = *src + a0 * *dp0 + tcz;
+                    ptrdiff_t di = k1;
+                    for (; jp2 >= floor2; jp2 -= 2, si -= 2 * W + 2, di -= 4)
+                        nrow[jp2] = cost[si] + a0 * dP0[di] + tcz;
                     if (patch0)
                         nrow[0] = INFINITY;
                 }
