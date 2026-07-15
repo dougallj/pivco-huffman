@@ -941,53 +941,74 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
     return J;
 }
 
-/* Chunk list (r, D, W) of the table pivcoh_table_from_lens will build
- * from these lens: within a length class the builder takes symbols in
- * ascending symbol order and splits the class count largest-set-bit
- * first, so chunk membership — and with it each chunk's weight — is a
- * function of lens alone, NOT of the deal that chose them.  Pricing
- * the guard on these realized weights (both sides) keeps it honest:
+/* Realized chunk lists (r, D, W) for BOTH lens images — the incoming
+ * baseline lb and the deal's candidate lc — priced as the tables
+ * pivcoh_table_from_lens will build: within a class the builder takes
+ * symbols in ascending symbol order and splits the count largest-set-
+ * bit first, so chunk membership — and with it each chunk's weight —
+ * is a function of lens alone, NOT of the deal that chose them.
+ * Pricing the guard on realized weights (both sides) keeps it honest:
  * the DP's sorted matching of heavy symbols to cheap chunks is a
  * search relaxation the canonical rebuild does not reproduce.
- * Frequencies narrow to u32 as in the leaf sort.  Emission order is
- * the builder's generation order; jl_time's (r, D)-ascending sort
- * turns it into the realized tree order either way. */
-static int pivcoh__jl_realized(const uint8_t lens[256],
-                               const uint64_t freq[256],
-                               pivcoh__jl_ch *ch)
+ *
+ * cnt* are per-class symbol counts, supplied by the caller (they fall
+ * out of data already at hand); bins 0 and 12..15 are trash (absent /
+ * garbage lengths — internal lens never exceed MAXLEN).  One fused
+ * ascending 256-symbol sweep then deals every class's chunk cursor on
+ * both sides simultaneously — ascending symbol order IS the builder's
+ * membership order — with absent symbols draining into a zero-weight
+ * dummy chunk via the &15 trash bins, branchlessly (their weight
+ * contribution is 0.0).  ~0.25 us/solve; a per-class-sweep form cost
+ * ~2.5 us, 40-60% of coarse-tier ebuild.  Frequencies narrow to u32
+ * as in the leaf sort. */
+static void pivcoh__jl_realized2(const uint8_t *lb, const uint8_t *lc,
+                                 const int cntb[16], const int cntc[16],
+                                 const uint64_t freq[256],
+                                 pivcoh__jl_ch chb[40], int *nb_out,
+                                 pivcoh__jl_ch chc[40], int *nc_out)
 {
-    int cnt[PIVCOH__MAXLEN + 1] = {0};
-    for (int s = 0; s < 256; s++) {
-        const int L = lens[s];
-        if (L >= 1 && L <= PIVCOH__MAXLEN) cnt[L]++;
-    }
-    int nch = 0;
-    int cur[PIVCOH__MAXLEN + 1], left[PIVCOH__MAXLEN + 1],
-        end[PIVCOH__MAXLEN + 1];
+    int curb[16], curc[16], leftb[16], leftc[16], endb[16], endc[16];
+    int nb = 0, nc = 0;
     for (int L = 1; L <= PIVCOH__MAXLEN; L++) {
-        cur[L] = nch;
-        for (int b = 8; b >= 0; b--)
-            if (cnt[L] & (1 << b)) {
-                ch[nch].r = (uint8_t)(b ? L - b : L);
-                ch[nch].D = (uint8_t)b;
-                ch[nch].W = 0.0;
-                nch++;
+        curb[L] = nb;
+        curc[L] = nc;
+        for (int b = 8; b >= 0; b--) {
+            if (cntb[L] & (1 << b)) {
+                chb[nb].r = (uint8_t)(b ? L - b : L);
+                chb[nb].D = (uint8_t)b;
+                chb[nb].W = 0.0;
+                nb++;
             }
-        end[L]  = nch;
-        left[L] = cur[L] < nch ? 1 << ch[cur[L]].D : 0;
+            if (cntc[L] & (1 << b)) {
+                chc[nc].r = (uint8_t)(b ? L - b : L);
+                chc[nc].D = (uint8_t)b;
+                chc[nc].W = 0.0;
+                nc++;
+            }
+        }
+        endb[L]  = nb;
+        endc[L]  = nc;
+        leftb[L] = curb[L] < nb ? 1 << chb[curb[L]].D : 1;
+        leftc[L] = curc[L] < nc ? 1 << chc[curc[L]].D : 1;
     }
-    /* one ascending symbol pass deals every class simultaneously: each
-     * class's cursor walks its chunks in the builder's largest-first
-     * order as its symbols stream by (~2 x 256 iterations total; the
-     * per-class vceq-sweep form cost ~2.5 us/solve, 40-60% of ebuild) */
+    chb[nb].W = chc[nc].W = 0.0;          /* trash-bin dummy sinks */
+    for (int t = 0; t < 16; t++)
+        if (t == 0 || t > PIVCOH__MAXLEN) {
+            curb[t] = nb; endb[t] = nb; leftb[t] = 0x7fffffff;
+            curc[t] = nc; endc[t] = nc; leftc[t] = 0x7fffffff;
+        }
     for (int s = 0; s < 256; s++) {
-        const int L = lens[s];
-        if (L < 1 || L > PIVCOH__MAXLEN) continue;
-        ch[cur[L]].W += (double)(uint32_t)freq[s];
-        if (--left[L] == 0 && ++cur[L] < end[L])
-            left[L] = 1 << ch[cur[L]].D;
+        const double f = (double)(uint32_t)freq[s];
+        const int Lb = lb[s] & 15, Lc = lc[s] & 15;
+        chb[curb[Lb]].W += f;
+        if (--leftb[Lb] == 0 && ++curb[Lb] < endb[Lb])
+            leftb[Lb] = 1 << chb[curb[Lb]].D;
+        chc[curc[Lc]].W += f;
+        if (--leftc[Lc] == 0 && ++curc[Lc] < endc[Lc])
+            leftc[Lc] = 1 << chc[curc[Lc]].D;
     }
-    return nch;
+    *nb_out = nb;
+    *nc_out = nc;
 }
 
 /* Core over the build's leaf array (ascending — reversed in place
@@ -1019,18 +1040,12 @@ static int pivcoh__jl_core(pivcoh__leaf *sf, int sigma,
     P[0] = 0.0;
     for (int i = 0; i < sigma; i++) P[i + 1] = P[i] + (double)sf[i].freq;
 
-    /* Baseline model for the adoption guard: bits + kind-aware decode
-     * time of the INCOMING lengths, on the realized chunk weights
-     * (exact canonical skeleton, exact membership). */
-    double base_bits = 0, base_time;
-    {
-        pivcoh__jl_ch pch[40];
-        const int npc = pivcoh__jl_realized(lens, freq, pch);
-        for (int i = 0; i < npc; i++)
-            base_bits += pch[i].W * (double)(pch[i].r + pch[i].D);
-        base_time = pivcoh__jl_time(pch, npc, &jv, kap, P[sigma]);
-        if (base_time < 0) return -1;
-    }
+    /* Baseline class counts (the guard itself is priced after the deal,
+     * one fused pass covering both sides; internal lens are <= MAXLEN
+     * so the &15 bins are exact, with 0 collecting absent symbols). */
+    int cntb[16] = {0};
+    for (int i = 0; i < sigma; i++)
+        cntb[lens[sf[i].sym] & 15]++;
 
     /* Per-take fixed-cost constants: lambda * gamma * blocks, one
      * record for D0 takes (the skeleton merge above the leaf), two for
@@ -1138,16 +1153,24 @@ static int pivcoh__jl_core(pivcoh__leaf *sf, int sigma,
         }
         if (cur != sigma_pad) return -1;
     }
-    /* Apply the adoption guard on the table the decoder will actually
+    /* Apply the adoption guard on the tables the decoder will actually
      * build: the deal's heavy-to-cheap matching is not realizable (the
      * rebuild redistributes a class's symbols over its chunks in symbol
-     * order), so price the realized weights.  Ghost chunks carry zero
-     * weight, so real symbols are scored exactly. */
+     * order), so both sides price the realized weights.  Ghost chunks
+     * carry zero weight, so real symbols are scored exactly. */
+    double base_bits = 0, base_time;
     {
-        pivcoh__jl_ch dch[40];
-        const int ndc = pivcoh__jl_realized(cand, freq, dch);
-        dp_time = pivcoh__jl_time(dch, ndc, &jv, kap, P[sigma]);
-        if (dp_time < 0) return -1;
+        pivcoh__jl_ch chb[40], chc[40];
+        int cntc[16] = {0}, nb, nc;
+        for (int i = 0; i < nchunks; i++)
+            cntc[chunks[i].L] += chunks[i].size;
+        pivcoh__jl_realized2(lens, cand, cntb, cntc, freq,
+                             chb, &nb, chc, &nc);
+        for (int i = 0; i < nb; i++)
+            base_bits += chb[i].W * (double)(chb[i].r + chb[i].D);
+        base_time = pivcoh__jl_time(chb, nb, &jv, kap, P[sigma]);
+        dp_time   = pivcoh__jl_time(chc, nc, &jv, kap, P[sigma]);
+        if (base_time < 0 || dp_time < 0) return -1;
     }
     if (!(dp_time <= gtime * base_time && dp_bits <= gbits * base_bits))
         return -1;
