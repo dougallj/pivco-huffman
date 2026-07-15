@@ -2441,16 +2441,11 @@ static inline void pivcoh__pack_d3(uint8_t *out, const uint8_t *ranks, int n, ui
     }
 }
 
-/* D=8: byte-aligned; no blend needed — the junk bytes past n are all
- * beyond the region, and there is no partial byte to zero-pad. */
-static inline void pivcoh__pack_d8(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
-{
-    uint8x16_t vb = vdupq_n_u8(base);
-    for (int i = 0; i < n; i += 16)
-        vst1q_u8(out + i, vsubq_u8(vld1q_u8(ranks + i), vb));
-}
-
-/* Dispatcher: D is structural (1..8); every kernel packs all n codes. */
+/* Dispatcher: D is structural (1..8); every kernel packs all n codes.
+ * D=8 is a full-alphabet equal-length code (256 ranks at one depth is
+ * only Kraft-exact as the whole tree), so base == 0 and the byte-
+ * aligned ranks ARE the local codes — memcpy, mirroring the decode
+ * side, with no read or write past the region. */
 static void pivcoh__pack_dN(uint8_t *out, const uint8_t *ranks,
                             int n, int D, uint8_t base)
 {
@@ -2462,7 +2457,7 @@ static void pivcoh__pack_dN(uint8_t *out, const uint8_t *ranks,
     case 5: pivcoh__pack_d5(out, ranks, n, base); break;
     case 6: pivcoh__pack_d6(out, ranks, n, base); break;
     case 7: pivcoh__pack_d7(out, ranks, n, base); break;
-    case 8: pivcoh__pack_d8(out, ranks, n, base); break;
+    case 8: memcpy(out, ranks, (size_t)n); break;
     }
     /* Zero the padding bits of the last partial byte (the kernels'
      * final vector packed garbage there); one store-forwarded RMW,
