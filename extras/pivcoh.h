@@ -976,13 +976,11 @@ static void pivcoh__jl_realized2(const uint8_t *lb, const uint8_t *lc,
             if (cntb[L] & (1 << b)) {
                 chb[nb].r = (uint8_t)(b ? L - b : L);
                 chb[nb].D = (uint8_t)b;
-                chb[nb].W = 0.0;
                 nb++;
             }
             if (cntc[L] & (1 << b)) {
                 chc[nc].r = (uint8_t)(b ? L - b : L);
                 chc[nc].D = (uint8_t)b;
-                chc[nc].W = 0.0;
                 nc++;
             }
         }
@@ -991,22 +989,28 @@ static void pivcoh__jl_realized2(const uint8_t *lb, const uint8_t *lc,
         leftb[L] = curb[L] < nb ? 1 << chb[curb[L]].D : 1;
         leftc[L] = curc[L] < nc ? 1 << chc[curc[L]].D : 1;
     }
-    chb[nb].W = chc[nc].W = 0.0;          /* trash-bin dummy sinks */
     for (int t = 0; t < 16; t++)
         if (t == 0 || t > PIVCOH__MAXLEN) {
             curb[t] = nb; endb[t] = nb; leftb[t] = 0x7fffffff;
             curc[t] = nc; endc[t] = nc; leftc[t] = 0x7fffffff;
         }
+    /* u64 accumulators: chunk weights are sums of <= 256 u32 values
+     * (< 2^40), exact in either u64 or double — bit-identical prices,
+     * but integer adds dodge the ucvtf + FP-latency chain per symbol.
+     * Index nb/nc is the trash-bin dummy sink. */
+    uint64_t wb[41] = {0}, wc[41] = {0};
     for (int s = 0; s < 256; s++) {
-        const double f = (double)(uint32_t)freq[s];
+        const uint32_t f = (uint32_t)freq[s];
         const int Lb = lb[s] & 15, Lc = lc[s] & 15;
-        chb[curb[Lb]].W += f;
+        wb[curb[Lb]] += f;
         if (--leftb[Lb] == 0 && ++curb[Lb] < endb[Lb])
             leftb[Lb] = 1 << chb[curb[Lb]].D;
-        chc[curc[Lc]].W += f;
+        wc[curc[Lc]] += f;
         if (--leftc[Lc] == 0 && ++curc[Lc] < endc[Lc])
             leftc[Lc] = 1 << chc[curc[Lc]].D;
     }
+    for (int i = 0; i < nb; i++) chb[i].W = (double)wb[i];
+    for (int i = 0; i < nc; i++) chc[i].W = (double)wc[i];
     *nb_out = nb;
     *nc_out = nc;
 }
