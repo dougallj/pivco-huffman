@@ -617,10 +617,13 @@ static double pivcoh__jl_sim(const pivcoh__jl_ch *ch, int n, int *i, int d,
     return t + tl + tr;
 }
 
-/* Kind-aware decode time for a chunk list (any order; sorted here by
- * root depth asc, D desc, W desc).  The prefill chunk is the heaviest-
- * per-symbol chunk, if it is a lone leaf — exact under the deal's
- * sorted order. */
+/* Kind-aware decode time for a chunk list (any order; sorted here into
+ * the order the table builder realizes: root depth asc, D asc.  The
+ * builder stable-sorts its L-ascending generation by depth only, and
+ * equal-depth chunks from lower classes have smaller D, so depth-then-D
+ * ascending IS that order — and since a class emits each D at most
+ * once, (r, D) is unique and the sort is total).  The prefill chunk is
+ * the heaviest-per-symbol chunk, if it is a lone leaf. */
 static double pivcoh__jl_time(pivcoh__jl_ch *ch, int n,
                               const pivcoh_joint *jp, const double *kap,
                               double total_weight)
@@ -629,8 +632,7 @@ static double pivcoh__jl_time(pivcoh__jl_ch *ch, int n,
     for (i = 1; i < n; i++) {
         pivcoh__jl_ch c = ch[i];
         for (j = i - 1; j >= 0 && (ch[j].r > c.r ||
-                 (ch[j].r == c.r && (ch[j].D < c.D ||
-                  (ch[j].D == c.D && ch[j].W < c.W)))); j--)
+                 (ch[j].r == c.r && ch[j].D > c.D)); j--)
             ch[j + 1] = ch[j];
         ch[j + 1] = c;
     }
@@ -939,6 +941,43 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
     return J;
 }
 
+/* Chunk list (r, D, W) of the table pivcoh_table_from_lens will build
+ * from these lens: within a length class the builder takes symbols in
+ * ascending symbol order and splits the class count largest-set-bit
+ * first, so chunk membership — and with it each chunk's weight — is a
+ * function of lens alone, NOT of the deal that chose them.  Pricing
+ * the guard on these realized weights (both sides) keeps it honest:
+ * the DP's sorted matching of heavy symbols to cheap chunks is a
+ * search relaxation the canonical rebuild does not reproduce.
+ * Frequencies narrow to u32 as in the leaf sort.  Emission order is
+ * the builder's generation order; jl_time's (r, D)-ascending sort
+ * turns it into the realized tree order either way. */
+static int pivcoh__jl_realized(const uint8_t lens[256],
+                               const uint64_t freq[256],
+                               pivcoh__jl_ch *ch)
+{
+    int nch = 0;
+    for (int L = 1; L <= PIVCOH__MAXLEN; L++) {
+        double cw[257];
+        int cnt = 0;
+        cw[0] = 0.0;
+        for (int s = 0; s < 256; s++)
+            if (lens[s] == L) {
+                cw[cnt + 1] = cw[cnt] + (double)(uint32_t)freq[s];
+                cnt++;
+            }
+        for (int b = 8, at = 0; b >= 0; b--)
+            if (cnt & (1 << b)) {
+                ch[nch].r = (uint8_t)(b ? L - b : L);
+                ch[nch].D = (uint8_t)b;
+                ch[nch].W = cw[at + (1 << b)] - cw[at];
+                at += 1 << b;
+                nch++;
+            }
+    }
+    return nch;
+}
+
 /* Core over the build's leaf array (ascending — reversed in place
  * here; ghost-padding may append).  Overwrites lens[] on adoption;
  * any reject leaves them untouched. */
@@ -969,31 +1008,14 @@ static int pivcoh__jl_core(pivcoh__leaf *sf, int sigma,
     for (int i = 0; i < sigma; i++) P[i + 1] = P[i] + (double)sf[i].freq;
 
     /* Baseline model for the adoption guard: bits + kind-aware decode
-     * time of the INCOMING lengths (exchangeable per-class weights,
-     * exact canonical skeleton). */
+     * time of the INCOMING lengths, on the realized chunk weights
+     * (exact canonical skeleton, exact membership). */
     double base_bits = 0, base_time;
-    int    cls_n[PIVCOH__MAXLEN + 1] = {0};
     {
-        double cls_w[PIVCOH__MAXLEN + 1] = {0};
-        for (int i = 0; i < sigma; i++) {
-            int L = lens[sf[i].sym];
-            if (L < 1 || L > PIVCOH__MAXLEN) L = PIVCOH__MAXLEN;
-            cls_n[L]++; cls_w[L] += (double)sf[i].freq;
-        }
         pivcoh__jl_ch pch[40];
-        int npc = 0;
-        for (int L = 1; L <= PIVCOH__MAXLEN; L++) {
-            if (!cls_n[L]) continue;
-            base_bits += cls_w[L] * L;
-            const double wbar = cls_w[L] / (double)cls_n[L];
-            for (int b = 0; b <= 8; b++)
-                if (cls_n[L] & (1 << b)) {
-                    pch[npc].r = (uint8_t)(L - b);
-                    pch[npc].D = (uint8_t)b;
-                    pch[npc].W = wbar * (double)(1 << b);
-                    npc++;
-                }
-        }
+        const int npc = pivcoh__jl_realized(lens, freq, pch);
+        for (int i = 0; i < npc; i++)
+            base_bits += pch[i].W * (double)(pch[i].r + pch[i].D);
         base_time = pivcoh__jl_time(pch, npc, &jv, kap, P[sigma]);
         if (base_time < 0) return -1;
     }
@@ -1086,37 +1108,38 @@ static int pivcoh__jl_core(pivcoh__leaf *sf, int sigma,
                 chunks[i].size = (uint16_t)(1 << b);
             }
 
-    /* Model the result and apply the adoption guard.  Ghost chunks
-     * carry zero weight, so the model scores real symbols exactly. */
+    /* Deal freq-sorted symbols to the chunks in that same order, into
+     * a CANDIDATE lens image (the caller's lens hold the baseline until
+     * the guard passes).  Ghosts (sorted last) take the dearest chunks:
+     * unused byte values receive real codes the encoder never emits.
+     * dp_bits is exact off the deal — bits depend only on per-symbol
+     * length, which the rebuild preserves. */
+    uint8_t cand[256];
     double dp_bits = 0, dp_time;
+    memcpy(cand, lens, 256);
     {
-        pivcoh__jl_ch dch[40];
         int cur = 0;
         for (int i = 0; i < nchunks; i++) {
-            const int L = chunks[i].L, b = chunks[i].b;
-            double w = P[cur + chunks[i].size] - P[cur];
-            dp_bits += w * L;
-            dch[i].r = (uint8_t)(L - b);
-            dch[i].D = (uint8_t)b;
-            dch[i].W = w;
-            cur += chunks[i].size;
+            dp_bits += (P[cur + chunks[i].size] - P[cur]) * chunks[i].L;
+            for (int j = 0; j < chunks[i].size; j++)
+                cand[sf[cur++].sym] = chunks[i].L;
         }
         if (cur != sigma_pad) return -1;
-        dp_time = pivcoh__jl_time(dch, nchunks, &jv, kap, P[sigma]);
+    }
+    /* Apply the adoption guard on the table the decoder will actually
+     * build: the deal's heavy-to-cheap matching is not realizable (the
+     * rebuild redistributes a class's symbols over its chunks in symbol
+     * order), so price the realized weights.  Ghost chunks carry zero
+     * weight, so real symbols are scored exactly. */
+    {
+        pivcoh__jl_ch dch[40];
+        const int ndc = pivcoh__jl_realized(cand, freq, dch);
+        dp_time = pivcoh__jl_time(dch, ndc, &jv, kap, P[sigma]);
         if (dp_time < 0) return -1;
     }
     if (!(dp_time <= gtime * base_time && dp_bits <= gbits * base_bits))
         return -1;
-
-    /* Deal freq-sorted symbols to the chunks in that same order.
-     * Ghosts (sorted last) land in the final, dearest chunk: unused
-     * byte values receive real codes the encoder never emits. */
-    {
-        int cur = 0;
-        for (int i = 0; i < nchunks; i++)
-            for (int j = 0; j < chunks[i].size; j++)
-                lens[sf[cur++].sym] = chunks[i].L;
-    }
+    memcpy(lens, cand, 256);
     return 0;
 }
 
