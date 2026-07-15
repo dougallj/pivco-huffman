@@ -168,6 +168,45 @@ int main(void)
       memset(lens, 0, 256); lens[0] = 2; lens[1] = 2;             /* under-subscribed */
       if (pivcoh_table_from_lens(&mini, lens)) FAIL("accepted kraft < 1"); }
 
+    /* High-window alphabets (every used symbol > 128): before the
+     * enc_umin clamp, enc_init's half-size path read past sym_to_rank.
+     * Full wire/roundtrip parity via one_case, then the out-of-window
+     * contract: a frequency-zero symbol must encode as rank 0, i.e.
+     * byte-identical to a stream with rank_to_sym[0] in its place. */
+    { memset(freq, 0, sizeof(freq));
+      for (int s = 200; s <= 220; s++) freq[s] = 1 + rng() % 65535;
+      one_case(freq, "hiwin.200-220", 0);
+      memset(freq, 0, sizeof(freq));
+      for (int s = 129; s <= 255; s++) freq[s] = 1 + rng() % 65535;
+      one_case(freq, "hiwin.129-255", 0);            /* base clamps to 128 */
+      memset(freq, 0, sizeof(freq));
+      freq[255] = 3;                                 /* umin would be 255 */
+      one_case(freq, "hiwin.255", 0);
+
+      const char *tag = "hiwin.oow"; int id = 0;
+      memset(freq, 0, sizeof(freq));
+      for (int s = 200; s <= 220; s++) freq[s] = 1 + rng() % 65535;
+      memset(&mini, 0, sizeof(mini));
+      if (!pivcoh_table_from_freqs(&mini, freq)) FAIL("build");
+      for (int i = 0; i < 4096; i++) blk[i] = (uint8_t)(200 + rng() % 21);
+      static uint8_t blk2[4096], enc2[65536];
+      memcpy(blk2, blk, 4096);
+      for (int i = 0; i < 4096; i += 9) {            /* sprinkle both OOW
+                                                        classes: below the
+                                                        window (wraps) and
+                                                        inside it, unused
+                                                        (zero s2r bytes) */
+          blk[i] = (i & 16) ? (uint8_t)(i % 200)     /* 0..199: below     */
+                            : (uint8_t)(221 + i % 35); /* 221..255: inside */
+          blk2[i] = mini.rank_to_sym[0];
+      }
+      ptrdiff_t e1 = pivcoh_encode(&mini, blk, 4096, enc_mini,
+                                   sizeof(enc_mini), scratch);
+      ptrdiff_t e2 = pivcoh_encode(&mini, blk2, 4096, enc2,
+                                   sizeof(enc2), scratch);
+      if (e1 < 0 || e1 != e2 || memcmp(enc_mini, enc2, (size_t)e1))
+          FAIL("out-of-window symbol not rank 0 (%td vs %td)", e1, e2); }
+
     /* Joint length/shape tiers.  Production on this branch has no joint
      * pass (defaults keep exact parity above), so these are consistency
      * checks: every tier's lengths form a table both engines accept, the

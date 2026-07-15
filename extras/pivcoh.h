@@ -2008,7 +2008,10 @@ static void pivcoh__enc_init(uint8_t *ranks, int n, const uint8_t *sym,
 {
     int i = 0;
     if (n >= 20 && span1 < 128) {
-        const uint8_t *w = s2r + umin;         /* umin + 128 <= 256 */
+        const uint8_t *w = s2r + umin;         /* umin <= 128 (clamped at
+                                                  enc-view build), so the
+                                                  128-byte window stays
+                                                  inside sym_to_rank */
         uint8x16x4_t t0 = vld1q_u8_x4(w), t1 = vld1q_u8_x4(w + 64);
         const uint8x16_t vmin = vdupq_n_u8((uint8_t)umin);
         const uint8x16_t s64  = vdupq_n_u8(64);
@@ -2560,6 +2563,12 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
         int lo = 255, hi = 0;
         for (int s = 0; s < 256; s++)
             if (t->code_len[s]) { if (s < lo) lo = s; if (s > hi) hi = s; }
+        if (lo > 128) lo = 128; /* keep enc_init's 128-byte window inside
+                                   sym_to_rank; span1 stays < 128 (hi <=
+                                   255) so all-high alphabets keep the
+                                   half-size path, and symbols below the
+                                   window still wrap to >= 128 -> both
+                                   lookups miss -> rank 0 as documented */
         tw->enc_umin  = (uint8_t)lo;
         tw->enc_span1 = (uint8_t)(hi - lo);
         tw->enc_ready = 1;
