@@ -2508,6 +2508,18 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
     int n_right = (kind == PIVCOH__LEAFL)
         ? pivcoh__part_core(ranks, n, rec->param, bm_stage, rout)
         : pivcoh__part_full(ranks, n, rec->param, bm_stage, rout);
+    /* Define the 16 bytes past the fresh right half (inside its 64-byte
+     * gap): the child's tail-free partition/pack loads read up to 15
+     * bytes past its ranks region.  Phantom lanes never reach the wire
+     * (masks are trimmed, the last partial byte is RMW-zeroed), but
+     * genuinely UNINITIALIZED ones would make MSan/valgrind flag the
+     * movemask -> popcount -> cursor/table-index chain as a use of
+     * uninitialized data (their multiply shadow models can't see that
+     * the movemask magic isolates lanes).  One zero store per fresh
+     * region keeps every tail load fully defined; left regions need
+     * nothing — bytes past them are stale parent ranks or scatter junk,
+     * defined once the root window (pivcoh_encode) is. */
+    vst1q_u8(rout + n_right, vdupq_n_u8(0));
     int n_left = n - n_right;
     *p++ = (uint8_t)n_right;                   /* K_right, u16 LE */
     *p++ = (uint8_t)(n_right >> 8);
@@ -2561,6 +2573,13 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
                                                   gap in enc_node) */
     pivcoh__enc_init(ranks, (int)n, in, t->sym_to_rank,
                      t->enc_umin, t->enc_span1);
+    vst1q_u8(ranks + n, vdupq_n_u8(0));        /* root tail-read window:
+                                                  with enc_node's
+                                                  per-partition twin,
+                                                  every tail-free 16-byte
+                                                  load reads fully
+                                                  defined bytes (see
+                                                  enc_node) */
     uint8_t *p = out;
     *p++ = (uint8_t)n;
     *p++ = (uint8_t)(n >> 8);
