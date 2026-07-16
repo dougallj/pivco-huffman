@@ -60,6 +60,16 @@ Reading:
 BALANCED at the fast levels decompresses another +5-7% over SIMPLEST
 (+29.5% / +17.7% / +12.4% over vanilla) and — the twist — COMPRESSES
 faster than the SIMPLEST build, back to vanilla parity at levels 1-2:
+
+RE-VERIFIED 2026-07-17 (methodology note: `zstd -b` self-warms — its
+timed windows sit inside seconds of continuous load, so the DVFS
+concern that bit bench_lz4pv does not apply here).  Alternating
+vanilla/pivco -b -i4 pairs: L1 +26.0/+27.8/+28.4%, L2 +16.5/+17.4%,
+L3 +12.3/+13.4% — L2/L3 match the table; L1's +29.5% was the cool end
+of the band.  ABSOLUTE MB/s on the mini sag ~4% as the chassis warms
+under sustained benching (both builds together: vanilla dec ran
+1906-2004, pivco-bal 2448-2494 across one session), so cite the L1
+headline as ~+27% (2.45-2.6 GB/s vs 1.9-2.0), not the 2594 point.
 the joint solve (~2-4 us/table) is repaid by pivcoh's flatter trees
 encoding faster (fewer partition passes), the same
 whole-file-compress effect measured back on the frame API.  Cost:
