@@ -535,9 +535,9 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         vlo  = vmaxq_u8(vlo,  vmaxq_u8(vmaxq_u8(g0, g1), vmaxq_u8(g2, g3)));
         vmax = vmaxq_u8(vmax, vmaxq_u8(vmaxq_u8(x0, x1), vmaxq_u8(x2, x3)));
     }
+    int minlen = 256 - vmaxvq_u8(vlo);               /* shortest; 256 if all-zero */
     int maxlen = vmaxvq_u8(vmax);                     /* longest code present */
     if (maxlen > PIVCOH__MAXLEN) return 0;            /* invalid length */
-    int minlen = 256 - vmaxvq_u8(vlo);               /* shortest; 256 if all-zero */
     for (int g = 0; g < 4; g++) {             /* pass 2: classify live range only */
         const uint8_t *b = code_len + 64 * g;
         uint8x16_t x0 = vld1q_u8(b),      x1 = vld1q_u8(b + 16),
@@ -550,13 +550,15 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         }
     }
 
-    /* Extract items[] in (length, symbol) order + per-length counts.  Each
-     * non-empty class byte scatters through select8 + one 8-byte store
-     * (the <= 7 junk bytes past the popcount are absorbed by items's pad
-     * and the next store), replacing the per-symbol ctz loop whose
-     * data-dependent branch is unpredictable.  n_used advances by the
-     * precomputed popc byte (an AND), keeping the scalar popcount's
-     * GPR<->SIMD round-trip off the store's serial address chain. */
+    /* Extract items[] in (length, symbol) order + per-length counts.  Every
+     * sub-group byte (up to the highest set one) scatters through select8 +
+     * one 8-byte store, branchlessly: an empty byte (mm==0) looks up
+     * select8[0]=all-0xFF, so vtbl yields 8 zeros that land at items[n_used]
+     * with n_used unchanged and are overwritten by the next store (or absorbed
+     * by items's 8-byte pad).  Dropping the per-sub-group "if (!mm) continue"
+     * removed an unpredictable branch worth ~1.3x on these tables.  n_used
+     * advances by the precomputed popc byte (an AND), keeping the scalar
+     * popcount's GPR<->SIMD round-trip off the store's serial address chain. */
     uint8_t items[256 + 8];
     int cnt[PIVCOH__MAXLEN + 1], n_used = 0, s;
     const uint8x8_t iota8 = vcreate_u8(0x0706050403020100ull);
@@ -566,7 +568,6 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
             uint64_t m = cmask[L - 1][g], pc = popc[L - 1][g];
             for (int gb = 64 * g; m; gb += 8, m >>= 8, pc >>= 8) {
                 unsigned mm = (unsigned)(m & 0xff);
-                if (!mm) continue;
                 uint8x8_t ids = vadd_u8(iota8, vdup_n_u8((uint8_t)gb));
                 vst1_u8(items + n_used,
                         vtbl1_u8(ids, vld1_u8(pivcoh__select8[mm])));
@@ -601,7 +602,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
             for (i = 8, j = acc; i >= 0; i--)
                 if (cnt[L] & (1 << i)) {
                     ch[nch].bit = (uint8_t)i;
-                    ch[nch].depth = (uint8_t)(i ? L - i : L);
+                    ch[nch].depth = (uint8_t)(L - i);
                     ch[nch].sym_idx = (uint8_t)j;
                     j += 1 << i;
                     nch++;
