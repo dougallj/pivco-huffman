@@ -597,8 +597,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
          * canonical assignment fills the tree left-to-right. */
         pivcoh__chunk ch[49];   /* max sum popcount(cnt[L]): 11 classes, sum <= 256 */
         int nch = 0;
-#ifndef PIVCOH_DIRECT_CHUNKGEN
-        /* Default: generate (length asc, bit desc), then stable depth-sort. */
+        /* Generate (length asc, bit desc), then stable depth-sort. */
         int i, j, acc, L;
         for (L = minlen, acc = 0; L <= maxlen; acc += cnt[L], L++)
             for (i = 8, j = acc; i >= 0; i--)
@@ -614,28 +613,6 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
             for (j = i - 1; j >= 0 && ch[j].depth > c.depth; j--) ch[j + 1] = ch[j];
             ch[j + 1] = c;
         }
-#else
-        /* Experimental (-DPIVCOH_DIRECT_CHUNKGEN): generate directly in the
-         * realized depth-asc/length-asc order, no insertion sort — for a
-         * fixed depth each length has at most one chunk, at bit b = L - depth,
-         * seeded past the larger same-length chunks (the bits of cnt[L] above
-         * b).  Byte-identical chunk lists; measured a wash on silesia-lits
-         * (helps full-alphabet binaries ~5-13%, hurts small-alphabet text
-         * ~12-16%). */
-        int base[PIVCOH__MAXLEN + 1], acc = 0;
-        for (int L = minlen; L <= maxlen; L++) { base[L] = acc; acc += cnt[L]; }
-        for (int depth = 0; depth <= maxlen; depth++)
-            for (int L = minlen; L <= maxlen; L++) {
-                int b = L - depth;
-                if ((unsigned)b <= 8 && (cnt[L] & (1 << b))) {
-                    int earlier = cnt[L] & ~((1 << (b + 1)) - 1);
-                    ch[nch].depth   = (uint8_t)depth;
-                    ch[nch].bit     = (uint8_t)b;
-                    ch[nch].sym_idx = (uint8_t)(base[L] + earlier);
-                    nch++;
-                }
-            }
-#endif
         if (pivcoh__sched(t, ch, nch, items) != 0) return 0;
     }
 
