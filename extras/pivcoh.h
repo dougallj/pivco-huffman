@@ -3218,9 +3218,221 @@ PIVCOHDEF int pivcoh_table_from_packed_lens(pivcoh_table *t,
  *   15, lo, hi  repeat it 19 + (lo | hi<<4) MORE times
  * Run tokens never expand (>= 3 symbols in <= 3 nibbles), so mode 1 is
  * at worst 256 literal nibbles and the writer picks whichever mode is
- * smaller: the wire never exceeds PIVCOH_LENS_WIRE_BOUND.  Zero runs
+ * smallest: the wire never exceeds PIVCOH_LENS_WIRE_BOUND.  Zero runs
  * carry text alphabets (absent bytes cluster); repeat runs carry
- * shaped trees (the joint pass makes big equal-length classes). */
+ * shaped trees (the joint pass makes big equal-length classes).
+ *
+ * mode 2: the same run structure, entropy-coded — adjacent symbols
+ * have strongly correlated lengths, so lengths are coded as DELTAS
+ * from the previous one under a FIXED canonical prefix code (MSB-first
+ * bits; code lengths trained jointly on the silesia+prague zstd-lits
+ * table populations, both effort modes; ~2.95 b/token vs 2.92 b
+ * entropy — a DEFLATE-fixed-code approach, no table on the wire, no
+ * FSE).  Tokens (extras read MSB-first after the code):
+ *   D0 / D+-1 / D+-2 / D+-3   one symbol, len = prev + delta
+ *   ABS, e(4)                 one symbol, len = 1+e (also the first)
+ *   Z1                        one absent
+ *   ZR4, e(4) / ZR8, e(8)     3+e / 19+e absents
+ *   REP4, e(4) / REP8, e(8)   3+e / 19+e MORE of the last length
+ *   END                       every remaining symbol is absent
+ * The writer emits whichever of the three modes is smallest; mode 2
+ * typically wins text/shaped tables (~15 B under mode 1), mode 1 or 0
+ * dense ones.  Decode is one 512-entry LUT, ~64-100 tokens. */
+enum { PIVCOH__LW_Z1, PIVCOH__LW_ZR4, PIVCOH__LW_ZR8, PIVCOH__LW_D0,
+       PIVCOH__LW_DP1, PIVCOH__LW_DM1, PIVCOH__LW_DP2, PIVCOH__LW_DM2,
+       PIVCOH__LW_DP3, PIVCOH__LW_DM3, PIVCOH__LW_ABS, PIVCOH__LW_REP4,
+       PIVCOH__LW_REP8, PIVCOH__LW_END, PIVCOH__LW_N };
+static const uint8_t  pivcoh__lw2_len[PIVCOH__LW_N] =
+    { 5, 7, 9, 2, 2, 2, 5, 5, 6, 5, 5, 4, 8, 9 };
+static const uint16_t pivcoh__lw2_code[PIVCOH__LW_N] =
+    { 26, 126, 510, 0, 1, 2, 27, 28, 62, 29, 30, 12, 254, 511 };
+static const uint8_t  pivcoh__lw2_xb[PIVCOH__LW_N] =
+    { 0, 4, 8, 0, 0, 0, 0, 0, 0, 0, 4, 4, 8, 0 };
+/* One unified 512-entry decode LUT over 9-bit windows:
+ *   bit 15 set:   the window opens with 1..4 two-bit delta codes
+ *                 (00=D0, 01=+1, 10=-1): bits 13..14 = count-1,
+ *                 bits 0..7 = the deltas, 2 bits each, oldest first
+ *   bit 15 clear: a single non-delta token: bits 8..11 = token,
+ *                 bits 0..3 = its code length */
+static uint16_t pivcoh__lw2_lut[512];
+static int      pivcoh__lw2_ready;
+static void pivcoh__lw2_init(void)
+{
+    if (pivcoh__lw2_ready) return;     /* idempotent fill: benign race */
+    for (int t = 0; t < PIVCOH__LW_N; t++) {
+        const int l = pivcoh__lw2_len[t];
+        if (t >= PIVCOH__LW_D0 && t <= PIVCOH__LW_DM1) continue;
+        const int base = pivcoh__lw2_code[t] << (9 - l);
+        for (int k = 0; k < 1 << (9 - l); k++)
+            pivcoh__lw2_lut[base + k] = (uint16_t)(t << 8 | l);
+    }
+    for (int w = 0; w < 512; w++) {
+        unsigned ent = 0, cnt = 0;
+        for (int k = 0; k < 4; k++) {
+            const int c2 = (w >> (7 - 2 * k)) & 3;
+            if (c2 == 3) break;                    /* '11...': longer code */
+            ent |= (unsigned)c2 << (2 * k);
+            cnt++;
+        }
+        if (cnt)
+            pivcoh__lw2_lut[w] = (uint16_t)(0x8000u | (cnt - 1) << 13 | ent);
+    }
+    pivcoh__lw2_ready = 1;
+}
+
+/* mode-2 writer: returns total wire bytes (mode byte included), or -1
+ * when the stream cannot beat cap bytes (bail early). */
+static int pivcoh__lw2_write(uint8_t *dst, const uint8_t code_len[256], int cap)
+{
+    uint32_t acc = 0;
+    int nbits = 0, len = 1;
+#define PIVCOH__LW2PUT(v_, n_) do { \
+        acc = acc << (n_) | (uint32_t)(v_); \
+        nbits += (n_); \
+        while (nbits >= 8) { \
+            if (len >= cap) return -1; \
+            dst[len++] = (uint8_t)(acc >> (nbits - 8)); \
+            nbits -= 8; \
+        } } while (0)
+#define PIVCOH__LW2TOK(t_) PIVCOH__LW2PUT(pivcoh__lw2_code[t_], pivcoh__lw2_len[t_])
+    int last = 255;
+    while (last >= 0 && code_len[last] == 0) last--;
+    if (last < 0) return -1;           /* no symbols: keep mode 0/1 */
+    int prev = 0, i = 0;
+    while (i <= last) {
+        const uint8_t v = code_len[i];
+        int j = i + 1;
+        while (j <= last && code_len[j] == v) j++;
+        int run = j - i;
+        i = j;
+        if (v == 0) {
+            while (run >= 19) {
+                const int r = run > 274 ? 274 : run;
+                PIVCOH__LW2TOK(PIVCOH__LW_ZR8);
+                PIVCOH__LW2PUT(r - 19, 8);
+                run -= r;
+            }
+            if (run >= 3) { PIVCOH__LW2TOK(PIVCOH__LW_ZR4); PIVCOH__LW2PUT(run - 3, 4); }
+            else while (run-- > 0) PIVCOH__LW2TOK(PIVCOH__LW_Z1);
+            continue;
+        }
+        const int d = v - prev;
+        if (prev == 0 || d < -3 || d > 3) {
+            PIVCOH__LW2TOK(PIVCOH__LW_ABS);
+            PIVCOH__LW2PUT(v - 1, 4);
+        } else {
+            static const uint8_t dt[7] = { PIVCOH__LW_DM3, PIVCOH__LW_DM2,
+                PIVCOH__LW_DM1, PIVCOH__LW_D0, PIVCOH__LW_DP1,
+                PIVCOH__LW_DP2, PIVCOH__LW_DP3 };
+            PIVCOH__LW2TOK(dt[d + 3]);
+        }
+        prev = v;
+        run--;
+        while (run >= 19) {
+            const int r = run > 274 ? 274 : run;
+            PIVCOH__LW2TOK(PIVCOH__LW_REP8);
+            PIVCOH__LW2PUT(r - 19, 8);
+            run -= r;
+        }
+        if (run >= 3) { PIVCOH__LW2TOK(PIVCOH__LW_REP4); PIVCOH__LW2PUT(run - 3, 4); }
+        else while (run-- > 0) PIVCOH__LW2TOK(PIVCOH__LW_D0);
+    }
+    if (last < 255) PIVCOH__LW2TOK(PIVCOH__LW_END);
+    if (nbits > 0) {
+        if (len >= cap) return -1;
+        dst[len++] = (uint8_t)(acc << (8 - nbits));
+    }
+#undef PIVCOH__LW2TOK
+#undef PIVCOH__LW2PUT
+    dst[0] = 2;
+    return len;
+}
+
+/* mode-2 reader: returns bytes consumed or -1. */
+static int pivcoh__lw2_read(uint8_t code_len[256], const uint8_t *src, size_t n)
+{
+    pivcoh__lw2_init();
+    /* Hot loop notes: a 64-bit accumulator is refilled a byte at a
+     * time only when short (<= 2 iterations per token); the dominant
+     * dense-table tokens are the 2-bit deltas, handled without the
+     * extras/run machinery; zero-padding past the stream is harmless
+     * because the per-token bit-budget check rejects overruns. */
+    const size_t total = 8 * (n - 1);
+    uint64_t acc = 0;
+    size_t bit = 0, byte = 1;
+    unsigned filled = 0;
+    int idx = 0, prev = 0;
+    static const int8_t dd[7] = { 0, 1, -1, 2, -2, 3, -3 };
+    while (idx < 256) {
+        if (filled < 17) {                 /* 4-byte refill */
+            unsigned add = 0;
+            for (int r = 0; r < 4; r++)
+                add = add << 8 | (byte + (size_t)r < n ? src[byte + (size_t)r] : 0);
+            byte += 4;
+            acc = acc << 32 | add;
+            filled += 32;
+        }
+        const unsigned e = pivcoh__lw2_lut[(acc >> (filled - 9)) & 511u];
+        if (e & 0x8000u) {                 /* 1..4 delta codes at once */
+            unsigned k = ((e >> 13) & 3) + 1;
+            if (prev == 0) return -1;
+            if (bit + 2 * k > total)
+                k = (unsigned)((total - bit) >> 1);
+            if (idx + (int)k > 256)
+                k = (unsigned)(256 - idx);
+            if (k == 0) return -1;
+            unsigned ds = e;
+            for (unsigned r = 0; r < k; r++, ds >>= 2) {
+                const int fill = prev + ((ds & 3) == 2 ? -1 : (int)(ds & 3));
+                if ((unsigned)(fill - 1) > 10u) return -1;
+                prev = fill;
+                code_len[idx++] = (uint8_t)fill;
+            }
+            bit += 2 * k;
+            filled -= 2 * k;
+            continue;
+        }
+        const int tok = (int)(e >> 8), cl = (int)(e & 15);
+        if ((unsigned)(tok - PIVCOH__LW_D0) < 7u) {   /* D+-2/3 singles */
+            const int fill = prev + dd[tok - PIVCOH__LW_D0];
+            bit += (size_t)cl;
+            if (bit > total || prev == 0 || (unsigned)(fill - 1) > 10u)
+                return -1;
+            filled -= (unsigned)cl;
+            prev = fill;
+            code_len[idx++] = (uint8_t)fill;
+            continue;
+        }
+        const int xb = pivcoh__lw2_xb[tok];
+        bit += (size_t)(cl + xb);
+        if (bit > total) return -1;
+        const unsigned x = xb
+            ? (unsigned)(acc >> (filled - (unsigned)(cl + xb))) & ((1u << xb) - 1)
+            : 0;
+        filled -= (unsigned)(cl + xb);
+        int run, fill;
+        switch (tok) {
+        case PIVCOH__LW_Z1:   run = 1; fill = 0; break;
+        case PIVCOH__LW_ZR4:  run = 3 + (int)x; fill = 0; break;
+        case PIVCOH__LW_ZR8:  run = 19 + (int)x; fill = 0; break;
+        case PIVCOH__LW_ABS:
+            fill = 1 + (int)x;
+            if (fill > 11) return -1;
+            prev = fill; run = 1; break;
+        case PIVCOH__LW_REP4:
+        case PIVCOH__LW_REP8:
+            if (prev == 0) return -1;
+            run = (tok == PIVCOH__LW_REP4 ? 3 : 19) + (int)x;
+            fill = prev; break;
+        default:                            /* END */
+            run = 256 - idx; fill = 0; break;
+        }
+        if (idx + run > 256) return -1;
+        memset(code_len + idx, fill, (size_t)run);
+        idx += run;
+    }
+    return 1 + (int)((bit + 7) >> 3);
+}
 PIVCOHDEF int pivcoh_lens_wire_write(uint8_t *dst, const uint8_t code_len[256])
 {
     uint8_t nib[512];
@@ -3250,6 +3462,29 @@ PIVCOHDEF int pivcoh_lens_wire_write(uint8_t *dst, const uint8_t code_len[256])
         }
     }
     const int rb = (nn + 1) >> 1;
+    const int m1 = rb < 128 ? 1 + rb : 129;
+    /* mode 2 costs a real token-loop parse at decode time (~0.1 us on
+     * text tables, ~0.5 us on dense 256-symbol ones), so it must BUY
+     * something: attempted only when mode 1 is big enough to beat,
+     * adopted only when it saves >= 16 bytes (dense tables save 30-45;
+     * the 2-5 byte marginal wins are not worth the parse).  At zstd's
+     * per-BLOCK table cadence that parse is worth ~4-7% of decode for
+     * huf0 ratio parity; it amortizes away at table-lifetime cadence.
+     * Decoders always accept mode 2; define PIVCOH_LENS_WIRE_NO_MODE2
+     * to never EMIT it (a size-for-decode-speed knob). */
+#ifdef PIVCOH_LENS_WIRE_NO_MODE2
+    (void)m1;
+    (void)pivcoh__lw2_write;
+#else
+    if (m1 >= 40) {
+        uint8_t m2buf[PIVCOH_LENS_WIRE_BOUND];
+        const int m2 = pivcoh__lw2_write(m2buf, code_len, m1 - 16);
+        if (m2 > 0 && m2 <= m1 - 16) {
+            memcpy(dst, m2buf, (size_t)m2);
+            return m2;
+        }
+    }
+#endif
     if (rb < 128) {
         dst[0] = 1;
         for (int k = 0; k < rb; k++) {
@@ -3273,6 +3508,7 @@ PIVCOHDEF int pivcoh_lens_wire_read(uint8_t code_len[256],
         pivcoh_lens_unpack(code_len, src + 1);
         return 129;
     }
+    if (src[0] == 2) return pivcoh__lw2_read(code_len, src, n);
     if (src[0] != 1) return -1;
     const size_t maxnib = 2 * (n - 1) < 512 ? 2 * (n - 1) : 512;
     size_t ni = 0;
