@@ -550,15 +550,17 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         }
     }
 
-    /* Extract items[] in (length, symbol) order + per-length counts.  Every
-     * sub-group byte (up to the highest set one) scatters through select8 +
-     * one 8-byte store, branchlessly: an empty byte (mm==0) looks up
+    /* Extract items[] in (length, symbol) order + per-length counts.  Fully
+     * branchless: a fixed 4 groups x 8 sub-group bytes, each scattered through
+     * select8 + one 8-byte store.  An empty byte (mm==0) looks up
      * select8[0]=all-0xFF, so vtbl yields 8 zeros that land at items[n_used]
      * with n_used unchanged and are overwritten by the next store (or absorbed
-     * by items's 8-byte pad).  Dropping the per-sub-group "if (!mm) continue"
-     * removed an unpredictable branch worth ~1.3x on these tables.  n_used
-     * advances by the precomputed popc byte (an AND), keeping the scalar
-     * popcount's GPR<->SIMD round-trip off the store's serial address chain. */
+     * by items's 8-byte pad).  Both data-dependent branches here hurt on the
+     * M4: dropping the per-sub-group "if (!mm) continue" was ~1.3x, and a
+     * constant 8-count instead of a variable "; m;" exit is a further ~1.1x
+     * (the trip count mispredicts).  n_used advances by the precomputed popc
+     * byte (an AND), keeping the scalar popcount's GPR<->SIMD round-trip off
+     * the store's serial address chain. */
     uint8_t items[256 + 8];
     int cnt[PIVCOH__MAXLEN + 1], n_used = 0, s;
     const uint8x8_t iota8 = vcreate_u8(0x0706050403020100ull);
@@ -566,7 +568,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         int start = n_used;
         for (int g = 0; g < 4; g++) {
             uint64_t m = cmask[L - 1][g], pc = popc[L - 1][g];
-            for (int gb = 64 * g; m; gb += 8, m >>= 8, pc >>= 8) {
+            for (int gb = 64 * g, s8 = 0; s8 < 8; s8++, gb += 8, m >>= 8, pc >>= 8) {
                 unsigned mm = (unsigned)(m & 0xff);
                 uint8x8_t ids = vadd_u8(iota8, vdup_n_u8((uint8_t)gb));
                 vst1_u8(items + n_used,
