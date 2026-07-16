@@ -9,10 +9,12 @@
  * literals fit under — so this is the per-block cadence (--blocks), the
  * only one huf0 can express in one table.
  *
- * pivcoh size = encoded payload + a 128-byte nibble-packed code-length
- * header per window (its frame format; huf0 embeds a compact header and
- * falls back to raw on incompressible blocks, which pivcoh's frame can't
- * yet do — see the sub-128B raw-store idea).  FSE is forced off.
+ * pivcoh size = encoded payload + the v4 code-lengths wire per window
+ * (pivcoh_lens_wire_*, typically 30..60 B), with a raw-store fallback on
+ * windows coding does not shrink — the same two moves huf0 makes (its
+ * FSE-packed weights header and raw fallback).  The decode pass parses
+ * the lens wire and rebuilds the table per window, so header costs are
+ * in the timings for both engines.
  *
  * Usage: bench_huf0_lits [--reps=N] <file.lits>...   (needs sibling .litblk) */
 #define PIVCOH_IMPLEMENTATION
@@ -25,7 +27,7 @@
 #include <time.h>
 
 #define BLK 16384               /* pivcoh sub-block (matches bench_pivcoh_lits) */
-#define LITHDR_BYTES 128        /* pivcoh per-window code-length header */
+#define LWSTRIDE 130            /* per-window lens wire: [len | 0=raw][bytes] */
 
 enum { M_HUF0 = 0, M_SIMPLE = 1, M_BAL = 2, NM = 3 };
 static const char *MNAME[NM] = { "huf0", "pvSMPL", "pvBAL" };
@@ -104,7 +106,7 @@ static int setup_and_gate(const char *base)
     for (int m = 0; m < NM; m++) {
         ENCS[m] = malloc(2 * N + NW * 256 + 65536);
         EOFF[m] = malloc((NW + 1) * sizeof(size_t));
-        LENS[m] = (m == M_HUF0) ? NULL : malloc(NW * 256);
+        LENS[m] = (m == M_HUF0) ? NULL : malloc(NW * LWSTRIDE);
         if (!ENCS[m] || !EOFF[m] || (m != M_HUF0 && !LENS[m])) return -1;
         COMP[m] = 0; EOFF[m][0] = 0;
     }
@@ -121,16 +123,24 @@ static int setup_and_gate(const char *base)
         if (r == 0) { memcpy(ENCS[M_HUF0] + off[M_HUF0], p, wlen); r = wlen; }
         off[M_HUF0] += r; EOFF[M_HUF0][w + 1] = off[M_HUF0]; COMP[M_HUF0] += r;
 
-        /* pivcoh SIMPLEST + BALANCED: payload + 128B length header */
+        /* pivcoh SIMPLEST + BALANCED: payload + lens wire, raw fallback */
         for (int m = M_SIMPLE; m <= M_BAL; m++) {
             pivcoh_table t;
             if (!pv_build(&t, p, wlen, m == M_BAL))
                 return fprintf(stderr, "%s: %s build failed w=%zu\n", base, MNAME[m], w);
-            memcpy(LENS[m] + w * 256, t.code_len, 256);
+            uint8_t *lw = LENS[m] + w * LWSTRIDE;
+            int lwn = pivcoh_lens_wire_write(lw + 1, t.code_len);
+            lw[0] = (uint8_t)lwn;
             ptrdiff_t pl = pv_encode(&t, p, wlen, ENCS[m] + off[m]);
             if (pl < 0) return fprintf(stderr, "%s: %s encode failed w=%zu\n", base, MNAME[m], w);
+            if ((size_t)pl + (size_t)lwn >= wlen) {   /* raw store */
+                memcpy(ENCS[m] + off[m], p, wlen);
+                pl = (ptrdiff_t)wlen;
+                lw[0] = 0;
+                COMP[m] += wlen;
+            } else
+                COMP[m] += (size_t)pl + (size_t)lwn;
             off[m] += (size_t)pl; EOFF[m][w + 1] = off[m];
-            COMP[m] += (size_t)pl + LITHDR_BYTES;
         }
     }
     /* gate: every method round-trips to D */
@@ -145,10 +155,18 @@ static int setup_and_gate(const char *base)
                 if (HUF_isError(d) || d != wlen)
                     return fprintf(stderr, "%s: huf0 decode err w=%zu\n", base, w);
             } else {
-                pivcoh_table t;
-                if (!pivcoh_table_from_lens(&t, LENS[m] + w * 256) ||
-                    pv_decode(&t, src, slen, out, wlen) != 0)
-                    return fprintf(stderr, "%s: %s decode err w=%zu\n", base, MNAME[m], w);
+                const uint8_t *lw = LENS[m] + w * LWSTRIDE;
+                if (lw[0] == 0) {                      /* raw window */
+                    if (slen != wlen) return fprintf(stderr, "%s: raw len w=%zu\n", base, w);
+                    memcpy(out, src, wlen);
+                } else {
+                    uint8_t cl[256];
+                    pivcoh_table t;
+                    if (pivcoh_lens_wire_read(cl, lw + 1, lw[0]) != (int)lw[0] ||
+                        !pivcoh_table_from_lens(&t, cl) ||
+                        pv_decode(&t, src, slen, out, wlen) != 0)
+                        return fprintf(stderr, "%s: %s decode err w=%zu\n", base, MNAME[m], w);
+                }
             }
         }
         if (memcmp(DEC, D, N) != 0)
@@ -168,6 +186,7 @@ static void enc_pass(int m)
         } else {
             pivcoh_table t;
             pv_build(&t, p, wlen, m == M_BAL);
+            pivcoh_lens_wire_write(SCR + SCRCAP - 256, t.code_len);
             pv_encode(&t, p, wlen, SCR);
         }
     }
@@ -182,9 +201,16 @@ static void dec_pass(int m)
         if (m == M_HUF0) {
             HUF_decompress(out, wlen, src, slen);
         } else {
-            pivcoh_table t;
-            pivcoh_table_from_lens(&t, LENS[m] + w * 256);
-            pv_decode(&t, src, slen, out, wlen);
+            const uint8_t *lw = LENS[m] + w * LWSTRIDE;
+            if (lw[0] == 0) {
+                memcpy(out, src, wlen);
+            } else {
+                uint8_t cl[256];
+                pivcoh_table t;
+                pivcoh_lens_wire_read(cl, lw + 1, lw[0]);
+                pivcoh_table_from_lens(&t, cl);
+                pv_decode(&t, src, slen, out, wlen);
+            }
         }
     }
 }

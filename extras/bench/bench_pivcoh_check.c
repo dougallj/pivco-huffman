@@ -1,8 +1,12 @@
 /* bench_pivcoh_check: verifies extras/pivcoh.h (the stb-style single-header
  * codec) against the production library:
- *   - table_from_freqs code_len == pivco_huffman_build_table code_len
- *   - mini encode wire == pivco_huffman_encode wire, byte for byte
- *   - cross-decode both ways + mini roundtrip (malloc and caller-scratch)
+ *   - table_from_freqs code_len == pivco_huffman_build_table code_len,
+ *     and the derived schedule/rank tables match (the TREE is still
+ *     production-identical; only the wire around it is v4's own)
+ *   - mini roundtrips its own v4 wire (malloc and caller-scratch paths,
+ *     deterministic re-encode), production roundtrips its own; outputs
+ *     equal the input on both sides.  Byte-identity of the streams died
+ *     with wire v4 (no FSE marker, 1-byte K_right, lens wire).
  *   - invalid lengths rejected; hostile-stream fuzz (mutations/truncations)
  *     never crashes (run under ASan for the real assurance) */
 #define PIVCOH_IMPLEMENTATION
@@ -71,34 +75,38 @@ static void one_case(const uint64_t freq[256], const char *tag, int id)
         if (pivco_huffman_encode(blk, N, &ref_table, enc_ref, &ref_len) != PIVCO_OK)
             FAIL("ref encode N=%zu", N);
         ptrdiff_t mini_len = pivcoh_encode(&mini, blk, N, enc_mini, sizeof(enc_mini), scratch);
-        if (mini_len < 0 || (size_t)mini_len != ref_len ||
-            memcmp(enc_ref, enc_mini, ref_len)) FAIL("wire differs N=%zu", N);
+        if (mini_len < 0) FAIL("mini encode N=%zu", N);
 
-        ptrdiff_t m2 = pivcoh_encode(&mini, blk, N, enc_mini, sizeof(enc_mini), NULL);
-        if (m2 != mini_len || memcmp(enc_ref, enc_mini, ref_len)) FAIL("malloc-path wire N=%zu", N);
+        /* deterministic re-encode through the malloc path */
+        static uint8_t enc_mini2[65536];
+        ptrdiff_t m2 = pivcoh_encode(&mini, blk, N, enc_mini2, sizeof(enc_mini2), NULL);
+        if (m2 != mini_len || memcmp(enc_mini2, enc_mini, (size_t)mini_len))
+            FAIL("malloc-path wire N=%zu", N);
 
-        /* mini decodes ref stream; ref decodes mini stream; consumed exact */
+        /* mini roundtrips its own v4 stream; production its own */
         size_t cons = 0;
         memset(dec_buf, 0xAA, N);
-        ptrdiff_t dn = pivcoh_decode(&mini, enc_ref, ref_len, dec_buf, sizeof(dec_buf), &cons, dscratch);
-        if (dn != (ptrdiff_t)N || cons != ref_len || memcmp(dec_buf, blk, N)) {
+        ptrdiff_t dn = pivcoh_decode(&mini, enc_mini, (size_t)mini_len, dec_buf, sizeof(dec_buf), &cons, dscratch);
+        if (dn != (ptrdiff_t)N || cons != (size_t)mini_len || memcmp(dec_buf, blk, N)) {
             size_t mm = 0;
             while (mm < N && dec_buf[mm] == blk[mm]) mm++;
-            FAIL("mini decode N=%zu: dn=%td cons=%zu/%zu first-mismatch@%zu (got %02x want %02x)",
-                 N, dn, cons, ref_len, mm, dec_buf[mm < N ? mm : 0], blk[mm < N ? mm : 0]);
+            FAIL("mini decode N=%zu: dn=%td cons=%zu/%td first-mismatch@%zu (got %02x want %02x)",
+                 N, dn, cons, mini_len, mm, dec_buf[mm < N ? mm : 0], blk[mm < N ? mm : 0]);
         }
         memset(dec_buf, 0xAA, N);
-        if (pivco_huffman_decode_dt(enc_mini, mini_len, &ref_table.dec, dec_buf, &cons)
+        if (pivco_huffman_decode_dt(enc_ref, ref_len, &ref_table.dec, dec_buf, &cons)
                 != PIVCO_OK || cons != ref_len || memcmp(dec_buf, blk, N))
-            FAIL("ref decode of mini stream N=%zu", N);
+            FAIL("ref roundtrip N=%zu", N);
         n_blocks++;
 
         /* hostile: single-byte mutations + truncations must never crash */
+        size_t fz_len = (size_t)mini_len;
+        memcpy(enc_ref, enc_mini, fz_len);     /* fuzz base: mini's own v4 stream */
         for (int f = 0; f < 40; f++) {
-            memcpy(enc_mini, enc_ref, ref_len);
-            enc_mini[rng() % ref_len] ^= (uint8_t)(1u << (rng() & 7));
-            (void)pivcoh_decode(&mini, enc_mini, ref_len, dec_buf, sizeof(dec_buf), NULL, dscratch);
-            (void)pivcoh_decode(&mini, enc_ref, rng() % (ref_len + 1), dec_buf,
+            memcpy(enc_mini, enc_ref, fz_len);
+            enc_mini[rng() % fz_len] ^= (uint8_t)(1u << (rng() & 7));
+            (void)pivcoh_decode(&mini, enc_mini, fz_len, dec_buf, sizeof(dec_buf), NULL, dscratch);
+            (void)pivcoh_decode(&mini, enc_ref, rng() % (fz_len + 1), dec_buf,
                                 sizeof(dec_buf), NULL, dscratch);
             n_fuzz += 2;
         }
@@ -209,10 +217,11 @@ int main(void)
 
     /* Joint length/shape tiers.  Production on this branch has no joint
      * pass (defaults keep exact parity above), so these are consistency
-     * checks: every tier's lengths form a table both engines accept, the
+     * checks: every tier's lengths form a table both engines accept
+     * (production still validates and builds from them — the TREE
+     * remains interchangeable even though the v4 wire is not), the
      * scratch and malloc paths agree byte-for-byte, and joint streams
-     * cross-decode through a lengths-only production rebuild — i.e. a
-     * joint tree is just another valid wire tree. */
+     * roundtrip through a lengths-only pivcoh rebuild. */
     { const char *tag = "joint"; int id = 0;
       static uint8_t jscratch[PIVCOH_JOINT_SCRATCH_SIZE];
       static pivcoh_table jt, jt2;
@@ -259,12 +268,6 @@ int main(void)
               if (pivco_huffman_build_decode_table(jt.code_len, &dt)
                       != PIVCO_OK)
                   FAIL("joint lens rejected by production gran=%d", GR[gi]);
-              size_t cons = 0;
-              memset(dec_buf, 0xAA, N);
-              if (pivco_huffman_decode_dt(enc_mini, (size_t)el, &dt, dec_buf,
-                                          &cons) != PIVCO_OK
-                      || cons != (size_t)el || memcmp(dec_buf, blk, N))
-                  FAIL("production decode of joint stream gran=%d", GR[gi]);
           }
           /* lambda > 1/7 breaks the slot DP's order condition; the
            * mass-DP fallback is deliberately not ported, so the reject
@@ -352,8 +355,11 @@ int main(void)
               }
           }
       }
-      /* decoder accepts blocks beyond the encoder's 32768 -- any u16
-       * size the codec can express: hand-build a 65535-symbol frame */
+      /* the BLOCK decoder accepts any u16 symbol count (65535), even
+       * though v4 frame coded segments cap at 32767 (the u16's top bit
+       * is the raw-store discriminator): roundtrip a max-size block
+       * directly, then hand-build a v4 frame from mixed segments
+       * (coded + raw) and decompress it */
       { id = 65535;
         pivcoh_table bt;
         uint64_t bfreq[256] = {0};
@@ -362,19 +368,38 @@ int main(void)
             bfreq[fsrc[i]]++;
         }
         if (!pivcoh_table_from_freqs(&bt, bfreq)) FAIL("big-block table");
-        for (int b = 0; b < 8; b++)
-            fdst[b] = (uint8_t)((uint64_t)65535 >> (8 * b));
-        pivcoh_lens_pack(fdst + 8, bt.code_len);
         static uint8_t bscratch[PIVCOH_SCRATCH_SIZE(65535)];
-        ptrdiff_t el = pivcoh_encode(&bt, fsrc, 65535, fdst + 140,
+        static uint8_t bdscratch[PIVCOH_DECODE_SCRATCH_SIZE(65535)];
+        ptrdiff_t el = pivcoh_encode(&bt, fsrc, 65535, fdst,
                                      PIVCOH_ENCODE_BOUND(65535), bscratch);
         if (el < 0) FAIL("big-block encode");
-        fdst[136] = (uint8_t)el;        fdst[137] = (uint8_t)(el >> 8);
-        fdst[138] = (uint8_t)(el >> 16); fdst[139] = (uint8_t)(el >> 24);
+        size_t cons = 0;
         memset(fout, 0xAA, 65535);
-        if (pivcoh_decompress(fout, 65535, fdst, 140 + (size_t)el, dscratch2)
-                != 65535 || memcmp(fout, fsrc, 65535))
+        if (pivcoh_decode(&bt, fdst, (size_t)el, fout, 65535, &cons, bdscratch)
+                != 65535 || cons != (size_t)el || memcmp(fout, fsrc, 65535))
             FAIL("65535-symbol block rejected or wrong");
+
+        /* hand-built v4 frame: [varint 40000][lens wire]
+         * [coded seg 32767][raw seg 7233] */
+        size_t fo = 0;
+        fdst[fo++] = (uint8_t)(40000 & 127) | 128;
+        fdst[fo++] = (uint8_t)(40000 >> 7 & 127) | 128;
+        fdst[fo++] = (uint8_t)(40000 >> 14);
+        int lw = pivcoh_lens_wire_write(fdst + fo, bt.code_len);
+        if (lw < 1) FAIL("frame lens wire");
+        fo += (size_t)lw;
+        el = pivcoh_encode(&bt, fsrc, 32767, fdst + fo,
+                           PIVCOH_ENCODE_BOUND(32767), bscratch);
+        if (el < 0) FAIL("frame seg encode");
+        fo += (size_t)el;
+        fdst[fo++] = (uint8_t)(7233 & 255);
+        fdst[fo++] = (uint8_t)(7233 >> 8) | 0x80;
+        memcpy(fdst + fo, fsrc + 32767, 7233);
+        fo += 7233;
+        memset(fout, 0xAA, 40000);
+        if (pivcoh_decompress(fout, 40000, fdst, fo, dscratch2) != 40000
+                || memcmp(fout, fsrc, 40000))
+            FAIL("hand-built v4 frame rejected or wrong");
       }
 
       /* utilities: packed lens roundtrip + fused build; histogram */
@@ -398,7 +423,7 @@ int main(void)
              "utilities consistent\n", n_frames);
     }
 
-    printf("pivcoh check PASS: %d tables, %d blocks wire-identical + cross-decoded, "
+    printf("pivcoh check PASS: %d tables, %d blocks round-tripped (v4 wire, trees production-identical), "
            "%d hostile decodes survived\n", n_tables, n_blocks, n_fuzz);
     return 0;
 }

@@ -70,20 +70,21 @@ static uint8_t *slurp(const char *path, size_t *n)
 static const uint8_t *D;            /* input stream */
 static size_t   N, G, NW;           /* file size, window size, #windows */
 static uint64_t (*FR)[256];         /* per-window histogram (for *build) */
-static uint8_t  (*LEN)[256];        /* per-window code lengths */
-static uint8_t  *ENC, *DEC;         /* ciphertext (+ WOFF), decode sink */
-static uint8_t  *ENC2;              /* joint mode: production's encode sink —
-                                       its streams differ from the joint
-                                       ciphertext ENC/WOFF/LEN describe, so
-                                       the timed pass must not overwrite it */
+static uint8_t  (*LEN)[256];        /* per-window pivcoh code lengths */
+static uint8_t  (*LENP)[256];       /* per-window production code lengths */
+static uint8_t  *ENC, *DEC;         /* pivcoh ciphertext (+ WOFF), decode sink */
+static uint8_t  *ENC2;              /* production ciphertext (+ WOFFP): the v4
+                                       pivcoh wire is not production-decodable
+                                       (or vice versa), so each engine keeps
+                                       its own streams */
 static size_t   *WOFF;              /* per-window ciphertext offsets */
+static size_t   *WOFFP;             /* production per-window offsets */
 static size_t   *WSTART;            /* per-window byte offset into D (NW+1) */
 static int      BLOCKS;             /* --blocks: one window per zstd block */
 static int      TABLES;             /* --tables: merge blocks per zstd HUF-table lifetime */
 static const char *CURPATH;         /* current input path (for the sidecars) */
 static uint8_t  escratch[PIVCOH_SCRATCH_SIZE(BLK)];
 static uint8_t  dscratch[PIVCOH_DECODE_SCRATCH_SIZE(BLK)];
-static uint8_t  gatebuf[PIVCOH_ENCODE_BOUND(BLK)];
 static volatile unsigned g_sink;    /* defeats DCE of the header-inlined builders */
 
 static int          JOINT;          /* 0 = plain; else joint tier active */
@@ -156,7 +157,7 @@ static int build_windows(const char *base)
 
 static void pass_enc_prod(void)
 {
-    uint8_t *sink = JOINT ? ENC2 : ENC;
+    uint8_t *sink = ENC2;
     size_t off = 0;
     for (size_t w = 0; w < NW; w++) {
         size_t wlen = wlen_of(w);
@@ -195,12 +196,12 @@ static void pass_enc_mini(void)
 static void pass_dec_prod(void)
 {
     for (size_t w = 0; w < NW; w++) {
-        size_t wlen = wlen_of(w), off = WOFF[w], dof = 0;
+        size_t wlen = wlen_of(w), off = WOFFP[w], dof = 0;
         pivco_huffman_decode_table_t dt;
-        pivco_huffman_build_decode_table(LEN[w], &dt);
+        pivco_huffman_build_decode_table(LENP[w], &dt);
         while (dof < wlen) {
             size_t consumed;
-            pivco_huffman_decode_dt(ENC + off, WOFF[w + 1] - off, &dt,
+            pivco_huffman_decode_dt(ENC2 + off, WOFFP[w + 1] - off, &dt,
                                     DEC + WSTART[w] + dof, &consumed);
             off += consumed;
             dof += wlen - dof < BLK ? wlen - dof : BLK;
@@ -248,7 +249,7 @@ static void pass_dbuild_prod(void)
 {
     for (size_t w = 0; w < NW; w++) {
         pivco_huffman_decode_table_t dt;
-        pivco_huffman_build_decode_table(LEN[w], &dt);
+        pivco_huffman_build_decode_table(LENP[w], &dt);
     }
 }
 
@@ -276,24 +277,31 @@ static double timeit(void (*fn)(void), int reps)
     return best;
 }
 
-/* Untimed setup + gates: reference ciphertext with production, pivcoh
- * gated to identical code lengths and wire bytes, both decoders
- * round-trip.  Returns 0 on success. */
+/* Untimed setup + gates: each engine encodes its own ciphertext (the
+ * v4 pivcoh wire is not production-decodable), both round-trip, and in
+ * plain mode the code LENGTHS are still gated identical — the tree
+ * logic is unchanged, only the wire around it moved.  Sizes include
+ * each side's own per-window table header (production: 128 B nibbles;
+ * pivcoh: the v4 lens wire).  Returns 0 on success. */
 static int setup_and_gate(const char *base)
 {
     j_adopt = j_bytes = p_bytes = 0;
     if (build_windows(base) != 0) return -1;
-    FR   = malloc(NW * sizeof(*FR));
-    LEN  = malloc(NW * sizeof(*LEN));
-    WOFF = malloc((NW + 1) * sizeof(*WOFF));
+    FR    = malloc(NW * sizeof(*FR));
+    LEN   = malloc(NW * sizeof(*LEN));
+    LENP  = malloc(NW * sizeof(*LENP));
+    WOFF  = malloc((NW + 1) * sizeof(*WOFF));
+    WOFFP = malloc((NW + 1) * sizeof(*WOFFP));
     ENC  = malloc(2 * N + NW * 1024 + 65536);
-    ENC2 = JOINT ? malloc(2 * N + NW * 1024 + 65536) : NULL;
+    ENC2 = malloc(2 * N + NW * 1024 + 65536);
     DEC  = malloc(N + 64);
-    if (!FR || !LEN || !WOFF || !ENC || !DEC || (JOINT && !ENC2)) return -1;
+    if (!FR || !LEN || !LENP || !WOFF || !WOFFP || !ENC || !ENC2 || !DEC)
+        return -1;
 
-    size_t off = 0;
+    size_t off = 0, offp = 0;
     for (size_t w = 0; w < NW; w++) {
         WOFF[w] = off;
+        WOFFP[w] = offp;
         size_t wlen = wlen_of(w);
         const uint8_t *p = D + WSTART[w];
         memset(FR[w], 0, sizeof(FR[w]));
@@ -302,48 +310,37 @@ static int setup_and_gate(const char *base)
         pivco_huffman_codec_table_t ct;
         if (pivco_huffman_build_codec_table(FR[w], &ct) != PIVCO_OK)
             return fprintf(stderr, "%s: prod build failed w=%zu\n", base, w);
+        memcpy(LENP[w], ct.code_len, 256);
         pivcoh_table t;
         if (JOINT) {
-            /* Joint lengths diverge from production's by design; the
-             * timed passes and the ciphertext use them for BOTH engines
-             * (production decodes from LEN too — "any decoder reads the
-             * output").  Production's plain encode still runs, untimed,
-             * for the compression-delta column. */
             if (!pivcoh_table_from_freqs_joint(&t, FR[w], &JP, jscratch))
                 return fprintf(stderr, "%s: joint build failed w=%zu\n", base, w);
-            memcpy(LEN[w], t.code_len, 256);
             if (memcmp(t.code_len, ct.code_len, 256) != 0) j_adopt++;
-            for (size_t b = 0; b < wlen; b += BLK) {
-                size_t bn = wlen - b < BLK ? wlen - b : BLK, el;
-                if (pivco_huffman_encode_ct(p + b, bn, &ct, gatebuf, &el) != PIVCO_OK)
-                    return fprintf(stderr, "%s: prod encode failed w=%zu\n", base, w);
-                p_bytes += el;
-                ptrdiff_t ml = pivcoh_encode(&t, p + b, bn, ENC + off,
-                                             PIVCOH_ENCODE_BOUND(bn), escratch);
-                if (ml < 0)
-                    return fprintf(stderr, "%s: joint encode failed w=%zu\n", base, w);
-                off += (size_t)ml;
-            }
         } else {
-            memcpy(LEN[w], ct.code_len, 256);
             if (!pivcoh_table_from_freqs(&t, FR[w]) ||
-                memcmp(t.code_len, LEN[w], 256) != 0)
+                memcmp(t.code_len, ct.code_len, 256) != 0)
                 return fprintf(stderr, "%s: pivcoh lens differ w=%zu\n", base, w);
-
-            for (size_t b = 0; b < wlen; b += BLK) {
-                size_t bn = wlen - b < BLK ? wlen - b : BLK, el;
-                if (pivco_huffman_encode_ct(p + b, bn, &ct, ENC + off, &el) != PIVCO_OK)
-                    return fprintf(stderr, "%s: prod encode failed w=%zu\n", base, w);
-                ptrdiff_t ml = pivcoh_encode(&t, p + b, bn, gatebuf,
-                                             sizeof(gatebuf), escratch);
-                if (ml != (ptrdiff_t)el || memcmp(gatebuf, ENC + off, el) != 0)
-                    return fprintf(stderr, "%s: pivcoh wire differs w=%zu\n", base, w);
-                off += el;
-            }
+        }
+        memcpy(LEN[w], t.code_len, 256);
+        uint8_t lwire[PIVCOH_LENS_WIRE_BOUND];
+        j_bytes += (size_t)pivcoh_lens_wire_write(lwire, t.code_len);
+        p_bytes += 128;                        /* production nibble header */
+        for (size_t b = 0; b < wlen; b += BLK) {
+            size_t bn = wlen - b < BLK ? wlen - b : BLK, el;
+            if (pivco_huffman_encode_ct(p + b, bn, &ct, ENC2 + offp, &el) != PIVCO_OK)
+                return fprintf(stderr, "%s: prod encode failed w=%zu\n", base, w);
+            offp += el;
+            ptrdiff_t ml = pivcoh_encode(&t, p + b, bn, ENC + off,
+                                         PIVCOH_ENCODE_BOUND(bn), escratch);
+            if (ml < 0)
+                return fprintf(stderr, "%s: pivcoh encode failed w=%zu\n", base, w);
+            off += (size_t)ml;
         }
     }
     WOFF[NW] = off;
+    WOFFP[NW] = offp;
     j_bytes += off;
+    p_bytes += offp;
 
     memset(DEC, 0, N);
     pass_dec_mini();
@@ -464,17 +461,17 @@ int main(int argc, char **argv)
                    " %5.2f %5.2f | %5.2f %5.2f",
                    base, glab, em, ep, em / ep, dm, dp, dm / dp,
                    ebm, ebp, dbm, dbp);
-            if (JOINT)
-                printf(" | %+.3fpp %zu/%zu",
-                       ((double)j_bytes - (double)p_bytes) / (double)N * 100.0,
-                       j_adopt, NW);
+            printf(" | %+.3fpp %zu/%zu",
+                   ((double)j_bytes - (double)p_bytes) / (double)N * 100.0,
+                   j_adopt, NW);
             printf("\n");
             gm[0] += log(em); gm[1] += log(ep);
             gm[2] += log(dm); gm[3] += log(dp);
             tj += j_bytes; tp += p_bytes; tn += N; ta += j_adopt; tw += NW;
             nfiles++;
             free(data);
-            free(FR); free(LEN); free(WOFF); free(WSTART); free(ENC); free(ENC2); free(DEC);
+            free(FR); free(LEN); free(LENP); free(WOFF); free(WOFFP);
+            free(WSTART); free(ENC); free(ENC2); free(DEC);
         }
         if (nfiles > 1) {
             printf("%-13s %5s | %6.0f %6.0f %5.2fx | %6.0f %6.0f %5.2fx |"
@@ -484,10 +481,9 @@ int main(int argc, char **argv)
                    exp((gm[0] - gm[1]) / nfiles),
                    exp(gm[2] / nfiles), exp(gm[3] / nfiles),
                    exp((gm[2] - gm[3]) / nfiles), nfiles);
-            if (JOINT)
-                printf(" | %+.3fpp %zu/%zu",
-                       ((double)tj - (double)tp) / (double)tn * 100.0,
-                       ta, tw);
+            printf(" | %+.3fpp %zu/%zu",
+                   ((double)tj - (double)tp) / (double)tn * 100.0,
+                   ta, tw);
             printf("\n");
         }
     }

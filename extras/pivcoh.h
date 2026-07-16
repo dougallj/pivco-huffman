@@ -1,9 +1,18 @@
-/* pivcoh.h - v3.0 - single-file PIVCO-Huffman block codec
+/* pivcoh.h - v4.0 - single-file PIVCO-Huffman block codec
  *
  * Based on https://github.com/MarcinZukowski/pivco-huffman
  *
- * AArch64/NEON-only. FSE/ANS-coded blocks are not supported and
- * are rejected on decode.
+ * AArch64/NEON-only.
+ *
+ * v4 WIRE: this codec's stream format diverges from the production
+ * pivco-huffman wire (v0.7) to stop paying its small-chunk taxes:
+ * per-node FSE marker bytes are gone (there is no FSE mode to mark),
+ * K_right headers shrink to one byte wherever the node's symbol count
+ * fits (the decoder always knows it), code lengths travel as a
+ * run-length nibble wire (typically 30..60 bytes instead of a flat
+ * 128), and the one-shot frame uses a varint size plus raw-store
+ * segment escapes for incompressible spans.  v3.x streams (production
+ * wire) are NOT decodable by v4 or vice versa.
  *
  * Do this in ONE C file to create the implementation:
  *     #define PIVCOH_IMPLEMENTATION
@@ -199,21 +208,24 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
 
 /* ---- one-shot frame API ----
  *
- * FRAME = [u64 decompressed_size LE]
- *         [128 B code lengths, 4-bit nibbles LSB-first: symbol 2i in
- *          the low nibble of byte i — the pivcohuf_file.h layout]
- *         [BLOCK...]             (decompressed_size = 0: header only)
- * BLOCK = [u32 comp_len LE] [comp_len bytes: one pivcoh block]
+ * FRAME = [varint decompressed_size]     (LEB128, 1..10 bytes)
+ *         [code-lengths wire]            (pivcoh_lens_wire_*, <= 129 B)
+ *         [SEG...]                       (decompressed_size = 0: no
+ *                                         lens, no segments)
+ * SEG:  the leading u16 (LE) is the discriminator.
+ *         high bit set:   raw store — (u16 & 0x7fff) verbatim bytes
+ *                         follow (1..32767)
+ *         high bit clear: one coded pivcoh block, starting with that
+ *                         same u16 as its symbol count (1..32767);
+ *                         self-delimiting via decode
  *
  * One table serves the whole frame (for windowed retraining use the
- * low-level API).  This encoder writes 32768-symbol blocks — the
- * measured decode-throughput plateau on Apple Silicon is 24..40 K —
- * and decoders accept any block size the codec can express (the
- * block's own u16 caps it at 65535).  The u32 makes blocks checkable
- * and skippable without decoding: a streaming reader can tell when a
- * whole block is buffered, and blocks can decode in parallel (a
- * block's output offset is the sum of the earlier blocks' symbol
- * counts, read from their 2-byte headers). */
+ * low-level API).  This encoder writes <= 32767-symbol segments (the
+ * measured decode-throughput plateau on Apple Silicon is 24..40 K) and
+ * stores a segment raw when coding would not shrink it — the huf0-
+ * style incompressible fallback.  Segments are not length-prefixed:
+ * v4 trades v3's skippable u32-framed blocks for 4 fewer bytes per
+ * segment; streaming readers must decode to find boundaries. */
 
 /* Compression effort: how much table-build time pivcoh_compress spends
  * shaping the code for DECOMPRESSION speed (the joint pass below).
@@ -240,9 +252,14 @@ typedef enum {
                                        shrinking as 1/n) */
 } pivcoh_effort;
 
-/* Worst-case frame size (frame header + per-block headers/rounding). */
+/* Worst-case frame size (frame header + per-segment headers/rounding;
+ * the per-segment 1032 also covers the last block's ENCODE_BOUND slack
+ * so pivcoh_encode can target the frame buffer directly). */
 #define PIVCOH_COMPRESS_BOUND(n) \
-    (136 + (11 * (size_t)(n) + 7) / 8 + ((size_t)(n) / 32768 + 1) * 1032)
+    (140 + (11 * (size_t)(n) + 7) / 8 + ((size_t)(n) / 32767 + 1) * 1032)
+
+/* Worst-case bytes of the code-lengths wire (mode byte + 128). */
+#define PIVCOH_LENS_WIRE_BOUND 129
 
 /* Fixed scratch sizes for the frame API (blocks cap at 32768 symbols,
  * so these are input-size-independent). */
@@ -291,9 +308,19 @@ PIVCOHDEF uint8_t *pivcoh_decompress_malloc(const uint8_t *src, size_t n,
  * bytes (1.6x on typical data, ~4x on skewed). */
 PIVCOHDEF void pivcoh_histogram(uint64_t freq[256], const uint8_t *p, size_t n);
 
-/* Code lengths <-> the frame/pivcohuf 128-byte nibble packing. */
+/* Code lengths <-> the raw 128-byte nibble packing (pivcohuf layout;
+ * also lens-wire mode 0's body). */
 PIVCOHDEF void pivcoh_lens_pack(uint8_t packed[128], const uint8_t code_len[256]);
 PIVCOHDEF void pivcoh_lens_unpack(uint8_t code_len[256], const uint8_t packed[128]);
+
+/* Compact code-lengths wire (the frame's table header; usable
+ * standalone for windowed formats).  _write emits into dst (capacity
+ * >= PIVCOH_LENS_WIRE_BOUND) and returns the byte count; _read parses,
+ * fills code_len[256], and returns the bytes consumed, or -1 on a
+ * malformed/truncated wire. */
+PIVCOHDEF int pivcoh_lens_wire_write(uint8_t *dst, const uint8_t code_len[256]);
+PIVCOHDEF int pivcoh_lens_wire_read(uint8_t code_len[256],
+                                    const uint8_t *src, size_t n);
 
 /* pivcoh_table_from_lens on nibble-packed lengths (returns 0 on invalid
  * lengths, exactly like it). */
@@ -2211,17 +2238,37 @@ static void pivcoh__merge_flat(uint8_t *out, int n, const uint8_t *bm, int D,
 
 /* ---- decode tree walk ---- */
 
-/* Read a node's post-order marker + raw bitmap: sets *bm and returns the
- * input pointer advanced past it, or NULL on truncation / a non-raw
- * (FSE) marker. */
+/* Read a node's post-order raw bitmap: sets *bm and returns the input
+ * pointer advanced past it, or NULL on truncation.  (v4: the v3 per-
+ * node FSE marker byte is gone — there is no FSE mode to mark.) */
 static inline const uint8_t *pivcoh__read_bm(const uint8_t **bm, int K,
                                              const uint8_t *p, const uint8_t *end)
 {
     size_t nb = (size_t)((K + 7) >> 3);
-    if ((size_t)(end - p) < nb + 1) return NULL;
-    if (*p++ != 0) return NULL;                /* raw-bitmap marker only (no FSE) */
+    if ((size_t)(end - p) < nb) return NULL;
     *bm = p;
     return p + nb;
+}
+
+/* Read a node's K_right header: one byte when the node's K fits one,
+ * two (LE) otherwise — the decoder always knows K at node entry.
+ * Returns the advanced pointer or NULL on truncation / KR > K. */
+static inline const uint8_t *pivcoh__read_kr(int *KR, int K,
+                                             const uint8_t *p, const uint8_t *end)
+{
+    int kr;
+    if (K > 255) {
+        if (end - p < 2) return NULL;
+        kr = p[0] | p[1] << 8;
+        p += 2;
+    } else {
+        if (end - p < 1) return NULL;
+        kr = p[0];
+        p += 1;
+    }
+    if (kr > K) return NULL;
+    *KR = kr;
+    return p;
 }
 
 /* Interior walk: decodes a subtree's K symbols into out[0,K), returning
@@ -2296,10 +2343,8 @@ descend:            /* (idx, K, out, tmp) is an INTERNAL subtree */
     if (sp >= (int)(sizeof stk / sizeof *stk)) return NULL;   /* defensive */
     {
         const pivcoh__rec *rec = &t->sched[idx];
-        if (end - p < 2) return NULL;
-        int KR = p[0] | p[1] << 8;
-        if (KR > K) return NULL;
-        p += 2;
+        int KR;
+        if (!(p = pivcoh__read_kr(&KR, K, p, end))) return NULL;
         int KL = K - KR;
         int kind = rec->kd & 3;
         struct cont *f = &stk[sp++];
@@ -2392,10 +2437,8 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
      * the arena, and only the root's own merge, whose writes are exact
      * (the EXACT `_x` kernels), targets `out`. */
     pivcoh__init_dec();
-    if (end - p < 2) return -1;
-    int KR = p[0] | p[1] << 8;
-    if (KR > N) return -1;
-    p += 2;
+    int KR;
+    if (!(p = pivcoh__read_kr(&KR, N, p, end))) return -1;
     int KL = N - KR;
     uint8_t *sc = scratch ? (uint8_t *)scratch
                           : (uint8_t *)malloc(PIVCOH_DECODE_SCRATCH_SIZE(N));
@@ -3039,8 +3082,11 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
      * defined once the root window (pivcoh_encode) is. */
     vst1q_u8(rout + n_right, vdupq_n_u8(0));
     int n_left = n - n_right;
-    *p++ = (uint8_t)n_right;                   /* K_right, u16 LE */
-    *p++ = (uint8_t)(n_right >> 8);
+    *p++ = (uint8_t)n_right;                   /* K_right: 1 byte when the
+                                                * node's n fits one (the
+                                                * decoder knows n) */
+    if (n > 255)
+        *p++ = (uint8_t)(n_right >> 8);
     *pp = p;
     if (kind == PIVCOH__FULL && n_right > n_left) {
         pivcoh__enc_node(t, idx + rec->right, rout, n_right, pp, rout + n_right + 64);
@@ -3053,8 +3099,7 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
             pivcoh__enc_node(t, idx + rec->right, rout, n_right, pp, rout + n_right + 64);
     }
     p = *pp;
-    *p++ = 0;                                  /* marker: raw bitmap */
-    memcpy(p, bm_stage, (size_t)nbytes);
+    memcpy(p, bm_stage, (size_t)nbytes);       /* post-order raw bitmap */
     *pp = p + nbytes;
 }
 
@@ -3160,13 +3205,140 @@ PIVCOHDEF int pivcoh_table_from_packed_lens(pivcoh_table *t,
     return pivcoh_table_from_lens(t, lens);
 }
 
+/* ---- compact code-lengths wire ----
+ *
+ * [u8 mode]; mode 0: + the raw 128-nibble packing (129 bytes total).
+ * mode 1: a 4-bit token stream (LSB-first nibble order) describing the
+ * 256 lengths in symbol order:
+ *   1..11       literal length
+ *   0           one absent symbol
+ *   12, e       run of 3+e absent symbols            (3..18)
+ *   13, lo, hi  run of 19 + (lo | hi<<4) absents     (19..274)
+ *   14, e       repeat the last literal 3+e MORE times
+ *   15, lo, hi  repeat it 19 + (lo | hi<<4) MORE times
+ * Run tokens never expand (>= 3 symbols in <= 3 nibbles), so mode 1 is
+ * at worst 256 literal nibbles and the writer picks whichever mode is
+ * smaller: the wire never exceeds PIVCOH_LENS_WIRE_BOUND.  Zero runs
+ * carry text alphabets (absent bytes cluster); repeat runs carry
+ * shaped trees (the joint pass makes big equal-length classes). */
+PIVCOHDEF int pivcoh_lens_wire_write(uint8_t *dst, const uint8_t code_len[256])
+{
+    uint8_t nib[512];
+    int nn = 0, i = 0;
+    while (i < 256) {
+        const uint8_t v = code_len[i];
+        int j = i + 1;
+        while (j < 256 && code_len[j] == v) j++;
+        int run = j - i;
+        i = j;
+        if (v != 0) {
+            nib[nn++] = v;
+            run--;
+        }
+        while (run >= 19) {
+            const int r = run > 274 ? 274 : run;
+            nib[nn++] = (uint8_t)(v ? 15 : 13);
+            nib[nn++] = (uint8_t)((r - 19) & 15);
+            nib[nn++] = (uint8_t)((r - 19) >> 4);
+            run -= r;
+        }
+        if (run >= 3) {
+            nib[nn++] = (uint8_t)(v ? 14 : 12);
+            nib[nn++] = (uint8_t)(run - 3);
+        } else {
+            while (run-- > 0) nib[nn++] = v;
+        }
+    }
+    const int rb = (nn + 1) >> 1;
+    if (rb < 128) {
+        dst[0] = 1;
+        for (int k = 0; k < rb; k++) {
+            const uint8_t lo = nib[2 * k];
+            const uint8_t hi = (uint8_t)(2 * k + 1 < nn ? nib[2 * k + 1] : 0);
+            dst[1 + k] = (uint8_t)(lo | hi << 4);
+        }
+        return 1 + rb;
+    }
+    dst[0] = 0;
+    pivcoh_lens_pack(dst + 1, code_len);
+    return 129;
+}
+
+PIVCOHDEF int pivcoh_lens_wire_read(uint8_t code_len[256],
+                                    const uint8_t *src, size_t n)
+{
+    if (!src || n < 1) return -1;
+    if (src[0] == 0) {
+        if (n < 129) return -1;
+        pivcoh_lens_unpack(code_len, src + 1);
+        return 129;
+    }
+    if (src[0] != 1) return -1;
+    const size_t maxnib = 2 * (n - 1) < 512 ? 2 * (n - 1) : 512;
+    size_t ni = 0;
+    int idx = 0, prev = 0;
+#define PIVCOH__LWNIB(out_)  do { \
+        if (ni >= maxnib) return -1; \
+        (out_) = (src[1 + (ni >> 1)] >> ((ni & 1) * 4)) & 15; \
+        ni++; } while (0)
+    while (idx < 256) {
+        int v, run, fill;
+        PIVCOH__LWNIB(v);
+        if (v <= 11) {
+            if (v) prev = v;
+            code_len[idx++] = (uint8_t)v;
+            continue;
+        }
+        if (v == 12 || v == 14) {
+            int e;
+            PIVCOH__LWNIB(e);
+            run = 3 + e;
+        } else {
+            int lo, hi;
+            PIVCOH__LWNIB(lo);
+            PIVCOH__LWNIB(hi);
+            run = 19 + lo + (hi << 4);
+        }
+        if (v >= 14) {
+            if (prev == 0) return -1;      /* repeat before any literal */
+            fill = prev;
+        } else {
+            fill = 0;
+        }
+        if (idx + run > 256) return -1;
+        memset(code_len + idx, fill, (size_t)run);
+        idx += run;
+    }
+#undef PIVCOH__LWNIB
+    return 1 + (int)((ni + 1) >> 1);
+}
+
+/* LEB128 varint (the frame's size field). */
+static inline int pivcoh__varint_put(uint8_t *p, uint64_t v)
+{
+    int i = 0;
+    while (v >= 128) { p[i++] = (uint8_t)(v | 128); v >>= 7; }
+    p[i++] = (uint8_t)v;
+    return i;
+}
+static inline int pivcoh__varint_get(const uint8_t *p, size_t n, uint64_t *v)
+{
+    uint64_t r = 0;
+    for (int i = 0; i < 10; i++) {
+        if ((size_t)i >= n) return -1;
+        r |= (uint64_t)(p[i] & 127) << (7 * i);
+        if (!(p[i] & 128)) { *v = r; return i + 1; }
+    }
+    return -1;
+}
+
 PIVCOHDEF ptrdiff_t pivcoh_compress_joint(uint8_t *dst, size_t dst_cap,
                                           const uint8_t *src, size_t n,
                                           const pivcoh_joint *j, void *scratch)
 {
     if (!dst || (!src && n) || dst_cap < PIVCOH_COMPRESS_BOUND(n)) return -1;
-    for (int b = 0; b < 8; b++) dst[b] = (uint8_t)((uint64_t)n >> (8 * b));
-    if (n == 0) return 8;
+    size_t off = (size_t)pivcoh__varint_put(dst, (uint64_t)n);
+    if (n == 0) return (ptrdiff_t)off;
     uint8_t *sc = scratch ? (uint8_t *)scratch
                           : (uint8_t *)malloc(PIVCOH_COMPRESS_SCRATCH_SIZE);
     if (!sc) return -1;
@@ -3174,18 +3346,21 @@ PIVCOHDEF ptrdiff_t pivcoh_compress_joint(uint8_t *dst, size_t dst_cap,
     pivcoh_histogram(freq, src, n);
     pivcoh_table t;
     pivcoh__from_freqs(&t, freq, j, sc + PIVCOH_SCRATCH_SIZE(32768));
-    pivcoh_lens_pack(dst + 8, t.code_len);
-    size_t off = 136;
-    for (size_t p = 0; p < n; p += 32768) {
-        size_t bn = n - p < 32768 ? n - p : 32768;
-        ptrdiff_t el = pivcoh_encode(&t, src + p, bn, dst + off + 4,
+    off += (size_t)pivcoh_lens_wire_write(dst + off, t.code_len);
+    for (size_t p = 0; p < n; p += 32767) {
+        size_t bn = n - p < 32767 ? n - p : 32767;
+        ptrdiff_t el = pivcoh_encode(&t, src + p, bn, dst + off,
                                      PIVCOH_ENCODE_BOUND(bn), sc);
         if (el < 0) { if (!scratch) free(sc); return -1; }   /* unreachable */
-        dst[off]     = (uint8_t)el;
-        dst[off + 1] = (uint8_t)((size_t)el >> 8);
-        dst[off + 2] = (uint8_t)((size_t)el >> 16);
-        dst[off + 3] = (uint8_t)((size_t)el >> 24);
-        off += 4 + (size_t)el;
+        if ((size_t)el >= bn + 2) {
+            /* raw store: coding did not shrink this segment */
+            dst[off]     = (uint8_t)bn;
+            dst[off + 1] = (uint8_t)(bn >> 8 | 0x80);
+            memcpy(dst + off + 2, src + p, bn);
+            off += 2 + bn;
+        } else {
+            off += (size_t)el;
+        }
     }
     if (!scratch) free(sc);
     return (ptrdiff_t)off;
@@ -3209,9 +3384,8 @@ PIVCOHDEF ptrdiff_t pivcoh_compress(uint8_t *dst, size_t dst_cap,
 
 PIVCOHDEF uint64_t pivcoh_decompressed_size(const uint8_t *src, size_t n)
 {
-    if (!src || n < 8) return (uint64_t)-1;
-    uint64_t raw = 0;
-    for (int b = 0; b < 8; b++) raw |= (uint64_t)src[b] << (8 * b);
+    uint64_t raw;
+    if (!src || pivcoh__varint_get(src, n, &raw) < 0) return (uint64_t)-1;
     return raw;
 }
 
@@ -3219,35 +3393,40 @@ PIVCOHDEF ptrdiff_t pivcoh_decompress(uint8_t *dst, size_t dst_cap,
                                       const uint8_t *src, size_t n,
                                       void *scratch)
 {
-    uint64_t raw = pivcoh_decompressed_size(src, n);
-    if (raw == (uint64_t)-1) return -1;
-    if (raw == 0) return n == 8 ? 0 : -1;
-    if (!dst || raw > dst_cap || raw > (uint64_t)(PTRDIFF_MAX - 1) || n < 136)
-        return -1;
+    uint64_t raw;
+    if (!src) return -1;
+    int vb = pivcoh__varint_get(src, n, &raw);
+    if (vb < 0) return -1;
+    if (raw == 0) return n == (size_t)vb ? 0 : -1;
+    if (!dst || raw > dst_cap || raw > (uint64_t)(PTRDIFF_MAX - 1)) return -1;
+    uint8_t lens[256];
+    int lb = pivcoh_lens_wire_read(lens, src + vb, n - (size_t)vb);
+    if (lb < 0) return -1;
     pivcoh_table t;
-    if (!pivcoh_table_from_packed_lens(&t, src + 8)) return -1;
+    if (!pivcoh_table_from_lens(&t, lens)) return -1;
     uint8_t *sc = scratch ? (uint8_t *)scratch
                           : (uint8_t *)malloc(PIVCOH_DECOMPRESS_SCRATCH_SIZE);
     if (!sc) return -1;
-    size_t off = 136, dof = 0;
+    size_t off = (size_t)vb + (size_t)lb, dof = 0;
     int ok = 1;
     while (dof < raw) {
-        if (n - off < 6) { ok = 0; break; }   /* u32 + a block's 2-byte n */
-        size_t bl = (size_t)src[off] | (size_t)src[off + 1] << 8
-                  | (size_t)src[off + 2] << 16 | (size_t)src[off + 3] << 24;
-        off += 4;
-        if (bl < 2 || bl > n - off) { ok = 0; break; }
-        /* the block's own symbol count, checked BEFORE decoding: it
-         * must fit the remaining declared span (scratch covers the u16
-         * maximum, so any expressible block size is accepted) */
-        size_t bn = (size_t)src[off] | (size_t)src[off + 1] << 8;
-        if (bn == 0 || bn > raw - dof) { ok = 0; break; }
-        size_t consumed = 0;
-        ptrdiff_t dn = pivcoh_decode(&t, src + off, bl, dst + dof,
-                                     (size_t)raw - dof, &consumed, sc);
-        if (dn != (ptrdiff_t)bn || consumed != bl) { ok = 0; break; }
-        dof += bn;
-        off += bl;
+        if (n - off < 2) { ok = 0; break; }
+        size_t h = (size_t)src[off] | (size_t)src[off + 1] << 8;
+        if (h & 0x8000) {                      /* raw-store segment */
+            size_t rn = h & 0x7fff;
+            if (rn == 0 || rn > raw - dof || rn > n - off - 2) { ok = 0; break; }
+            memcpy(dst + dof, src + off + 2, rn);
+            dof += rn;
+            off += 2 + rn;
+        } else {                               /* coded block, self-delimiting */
+            if (h == 0 || h > raw - dof) { ok = 0; break; }
+            size_t consumed = 0;
+            ptrdiff_t dn = pivcoh_decode(&t, src + off, n - off, dst + dof,
+                                         (size_t)raw - dof, &consumed, sc);
+            if (dn != (ptrdiff_t)h) { ok = 0; break; }
+            dof += (size_t)dn;
+            off += consumed;
+        }
     }
     if (dof != raw || off != n) ok = 0;       /* strict: no trailing bytes */
     if (!scratch) free(sc);
