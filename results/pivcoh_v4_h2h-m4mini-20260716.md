@@ -55,3 +55,27 @@ Geomeans (enc MB/s / dec MB/s / ratio):
   production-identical (`bench_pivcoh_check` gates tables + roundtrip,
   ASan-clean, plus a standalone wire fuzz harness: truncations, bit
   flips, hand-built frames).
+
+## Addendum: lens wire mode 2 (fixed-prefix delta tokens, commit ec882f7)
+
+Lengths coded as deltas from the previous symbol's length under a fixed
+canonical prefix code (trained jointly on both corpora's table
+populations, 2.95 b/token vs 2.92 b entropy); unified 512-entry decode
+LUT emits up to four 2-bit delta codes per lookup.  Cost-aware writer:
+emitted only when it beats mode 1 by >= 16 B (dense tables save 30-45 B);
+`PIVCOH_LENS_WIRE_NO_MODE2` suppresses emission.
+
+Corpus table means: silesia 66.0 -> 57.3 B, prague 65.6 -> 51.2 B
+(huf0 weight headers: 47.8 / 56.6).  Head-to-head (v43 rows in the txt):
+
+|            | huf0             | pivcoh SIMPLEST   | pivcoh BALANCED   |
+|------------|------------------|-------------------|-------------------|
+| silesia    | 1171 / 1354 / 1.28 | 1280 / 6701 / **1.28** | 952 / 8598 / 1.27 |
+| prague     | 1059 / 1421 / 1.25 | 1149 / 6408 / 1.23 | 800 / 8184 / 1.23 |
+
+SIMPLEST reaches huf0 ratio parity on silesia at 4.9x its decode; the
+lens parse costs ~4-7% decode at this extreme per-block cadence
+(mozilla, dense 256-symbol tables, is the worst case at ~ -6%) and
+amortizes away at table-lifetime cadence.  Residual size gap on the
+dense tables is per-table adaptivity, unreachable without carrying an
+entropy table on the wire.
