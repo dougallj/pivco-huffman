@@ -518,6 +518,10 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
     const uint8x16_t bw = vld1q_u8(bw_a);
     uint64_t cmask[PIVCOH__MAXLEN][4];        /* [L-1][group]: bit s set iff
                                                  symbol 64g+s has length L */
+    uint64_t popc[PIVCOH__MAXLEN][4];         /* [L-1][group]: byte j = popcount
+                                                 of cmask byte j, precomputed by
+                                                 vcnt so the extract loop's
+                                                 n_used chain needs only an AND */
     const uint8x16_t vz = vdupq_n_u8(0);
     uint8x16_t vmax = vz, vlo = vz;           /* vlo = max of negated lengths */
     for (int g = 0; g < 4; g++) {             /* pass 1: shortest/longest only */
@@ -538,30 +542,35 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         const uint8_t *b = code_len + 64 * g;
         uint8x16_t x0 = vld1q_u8(b),      x1 = vld1q_u8(b + 16),
                    x2 = vld1q_u8(b + 32), x3 = vld1q_u8(b + 48);
-        for (int L = minlen; L <= maxlen; L++)
-            cmask[L - 1][g] = vget_lane_u64(vreinterpret_u64_u8(
-                pivcoh__eqmasks64(x0, x1, x2, x3, vdupq_n_u8((uint8_t)L), bw)), 0);
+        for (int L = minlen; L <= maxlen; L++) {
+            uint8x8_t em = pivcoh__eqmasks64(x0, x1, x2, x3,
+                                             vdupq_n_u8((uint8_t)L), bw);
+            cmask[L - 1][g] = vget_lane_u64(vreinterpret_u64_u8(em), 0);
+            popc[L - 1][g]  = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(em)), 0);
+        }
     }
 
     /* Extract items[] in (length, symbol) order + per-length counts.  Each
      * non-empty class byte scatters through select8 + one 8-byte store
      * (the <= 7 junk bytes past the popcount are absorbed by items's pad
      * and the next store), replacing the per-symbol ctz loop whose
-     * data-dependent branch is unpredictable. */
+     * data-dependent branch is unpredictable.  n_used advances by the
+     * precomputed popc byte (an AND), keeping the scalar popcount's
+     * GPR<->SIMD round-trip off the store's serial address chain. */
     uint8_t items[256 + 8];
     int cnt[PIVCOH__MAXLEN + 1], n_used = 0, s;
     const uint8x8_t iota8 = vcreate_u8(0x0706050403020100ull);
     for (int L = minlen; L <= maxlen; L++) {         /* only live length classes */
         int start = n_used;
         for (int g = 0; g < 4; g++) {
-            uint64_t m = cmask[L - 1][g];
-            for (int gb = 64 * g; m; gb += 8, m >>= 8) {
+            uint64_t m = cmask[L - 1][g], pc = popc[L - 1][g];
+            for (int gb = 64 * g; m; gb += 8, m >>= 8, pc >>= 8) {
                 unsigned mm = (unsigned)(m & 0xff);
                 if (!mm) continue;
                 uint8x8_t ids = vadd_u8(iota8, vdup_n_u8((uint8_t)gb));
                 vst1_u8(items + n_used,
                         vtbl1_u8(ids, vld1_u8(pivcoh__select8[mm])));
-                n_used += __builtin_popcount(mm);
+                n_used += (unsigned)(pc & 0xff);
             }
         }
         cnt[L] = n_used - start;
