@@ -907,12 +907,16 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
     int border[8], nb;
     if (!pivcoh__jl_order(lam, kap, bcap, border, &nb))
         return -1.0;
-    /* sigma <= 32 rows fit five q-registers at a fixed W = 20: the take
-     * sweeps then run register-resident per diagonal (loads/stores once
-     * per row instead of per item), which is where the grouped tiers'
-     * time lives. */
-    const int small = sigma <= 32;
-    const int W = small ? 20 : (((sigma >> 1) + 2) + 3) & ~3;
+    /* sigma <= 32 rows fit five q-registers at a fixed W = 20, and
+     * sigma <= 64 rows nine at W = 36: the take sweeps then run
+     * register-resident per diagonal (loads/stores once per row
+     * instead of per item), which is where the grouped tiers' time
+     * lives.  The 9-group form keeps only a two-register candidate
+     * window live: dest groups are processed descending, so a
+     * candidate's source group is always still pre-item. */
+    const int sm32 = sigma <= 32;
+    const int sm64 = !sm32 && sigma <= 64;
+    const int W = sm32 ? 20 : sm64 ? 36 : (((sigma >> 1) + 2) + 3) & ~3;
     const size_t plane = (size_t)(sigma + 1) * (size_t)W;
     uint8_t *own = scratch ? NULL :
         (uint8_t *)malloc(plane * (4 + 2 * (size_t)lmax) + 8);
@@ -960,9 +964,91 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
             float *row = cost + (size_t)t * W;
             uint16_t *prow = archL + (size_t)t * W;   /* picks, archived
                                                        * in place */
-            if (small) {
-                /* Whole row in registers across every item.  No lane
-                 * masking: a candidate's dest is always above its
+            if (jcap >= 20 && jcap < 36) {
+                /* Nine-group register-resident sweep for rows whose
+                 * dests all fit lanes 0..35: every wide sm64 row (the
+                 * grouped auto tier's bulk) and the mid-band rows of
+                 * full-width exact solves.  Same junk-propagation
+                 * safety as below: dest > source always, so beyond-jcap
+                 * lanes never contaminate the band.  Candidates are
+                 * computed on the fly per dest group, descending, so
+                 * sources are pre-item.  Narrower rows fall through to
+                 * the five-group body — it only touches lanes 0..19,
+                 * which cover every dest, and processing 9 groups for
+                 * a 2-group band costs more than it saves. */
+                float32x4_t r[9];
+                uint16x4_t pk[9];
+                const float32x4_t vinf = vdupq_n_f32(INFINITY);
+                const uint16x4_t z16 = vdup_n_u16(0);
+#pragma clang loop unroll(full)
+                for (int g = 0; g < 9; g++) {
+                    r[g] = vld1q_f32(row + 4 * g);
+                    pk[g] = vdup_n_u16(0);
+                }
+                for (int oi = 0; oi < nb; oi++) {
+                    const int b = border[oi];
+                    if (b > bmax) continue;
+                    const int jstep = 1 << (b - 1);
+                    if (jcap - jstep < 0) continue;
+                    const float a = (float)((double)L
+                                            + lam * ((double)(L - b) + kap[b]));
+                    const float32x4_t va = vdupq_n_f32(a);
+                    const float32x4_t vtc = vdupq_n_f32((float)tc1);
+                    const float *dpb = dPt[p][b];
+                    const uint16x4_t vbit = vdup_n_u16((uint16_t)(1u << b));
+#define PIVCOH__JL9_CAND(g) \
+    vaddq_f32(vfmaq_f32(r[g], vld1q_f32(dpb + 4 * (g)), va), vtc)
+#define PIVCOH__JL9_TAKE(g, s, kq) do { \
+    const uint32x4_t m_ = vcltq_f32((s), r[g]); \
+    r[g] = vbslq_f32(m_, (s), r[g]); \
+    pk[g] = vbsl_u16(vmovn_u32(m_), (kq), pk[g]); } while (0)
+#define PIVCOH__JL9_SHIFTK(K) do { \
+    _Pragma("clang loop unroll(full)") \
+    for (int g = 8; g >= (K); g--) { \
+        const float32x4_t c_ = PIVCOH__JL9_CAND(g - (K)); \
+        const uint16x4_t kq_ = vorr_u16(pk[g - (K)], vbit); \
+        PIVCOH__JL9_TAKE(g, c_, kq_); \
+    } } while (0)
+#define PIVCOH__JL9_EXT(N) do { \
+    float32x4_t chi_ = PIVCOH__JL9_CAND(8); \
+    uint16x4_t khi_ = vorr_u16(pk[8], vbit); \
+    _Pragma("clang loop unroll(full)") \
+    for (int g = 8; g >= 1; g--) { \
+        const float32x4_t clo_ = PIVCOH__JL9_CAND(g - 1); \
+        const uint16x4_t klo_ = vorr_u16(pk[g - 1], vbit); \
+        PIVCOH__JL9_TAKE(g, vextq_f32(clo_, chi_, N), \
+                         vext_u16(klo_, khi_, N)); \
+        chi_ = clo_; khi_ = klo_; \
+    } \
+    PIVCOH__JL9_TAKE(0, vextq_f32(vinf, chi_, N), \
+                     vext_u16(z16, khi_, N)); } while (0)
+                    switch (jstep) {
+                    case 1:  PIVCOH__JL9_EXT(3);    break;
+                    case 2:  PIVCOH__JL9_EXT(2);    break;
+                    case 4:  PIVCOH__JL9_SHIFTK(1); break;
+                    case 8:  PIVCOH__JL9_SHIFTK(2); break;
+                    case 16: PIVCOH__JL9_SHIFTK(4); break;
+                    default: PIVCOH__JL9_SHIFTK(8); break;   /* 32 */
+                    }
+#undef PIVCOH__JL9_CAND
+#undef PIVCOH__JL9_TAKE
+#undef PIVCOH__JL9_SHIFTK
+#undef PIVCOH__JL9_EXT
+                }
+#pragma clang loop unroll(full)
+                for (int g = 0; g < 9; g++) {
+                    vst1q_f32(row + 4 * g, r[g]);
+                    vst1_u16(prow + 4 * g, pk[g]);
+                }
+                continue;
+            }
+            if (sm32 || sm64 || jcap < 20) {
+                /* Whole row in five registers across every item — used
+                 * whenever every dest fits lanes 0..19: all of
+                 * sigma <= 32, narrow sm64 rows, and the narrow-band
+                 * rows of full-width exact solves (deep levels, band
+                 * edges); wider lanes are simply left untouched.  No
+                 * lane masking: a candidate's dest is always above its
                  * source, so lanes beyond jcap only ever contaminate
                  * lanes beyond jcap, and nothing in band ever reads
                  * them (same argument the in-place generic sweep
