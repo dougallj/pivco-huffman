@@ -111,8 +111,7 @@
  * yields fewer, larger flat blocks and fewer merge passes.  Measured on
  * windowed LZ-literal workloads this buys +25%..+130% decode speed at
  * a compression delta within ±0.3 pp (better at small windows).  The
- * wire carries only lengths, so ANY decoder reads the output.
- * Port of the production joint optimizer (joint-cost-model @ c6073f5). */
+ * wire carries only lengths, so ANY decoder reads the output. */
 typedef struct {
     float lambda;      /* bits one merge pass is worth; <= 0 disables the
                           pass entirely (plain Huffman lengths) */
@@ -121,10 +120,7 @@ typedef struct {
                           worst case), 2/4/8 fixed grouping, -1 coarse auto
                           (one grouping step chunkier, ~2-4 us: most of
                           auto's decode win at a fraction of its encode
-                          cost -- it replaced a greedy nudger that the
-                          coarse DP dominated once the guard's near-
-                          incompressible waiver landed).  Other values
-                          behave as 0. */
+                          cost).  Other values behave as 0. */
     float guard_bits;  /* adopt only if modeled bits <= guard_bits * baseline */
     float guard_time;  /* ... and modeled decode time <= guard_time * baseline;
                           otherwise the plain Huffman lengths are kept */
@@ -159,7 +155,7 @@ typedef struct {
     uint8_t enc_ready;       /* encoder view valid (filled lazily on first
                                 encode; decode never needs it) */
     uint8_t enc_umin;        /* used-symbol window: min symbol and span-1;
-                                a span < 128 halves enc_init's lookup */
+                                a span < 128 halves enc_ranks's lookup */
     uint8_t enc_span1;
     uint8_t rank_to_sym[256], sym_to_rank[256];
     pivcoh__rec sched[60];   /* Kraft-complete max is 59 records (33 chunks,
@@ -223,9 +219,9 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
  * low-level API).  This encoder writes <= 32767-symbol segments (the
  * measured decode-throughput plateau on Apple Silicon is 24..40 K) and
  * stores a segment raw when coding would not shrink it — the huf0-
- * style incompressible fallback.  Segments are not length-prefixed:
- * v4 trades v3's skippable u32-framed blocks for 4 fewer bytes per
- * segment; streaming readers must decode to find boundaries. */
+ * style incompressible fallback.  Segments are not length-prefixed
+ * (4 bytes saved per segment); streaming readers must decode to find
+ * boundaries. */
 
 /* Compression effort: how much table-build time pivcoh_compress spends
  * shaping the code for DECOMPRESSION speed (the joint pass below).
@@ -332,7 +328,7 @@ PIVCOHDEF int pivcoh_table_from_packed_lens(pivcoh_table *t,
 #ifdef PIVCOH_IMPLEMENTATION
 
 #if !defined(__aarch64__)
-#error "pivcoh.h v2.x is the NEON edition and requires aarch64 (the scalar codec lives on the main branch)"
+#error "pivcoh.h is the NEON edition and requires aarch64"
 #endif
 
 #include <arm_neon.h>
@@ -350,16 +346,16 @@ typedef struct { uint8_t depth, bit, sym_idx; } pivcoh__chunk;
 /* Pre-order schedule from the depth-sorted chunk list: chunks are the
  * tree's left-to-right leaves, and the leaf-depth sequence determines
  * the tree.  Iterative, with an explicit stack of open internal nodes
- * (port of the production build_schedule; the recursion this replaces
- * was the dominant per-window table-build cost on ragged deep trees).
+ * (recursion here was the dominant per-window table-build cost on
+ * ragged deep trees).
  * The walk doubles as Kraft-completeness validation.  Returns 0, or -1
  * on non-Kraft-complete lengths. */
-typedef struct { int my, rank0, mid_sched, mid_rank, state; } pivcoh__frame;
+typedef struct { int my, rank0, mid_sched, mid_rank, state; } pivcoh__sched_frame;
 
 static int pivcoh__sched(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
                          const uint8_t *items)
 {
-    pivcoh__frame stk[PIVCOH__MAXLEN + 1];
+    pivcoh__sched_frame stk[PIVCOH__MAXLEN + 1];
     const int cap = (int)(sizeof t->sched / sizeof *t->sched);
     int sp = 0, ci = 0, rank = 0;
 
@@ -369,7 +365,7 @@ static int pivcoh__sched(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
         /* Descend the left spine until a chunk sits at this depth. */
         while (ch[ci].depth != sp) {
             if (sp > PIVCOH__MAXLEN || t->sched_len >= cap) return -1;
-            pivcoh__frame *f = &stk[sp++];
+            pivcoh__sched_frame *f = &stk[sp++];
             f->my    = t->sched_len++;
             f->rank0 = rank;
             f->state = 0;
@@ -403,7 +399,7 @@ static int pivcoh__sched(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
                 t->num_ranks = (uint16_t)rank;
                 return 0;
             }
-            pivcoh__frame *f = &stk[sp - 1];
+            pivcoh__sched_frame *f = &stk[sp - 1];
             if (f->state == 0) {               /* left done; do the right */
                 f->state     = 1;
                 f->mid_sched = t->sched_len;
@@ -420,9 +416,7 @@ static int pivcoh__sched(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
              * the left child instead.  Corrupt lengths only perturb the
              * counts, not this ordering -- so a lone right child cannot occur
              * (verified: 0 hits over 85M valid + malformed length vectors,
-             * incl. exhaustive small shapes).  NB the production builder's
-             * naive research-tree mode makes every symbol a singleton and can
-             * reach both; pivcoh's power-of-two chunking never does. */
+             * incl. exhaustive small shapes). */
             int left_lone = f->mid_sched == f->my + 1 &&
                             f->mid_rank == f->rank0 + 1;
             pivcoh__rec *r = &t->sched[f->my];
@@ -441,7 +435,7 @@ static int pivcoh__sched(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
  * data-dependent branch is unpredictable.  Compile-time (2 KiB, cold) so
  * the decode table build never triggers the lazy encoder init; the
  * packed 8-byte rows are also denser in L1 than the encoder's 16-byte
- * ctab8 for this hot loop. */
+ * ptab8 for this hot loop. */
 static const uint8_t pivcoh__select8[256][8] = {
     {255,255,255,255,255,255,255,255}, {0,255,255,255,255,255,255,255}, {1,255,255,255,255,255,255,255}, {0,1,255,255,255,255,255,255},
     {2,255,255,255,255,255,255,255}, {0,2,255,255,255,255,255,255}, {1,2,255,255,255,255,255,255}, {0,1,2,255,255,255,255,255},
@@ -509,10 +503,10 @@ static const uint8_t pivcoh__select8[256][8] = {
     {2,3,4,5,6,7,255,255}, {0,2,3,4,5,6,7,255}, {1,2,3,4,5,6,7,255}, {0,1,2,3,4,5,6,7},
 };
 
-/* 8 length-class bitmap bytes for 64 symbols: masks64v's vpaddq tree with
+/* 8 length-class bitmap bytes for 64 symbols: gtmasks64v's vpaddq tree with
  * the compare flipped to equality (bit s of the returned u64 = symbol s
  * has this exact length).  Local to the table build; the encode-side
- * masks64v (rank > thr) lives with the partition kernels. */
+ * gtmasks64v (rank > thr) lives with the partition kernels. */
 static inline uint8x8_t pivcoh__eqmasks64(uint8x16_t v0, uint8x16_t v1,
                                           uint8x16_t v2, uint8x16_t v3,
                                           uint8x16_t vt, uint8x16_t bw)
@@ -586,10 +580,10 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
      * one 8-byte store, branchlessly: an empty byte (mm==0) looks up
      * select8[0]=all-0xFF, so vtbl yields 8 zeros that land at items[n_used]
      * with n_used unchanged and are overwritten by the next store (or absorbed
-     * by items's 8-byte pad).  Dropping the per-sub-group "if (!mm) continue"
-     * removed an unpredictable branch worth ~1.3x on these tables.  n_used
-     * advances by the precomputed popc byte (an AND), keeping the scalar
-     * popcount's GPR<->SIMD round-trip off the store's serial address chain. */
+     * by items's 8-byte pad) — a per-sub-group empty test would be an
+     * unpredictable branch (~1.3x on these tables).  n_used advances by the
+     * precomputed popc byte (an AND), keeping the scalar popcount's
+     * GPR<->SIMD round-trip off the store's serial address chain. */
     uint8_t items[256 + 8];
     int cnt[PIVCOH__MAXLEN + 1], n_used = 0, s;
     const uint8x8_t iota8 = vcreate_u8(0x0706050403020100ull);
@@ -621,15 +615,14 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
         t->sched[0].param = t->sched[0].right = 0;
         t->sched_len = 1;
     } else {
-        /* "optimized" chunking: split each length's count by its set bits
+        /* Power-of-two chunking: split each length's count by its set bits
          * (largest first), a 2^b chunk rooted at depth L-b, ordered so
          * canonical assignment fills the tree left-to-right. */
         pivcoh__chunk ch[49];   /* max sum popcount(cnt[L]): 11 classes, sum <= 256 */
         int nch = 0;
         /* Generate the chunks (length asc, bit desc), then stable depth-sort.
-         * Walk only the set bits of cnt[L] via clz (highest first) rather than
-         * testing all 9 positions -- fewer stores and fewer data-dependent
-         * branches than the unrolled bit-test loop, ~1.1-1.18x on the M4. */
+         * cnt[L]'s set bits walk via clz, highest first (fewer stores and
+         * data-dependent branches than testing all 9 positions). */
         int i, j, n, acc, L;
         for (L = minlen, acc = 0; L <= maxlen; acc += cnt[L], L++) {
             uint32_t tmp = (uint32_t)cnt[L];
@@ -664,11 +657,7 @@ typedef struct { uint32_t freq; uint16_t sym; } pivcoh__leaf;
  * sym) order.  Small alphabets insertion-sort; larger ones take an LSD
  * radix over only the frequency bytes that VARY across the set (vary =
  * OR ^ AND of all freqs, a free by-product of the caller's scan) — a
- * constant byte is an identity pass, so it is skipped outright.  Port
- * of the production sort_leaves_by_freq (same n <= 40 crossover, minus
- * its dominant-bin scatter specialization); the O(n^2) insertion sort
- * this replaces was 3-5x the whole production table build on
- * fresh-tables-every-4K workloads over near-full alphabets. */
+ * constant byte is an identity pass, so it is skipped outright. */
 static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint32_t vary)
 {
     int i, j;
@@ -712,7 +701,6 @@ static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint32_t vary)
 
 /* ============ joint length/shape optimization (encoder side) ============
  *
- * Port of the production joint_lengths.c (joint-cost-model @ c6073f5).
  * Chunk model: choosing lengths IS choosing at most one chunk per
  * (level L <= 11, flat depth b <= min(8, L)) — a chunk holds 2^b
  * symbols at length L inside a depth-b flat, so each of its symbols'
@@ -726,11 +714,10 @@ static void pivcoh__sort_leaves(pivcoh__leaf *leaf, int n, uint32_t vary)
  * Huffman baseline, so the result can only improve in-model, and a
  * kind-aware time model guards against out-of-model regressions.
  *
- * Deliberately not ported: the FSE decode-tax term (pivcoh speaks the
- * raw-bitmap subset — no bitmap is ever FSE-coded) and the ~10 MB
- * mass-DP fallback for lambda > 1/7 — when the slot DP's validity
- * condition fails, the baseline is kept, the same contract as a guard
- * reject. */
+ * There is no FSE decode-tax term (no bitmap is ever FSE-coded here),
+ * and no fallback solver for lambda > 1/7: when the slot DP's validity
+ * condition fails, the baseline is kept — the same contract as a
+ * guard reject. */
 
 /* ---- kind-aware decode-time model (the adoption guard) ----
  *
@@ -750,13 +737,10 @@ typedef struct { uint8_t r, D; double W; } pivcoh__jl_ch;
  * the parent sees (0 = lone leaf, 1 = internal).  pre marks the chunk
  * index holding the prefilled top symbol (-1 = none).
  *
- * Iterative: an explicit frame stack replaces the recursion, matching
- * the decode walk's style — the tree is only <= MAXLEN + 1 deep, but
- * the recursive form carried ten arguments per call and the guard runs
- * the walk twice per window.  phase 0 frames are waiting on their left
- * child, phase 1 on their right; combine order, cursor state at the
- * prefill test, and the ((t + tl) + tr) association all match the
- * recursive form exactly, so results are bit-identical. */
+ * Iterative, explicit frame stack: phase 0 frames are waiting on their
+ * left child, phase 1 on their right.  Combine order, cursor state at
+ * the prefill test, and the ((t + tl) + tr) association all match the
+ * recursive form exactly, so results are bit-identical to it. */
 static double pivcoh__jl_sim(const pivcoh__jl_ch *ch, int n, int *i, int d,
                              int pre, const pivcoh_joint *jp,
                              const double *kap, int *recs,
@@ -776,8 +760,7 @@ enter:
                                  * the caller's i != n check reports -1.
                                  * Unreachable from the in-header callers
                                  * (their multisets are Kraft-exact by
-                                 * construction) — pure stack-safety.
-                                 * Upstream fix 93b5a7e. */
+                                 * construction) — pure stack-safety. */
         rt = 0.0; rW = 0; rkind = 1;
         goto unwind;
     }
@@ -1283,10 +1266,6 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
          * j' — two constant-stride subloops with the unified source
          * index (k - d - (t&1))/2.  The subloop containing the top cell
          * runs first (it holds the only same-row read). */
-        /* NB the production source declares this constant and then never
-         * adds it — its DP under-prices b = 0 takes by the per-record
-         * gamma surcharge, which the guard then charges.  Fixed here:
-         * the fold's take cost carries + tcz. */
         const float a0 = (float)((double)L * (1.0 + lam) + lam * kap[0]);
         const float tcz = (float)tc0;
         for (int tp = thi[L + 1]; tp >= tlo[L + 1]; tp--) {
@@ -1612,9 +1591,8 @@ static int pivcoh__from_freqs(pivcoh_table *t, const uint64_t freq[256],
 {
     /* Frequencies narrow to u32 (and internal sums wrap mod 2^32): a
      * histogram totalling >= 4 GiB may derive different -- still valid,
-     * still Kraft-exact, but no longer production-identical -- code
-     * lengths.  Correctness-only: every index below is bounded
-     * structurally, never by frequency values. */
+     * still Kraft-exact -- code lengths.  Correctness-only: every index
+     * below is bounded structurally, never by frequency values. */
     pivcoh__leaf leaf[256];
     uint32_t orv = 0, andv = ~(uint32_t)0;
     int n = 0, i;
@@ -1718,10 +1696,10 @@ PIVCOHDEF int pivcoh_table_from_freqs_joint(pivcoh_table *t,
     return pivcoh__from_freqs(t, freq, j, scratch);
 }
 
-/* ================= decode kernels (ports of primitives_neon) ================
+/* ========================== decode kernels ==========================
  *
  * Buffer contract: a merge kernel may read up to 16 bytes past a source
- * cursor and — interior (non-EXACT) merges only — overwrite up to 15
+ * cursor and — interior (slack != 0) merges only — overwrite up to 15
  * bytes past out+K, saved and restored around the merge.  Validation is
  * the end-of-merge r_end equality: cursors are monotone, so final
  * r == r_end proves no prefix of the bitmap ever overdrew either side
@@ -1730,15 +1708,15 @@ PIVCOHDEF int pivcoh_table_from_freqs_joint(pivcoh_table *t,
  * nothing per iteration (in-loop guards were tried and cost ~2%).  On a
  * stream that fails it the cursors strayed mid-merge first: by at most
  * K bytes past a side plus the 64-byte iteration window, absorbed by
- * the decode arena's pad.  Writes of EXACT merges (the root, targeting
- * the caller's buffer) are exactly bounded to out[0,K).  Bitmap reads
+ * the decode arena's pad.  Writes of slack = 0 merges (the root,
+ * targeting the caller's buffer) are exactly bounded to out[0,K).
+ * Bitmap reads
  * never pass ceil(K/8) bytes, flat-region reads never pass ceil(K*D/8)
  * bytes.
  */
 
 /* Two-table SABD merge shuffles (8 KiB — the only merge tables: every
- * merge tail is a 16-byte SABD chunk too, so the old stride-16/8
- * expand-tab ladder and its ~21 KiB of tables are gone). */
+ * merge tail is a 16-byte SABD chunk too). */
 static int8_t  pivcoh__mshuf0[256 * 16]     __attribute__((aligned(16)));
 static int8_t  pivcoh__mshuf1[256 * 16]     __attribute__((aligned(16)));
 
@@ -1801,9 +1779,10 @@ static inline unsigned pivcoh__tailmask(const uint8_t *bm, int j, unsigned rem)
     return mask & ((1u << rem) - 1);
 }
 
-/* merge_vec_vec: 64 bytes/iter main loop — four 16-byte SABD chunks
- * share one vcnt + 64-bit-multiply prefix sum for the per-chunk cursor
- * splits and the L/R advance — then 16-byte chunks.
+/* mvv — merge vec <- (vec, vec).  64 bytes/iter main loop: four
+ * 16-byte SABD chunks share one vcnt + 64-bit-multiply prefix sum for
+ * the per-chunk cursor splits and the L/R advance — then 16-byte
+ * chunks.
  *
  * The loop is software-pipelined one iteration deep: the carried chain
  * (bitmap load -> vcnt -> lane move -> multiply -> cursor advance) is
@@ -1813,16 +1792,15 @@ static inline unsigned pivcoh__tailmask(const uint8_t *bm, int j, unsigned rem)
  * bitmap straight into SIMD (a GPR->SIMD fmov costs a load-port uop on
  * Apple and would sit mid-chain).  Byte k of pfx = sum of the mask's
  * byte-popcounts 0..k: bytes 1/3/5 are the 16-bit chunk boundaries,
- * byte 7 the total.  Store cadence is unchanged — the 128B-unroll
- * shape that won microbenches but lost e2e to streaming effects is
- * deliberately avoided (micro: +7% L1, +4% streaming as-is).
+ * byte 7 the total.  Store cadence stays at 64B — a 128B unroll wins
+ * micro (+7% L1) but loses e2e to streaming effects.
  *
- * EXACT=0 (interior nodes, arena-backed out): entirely SIMD, no scalar
- * tail.  The final partial chunk runs mask-trimmed at full 16-byte
- * width, overwriting up to 15 bytes past out+K; the 16 bytes there are
- * saved up front and restored after.  EXACT=1 (the root merge, which
- * targets the caller's buffer): whole chunks while they fit, then a
- * plain scalar tail (<= 15 elements, once per block).
+ * slack != 0 (interior nodes, arena-backed out): entirely SIMD, no
+ * scalar tail.  The final partial chunk runs mask-trimmed at full
+ * 16-byte width, overwriting up to 15 bytes past out+K; the 16 bytes
+ * there are saved up front and restored after.  slack = 0 (the root
+ * merge, which targets the caller's buffer): whole chunks while they
+ * fit, then a plain scalar tail (<= 15 elements, once per block).
  *
  * Both variants validate at the end — see the section comment.  Returns
  * 0, or -1 when the bitmap contradicts the K_right header. */
@@ -1830,11 +1808,11 @@ static inline unsigned pivcoh__tailmask(const uint8_t *bm, int j, unsigned rem)
                              vcnt_u8(vld1_u8(p))), 0) * 0x0101010101010101ull)
 __attribute__((always_inline)) static inline
 int pivcoh__mvv(const uint8_t *bm, int K, const uint8_t *l, int KL,
-                const uint8_t *r, int KR, uint8_t *out, int EXACT)
+                const uint8_t *r, int KR, uint8_t *out, int slack)
 {
     const uint8_t *l_end = l + KL, *r_end = r + KR;
     uint8x16_t keep = vdupq_n_u8(0);
-    if (!EXACT) keep = vld1q_u8(out + K);
+    if (slack) keep = vld1q_u8(out + K);
     intptr_t i = 0;
 #define PIVCOH__MVV4(mask, pfx) do {                                       \
         intptr_t p0 = ((pfx) >> 8) & 0xff, p1 = ((pfx) >> 24) & 0xff,      \
@@ -1865,7 +1843,7 @@ int pivcoh__mvv(const uint8_t *bm, int K, const uint8_t *l, int KL,
         int pt = __builtin_popcount(m16);
         r += pt; l += 16 - pt;
     }
-    if (!EXACT) {
+    if (slack) {
         if (j < K) {
             unsigned mask = pivcoh__tailmask(bm, j, (unsigned)(K - j));
             pivcoh__merge16(out + j, l, r, mask);
@@ -1885,27 +1863,19 @@ int pivcoh__mvv(const uint8_t *bm, int K, const uint8_t *l, int KL,
     }
     return r == r_end ? 0 : -1;
 }
-static int pivcoh__merge_vec_vec(const uint8_t *bm, int K,
-                                 const uint8_t *l, int KL,
-                                 const uint8_t *r, int KR, uint8_t *out)
-{ return pivcoh__mvv(bm, K, l, KL, r, KR, out, 0); }
-static int pivcoh__merge_vec_vec_x(const uint8_t *bm, int K,
-                                   const uint8_t *l, int KL,
-                                   const uint8_t *r, int KR, uint8_t *out)
-{ return pivcoh__mvv(bm, K, l, KL, r, KR, out, 1); }
 #undef PIVCOH__PFX8
 
-/* merge_cst_vec: L is a broadcast constant (LEAF_LEFT) — no L load or
- * cursor; only the R cursor advances (and is guarded/validated).  Same
- * EXACT/tail-free split as pivcoh__mvv. */
+/* mcv — merge vec <- (cst, vec): L is a broadcast constant
+ * (LEAF_LEFT) — no L load or cursor; only the R cursor advances (and
+ * is guarded/validated).  Same slack split as mvv. */
 __attribute__((always_inline)) static inline
 int pivcoh__mcv(const uint8_t *bm, int K, uint8_t left_sym,
-                const uint8_t *r, int KR, uint8_t *out, int EXACT)
+                const uint8_t *r, int KR, uint8_t *out, int slack)
 {
     const uint8_t *r_end = r + KR;
     uint8x16_t Lb = vdupq_n_u8(left_sym);
     uint8x16_t keep = vdupq_n_u8(0);
-    if (!EXACT) keep = vld1q_u8(out + K);
+    if (slack) keep = vld1q_u8(out + K);
     intptr_t i = 0;
     for (; i + 64 <= K; i += 64) {
         uint64_t mask; memcpy(&mask, bm + (i >> 3), 8);
@@ -1924,7 +1894,7 @@ int pivcoh__mcv(const uint8_t *bm, int K, uint8_t left_sym,
         pivcoh__merge16cst(out + j, Lb, r, m16);
         r += __builtin_popcount(m16);
     }
-    if (!EXACT) {
+    if (slack) {
         if (j < K) {
             unsigned mask = pivcoh__tailmask(bm, j, (unsigned)(K - j));
             pivcoh__merge16cst(out + j, Lb, r, mask);
@@ -1941,31 +1911,25 @@ int pivcoh__mcv(const uint8_t *bm, int K, uint8_t left_sym,
     }
     return r == r_end ? 0 : -1;
 }
-static int pivcoh__merge_cst_vec(const uint8_t *bm, int K, uint8_t left_sym,
-                                 const uint8_t *r, int KR, uint8_t *out)
-{ return pivcoh__mcv(bm, K, left_sym, r, KR, out, 0); }
-static int pivcoh__merge_cst_vec_x(const uint8_t *bm, int K, uint8_t left_sym,
-                                   const uint8_t *r, int KR, uint8_t *out)
-{ return pivcoh__mcv(bm, K, left_sym, r, KR, out, 1); }
-
 /* ---- flat-subtree D-bit decode helpers ----
  *
- * Every flat kernel below has two tails, chosen by `tf` (tail-free):
- * the walk passes tf=1 when the input holds >= 16 readable bytes past
- * the flat region AND out is arena-backed — which is (almost) every
- * interior flat region: in decode order the last bytes of a block are
- * the ROOT's merge bitmap, so an interior region is followed by its
- * ancestors' records (a parent's bitmap alone exceeds 16 bytes once
- * the region holds ~120 symbols).  tf kernels simply run their MAIN
- * loop past n — same shape, same constants, no separate tail pipeline —
- * reading at most 16 bytes past the region (inside the stream) and
- * scribbling up to one iteration's width minus one (15..63 bytes,
- * kernel-dependent) past out+n, saved and restored at loop width — so
- * the byte-wise "safe" unpacks and per-code scalar tails are gone.
- * tf=0 (a flat ROOT decoding into the caller's buffer — where the
- * region really can end the stream — or a rare end-of-block interior
- * region) keeps the region-bounded vector loops and finishes the last
- * few codes with the scalar extractor below. */
+ * Every flat kernel below has two tails, chosen by `slack` — the same
+ * flag the merge kernels take: nonzero promises >= 16 readable bytes
+ * past the kernel's input region and scribble room past its output
+ * (out arena-backed), zero promises neither and gets exact bounds.
+ * The walk passes slack=1 for (almost) every interior flat region: in
+ * decode order the last bytes of a block are the ROOT's merge bitmap,
+ * so an interior region is followed by its ancestors' records (a
+ * parent's bitmap alone exceeds 16 bytes once the region holds ~120
+ * symbols).  With slack the kernels simply run their MAIN loop past
+ * n — same shape, same constants, no separate tail pipeline — reading
+ * at most 16 bytes past the region (inside the stream) and scribbling
+ * up to one iteration's width minus one (15..63 bytes, kernel-
+ * dependent) past out+n, saved and restored at loop width.  slack=0
+ * (a flat ROOT decoding into the caller's buffer — where the region
+ * really can end the stream — or a rare end-of-block interior region)
+ * keeps the region-bounded vector loops and finishes the last few
+ * codes with the scalar extractor below. */
 
 static inline uint32_t pivcoh__extract_bits(const uint8_t *in, int bit_pos, int D)
 {
@@ -1975,68 +1939,37 @@ static inline uint32_t pivcoh__extract_bits(const uint8_t *in, int bit_pos, int 
     return (val >> bit_off) & ((1u << D) - 1);
 }
 
-static const uint8_t pivcoh__d7_shuf_tab[16] = {0,1, 0,1, 1,2, 2,3, 3,4, 4,5, 5,6, 6,6};
-static const int16_t pivcoh__d7_shift_tab[8] = {0, -7, -6, -5, -4, -3, -2, -1};
-static inline uint8x8_t pivcoh__d7_unpack(const uint8_t *bm_ptr)
+static inline uint8x8_t pivcoh__d7_codes8(const uint8_t *bm_ptr)
 {
+    static const uint8_t shuf_a[16] = {0,1, 0,1, 1,2, 2,3, 3,4, 4,5, 5,6, 6,6};
+    static const int16_t shift_a[8] = {0, -7, -6, -5, -4, -3, -2, -1};
     uint8x16_t bm_lo = vld1q_u8(bm_ptr);
-    uint16x8_t w = vreinterpretq_u16_u8(vqtbl1q_u8(bm_lo, vld1q_u8(pivcoh__d7_shuf_tab)));
-    uint16x8_t shifted = vshlq_u16(w, vld1q_s16(pivcoh__d7_shift_tab));
+    uint16x8_t w = vreinterpretq_u16_u8(vqtbl1q_u8(bm_lo, vld1q_u8(shuf_a)));
+    uint16x8_t shifted = vshlq_u16(w, vld1q_s16(shift_a));
     return vmovn_u16(vandq_u16(shifted, vdupq_n_u16(0x7F)));
-}
-
-/* One 16-output pair-gather chunk for the byte-crossing depths: a
- * 16-byte load, one vqtbl1 placing two adjacent codes in each u16 lane,
- * a u16 shift aligning the pair, a u8 shift + mask isolating each code,
- * then the c2s scatter.  Consumes 2D input bytes of the 16 loaded.
- * These ARE the D=5/6 main-loop bodies — main loop and tf tail share
- * one shape and one constant set per kernel. */
-static inline void pivcoh__d5_chunk16(uint8_t *dst, const uint8_t *src,
-                                      uint8x16x2_t c2s_vec)
-{
-    static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 2,3, 3,4, 5,6, 6,7, 7,8, 8,9 };
-    static const int16_t hshift_t[8]     = { 3, 1, -1, -3, 3, 1, -1, -3 };
-    static const int8_t  bshr_t[16]      = { -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0 };
-    uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(vld1q_u8(src), vld1q_u8(pair_shuf_t)));
-    x = vshlq_u16(x, vld1q_s16(hshift_t));
-    uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), vld1q_s8(bshr_t));
-    vst1q_u8(dst, vqtbl2q_u8(c2s_vec, vandq_u8(y, vdupq_n_u8(0x1f))));
-}
-
-static inline void pivcoh__d6_chunk16(uint8_t *dst, const uint8_t *src,
-                                      uint8x16x4_t c2s_vec)
-{
-    static const uint8_t pair_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
-    static const int16_t hshift_t[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
-    static const int8_t  bshr_t[16]      = { -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0 };
-    uint16x8_t x = vreinterpretq_u16_u8(vqtbl1q_u8(vld1q_u8(src), vld1q_u8(pair_shuf_t)));
-    x = vshlq_u16(x, vld1q_s16(hshift_t));
-    uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), vld1q_s8(bshr_t));
-    vst1q_u8(dst, vqtbl4q_u8(c2s_vec, vandq_u8(y, vdupq_n_u8(0x3f))));
 }
 
 /* ---- per-D flat decodes (contiguous output) ---- */
 
 /* D=1 (8 codes/byte): each output lane bit-selects between the two
  * broadcast symbols — dup-shuffle the 2 bitmap bytes across the lanes,
- * CMTST each lane's own bit, BSL the symbols (one op less than the
- * old shift+mask+lookup, though the kernel is store-bound either way).
- * The tf chunks read <= 1 byte past the region (inside the stream);
- * tf=0 (a 2-symbol flat root) finishes scalar. */
-static const uint8_t pivcoh__d1_dup_tab[16] = {0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1};
-static const uint8_t pivcoh__d1_bit_tab[16] = {1,2,4,8,16,32,64,128,
-                                               1,2,4,8,16,32,64,128};
-static void pivcoh__flat_d1(uint8_t *out, int n, const uint8_t *bm,
-                            const uint8_t *c2s, int tf)
+ * CMTST each lane's own bit, BSL the symbols (store-bound).
+ * The slack chunks read <= 1 byte past the region (inside the stream);
+ * slack=0 (a 2-symbol flat root) finishes scalar. */
+static void pivcoh__unpack_d1(uint8_t *out, int n, const uint8_t *bm,
+                              const uint8_t *c2s, int slack)
 {
+    static const uint8_t dup_a[16] = {0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1};
+    static const uint8_t bit_a[16] = {1,2,4,8,16,32,64,128,
+                                      1,2,4,8,16,32,64,128};
     uint8x16_t Lv    = vdupq_n_u8(c2s[0]);
     uint8x16_t Rv    = vdupq_n_u8(c2s[1]);
-    uint8x16_t dup_v = vld1q_u8(pivcoh__d1_dup_tab);
-    uint8x16_t bit_v = vld1q_u8(pivcoh__d1_bit_tab);
+    uint8x16_t dup_v = vld1q_u8(dup_a);
+    uint8x16_t bit_v = vld1q_u8(bit_a);
     uint8x16_t keep = vdupq_n_u8(0);
-    if (tf) keep = vld1q_u8(out + n);
+    if (slack) keep = vld1q_u8(out + n);
 
-    int j = 0, lim = tf ? n : n - 15;
+    int j = 0, lim = slack ? n : n - 15;
     for (; j < lim; j += 16) {
         uint16_t bm_word; memcpy(&bm_word, bm + (j >> 3), 2);
         uint8x16_t bm_lo = vreinterpretq_u8_u16(
@@ -2044,31 +1977,31 @@ static void pivcoh__flat_d1(uint8_t *out, int n, const uint8_t *bm,
         uint8x16_t dup = vqtbl1q_u8(bm_lo, dup_v);
         vst1q_u8(out + j, vbslq_u8(vtstq_u8(dup, bit_v), Rv, Lv));
     }
-    if (tf) { vst1q_u8(out + n, keep); return; }
+    if (slack) { vst1q_u8(out + n, keep); return; }
     for (; j < n; j++)
         out[j] = c2s[(bm[j >> 3] >> (j & 7)) & 1];
 }
 
 /* D=2 (4 codes/byte): 64/iter maps each input nibble straight to a
  * symbol pair via two prepped tables, interleaved back with vst4q.
- * The tf tail is the same loop run past n (scribbling < 64 bytes past
+ * The slack tail is the same loop run past n (scribbling < 64 bytes past
  * out+n, saved and restored) — one shape, one constant set. */
-static void pivcoh__flat_d2(uint8_t *out, int n, const uint8_t *bm,
-                            const uint8_t *c2s, int tf)
+static void pivcoh__unpack_d2(uint8_t *out, int n, const uint8_t *bm,
+                              const uint8_t *c2s, int slack)
 {
     int i = 0;
-    if (tf || n >= 64) {
+    if (slack || n >= 64) {
         static const uint8_t th_idx[16] = {0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3};
         uint32_t w; memcpy(&w, c2s, 4);
         const uint8x16_t TL = vreinterpretq_u8_u32(vdupq_n_u32(w));   /* c2s[n&3] */
         const uint8x16_t TH = vqtbl1q_u8(TL, vld1q_u8(th_idx));       /* c2s[(n>>2)&3] */
         const uint8x16_t m  = vdupq_n_u8(0x0F);
         uint8x16_t k0 = vdupq_n_u8(0), k1 = k0, k2 = k0, k3 = k0;
-        if (tf) {
+        if (slack) {
             k0 = vld1q_u8(out + n);      k1 = vld1q_u8(out + n + 16);
             k2 = vld1q_u8(out + n + 32); k3 = vld1q_u8(out + n + 48);
         }
-        int lim = tf ? n : n - 63;
+        int lim = slack ? n : n - 63;
         for (; i < lim; i += 64) {
             uint8x16_t v  = vld1q_u8(bm + (i >> 2));
             uint8x16_t lo = vandq_u8(v, m), hi = vshrq_n_u8(v, 4);
@@ -2076,7 +2009,7 @@ static void pivcoh__flat_d2(uint8_t *out, int n, const uint8_t *bm,
                                 vqtbl1q_u8(TL, hi), vqtbl1q_u8(TH, hi) }};
             vst4q_u8(out + i, o);
         }
-        if (tf) {
+        if (slack) {
             vst1q_u8(out + n, k0);      vst1q_u8(out + n + 16, k1);
             vst1q_u8(out + n + 32, k2); vst1q_u8(out + n + 48, k3);
             return;
@@ -2086,29 +2019,28 @@ static void pivcoh__flat_d2(uint8_t *out, int n, const uint8_t *bm,
 }
 
 /* D=3: 32 codes/iter via the D=6 pair-gather (two D=3 codes per byte),
- * split lo/hi and interleave with vst2q.  The tf tail is the same loop
+ * split lo/hi and interleave with vst2q.  The slack tail is the same loop
  * run past n (scribbling < 32 bytes past out+n, saved and restored;
- * the tf=0 main-loop bound i+48 <= n keeps its 16-byte loads inside
- * ceil(3n/8) — production guards only against the output and can read
- * 4 bytes past the region). */
-static void pivcoh__flat_d3(uint8_t *out, int n, const uint8_t *bm,
-                            const uint8_t *c2s, int tf)
+ * the slack=0 main-loop bound i+48 <= n keeps its 16-byte loads inside
+ * ceil(3n/8)). */
+static void pivcoh__unpack_d3(uint8_t *out, int n, const uint8_t *bm,
+                              const uint8_t *c2s, int slack)
 {
     int i = 0;
-    if (tf || n >= 48) {
+    if (slack || n >= 48) {
         const uint8x8_t  c2s8  = vld1_u8(c2s);
         const uint8x16_t c2s16 = vcombine_u8(c2s8, c2s8);
         const uint8x16_t m7    = vdupq_n_u8(7);
         uint8x16x2_t c2s32; c2s32.val[0] = c2s16; c2s32.val[1] = c2s16;
-        static const uint8_t pair6_shuf_t[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
-        static const int16_t hshift6_t[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
-        static const int8_t  bshr6_t[16]      = { -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0 };
-        const uint8x16_t pair6_shuf = vld1q_u8(pair6_shuf_t);
-        const int16x8_t  hshift6    = vld1q_s16(hshift6_t);
-        const int8x16_t  bshr6      = vld1q_s8(bshr6_t);
+        static const uint8_t pair6_shuf_a[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
+        static const int16_t hshift6_a[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
+        static const int8_t  bshr6_a[16]      = { -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0 };
+        const uint8x16_t pair6_shuf = vld1q_u8(pair6_shuf_a);
+        const int16x8_t  hshift6    = vld1q_s16(hshift6_a);
+        const int8x16_t  bshr6      = vld1q_s8(bshr6_a);
         uint8x16_t k0 = vdupq_n_u8(0), k1 = k0;
-        if (tf) { k0 = vld1q_u8(out + n); k1 = vld1q_u8(out + n + 16); }
-        int lim = tf ? n : n - 47;
+        if (slack) { k0 = vld1q_u8(out + n); k1 = vld1q_u8(out + n + 16); }
+        int lim = slack ? n : n - 47;
         const uint8_t *bp = bm;
         for (; i < lim; i += 32, bp += 12) {
             uint8x16_t packed = vld1q_u8(bp);
@@ -2120,7 +2052,7 @@ static void pivcoh__flat_d3(uint8_t *out, int n, const uint8_t *bm,
             o.val[1] = vqtbl2q_u8(c2s32, vshrq_n_u8(pair6, 3));
             vst2q_u8(out + i, o);
         }
-        if (tf) {
+        if (slack) {
             vst1q_u8(out + n, k0);
             vst1q_u8(out + n + 16, k1);
             return;
@@ -2129,17 +2061,17 @@ static void pivcoh__flat_d3(uint8_t *out, int n, const uint8_t *bm,
     for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 3, 3)];
 }
 
-/* D=4: nibbles index c2s directly; 32/iter via vzip.  The tf tail is
+/* D=4: nibbles index c2s directly; 32/iter via vzip.  The slack tail is
  * the same loop run past n (scribbling < 32 bytes past out+n, saved
  * and restored) — one shape, one constant set. */
-static void pivcoh__flat_d4(uint8_t *out, int n, const uint8_t *bm,
-                            const uint8_t *c2s, int tf)
+static void pivcoh__unpack_d4(uint8_t *out, int n, const uint8_t *bm,
+                              const uint8_t *c2s, int slack)
 {
     uint8x16_t c2s_vec = vld1q_u8(c2s);
     const uint8x16_t m = vdupq_n_u8(0x0F);
     uint8x16_t k0 = vdupq_n_u8(0), k1 = k0;
-    if (tf) { k0 = vld1q_u8(out + n); k1 = vld1q_u8(out + n + 16); }
-    int i = 0, lim = tf ? n : n - 31;
+    if (slack) { k0 = vld1q_u8(out + n); k1 = vld1q_u8(out + n + 16); }
+    int i = 0, lim = slack ? n : n - 31;
     for (; i < lim; i += 32) {
         uint8x16_t v  = vld1q_u8(bm + (i >> 1));
         uint8x16_t lo = vandq_u8(v, m), hi = vshrq_n_u8(v, 4);
@@ -2147,7 +2079,7 @@ static void pivcoh__flat_d4(uint8_t *out, int n, const uint8_t *bm,
         vst1q_u8(out + i,      vzip1q_u8(a, b));
         vst1q_u8(out + i + 16, vzip2q_u8(a, b));
     }
-    if (tf) {
+    if (slack) {
         vst1q_u8(out + n, k0);
         vst1q_u8(out + n + 16, k1);
         return;
@@ -2155,92 +2087,113 @@ static void pivcoh__flat_d4(uint8_t *out, int n, const uint8_t *bm,
     for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 4, 4)];
 }
 
-/* D=5: pair-gather chunks (two adjacent codes per u16 lane, positioned
- * so the byte reinterpret interleaves even/odd for free); vqtbl2
- * scatter.  tf=0 keeps the region-safe block count. */
-static void pivcoh__flat_d5(uint8_t *out, int n, const uint8_t *bm,
-                            const uint8_t *c2s, int tf)
+/* D=5: pair-gather (each u16 lane holds two adjacent codes, positioned
+ * so the byte reinterpret interleaves even/odd for free): 16-byte load
+ * consuming 10, vqtbl1 pair placement, u16 pair-align shift, u8
+ * shift + mask isolating each code, vqtbl2 c2s scatter.
+ * slack=0 keeps the region-safe block count. */
+static void pivcoh__unpack_d5(uint8_t *out, int n, const uint8_t *bm,
+                              const uint8_t *c2s, int slack)
 {
+    static const uint8_t pair_shuf_a[16] = { 0,1, 1,2, 2,3, 3,4, 5,6, 6,7, 7,8, 8,9 };
+    static const int16_t hshift_a[8]     = { 3, 1, -1, -3, 3, 1, -1, -3 };
+    static const int8_t  bshr_a[16]      = { -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0, -3,0 };
+    const uint8x16_t pair_shuf = vld1q_u8(pair_shuf_a);
+    const int16x8_t  hshift    = vld1q_s16(hshift_a);
+    const int8x16_t  bshr      = vld1q_s8(bshr_a);
     uint8x16x2_t c2s_vec = vld1q_u8_x2(c2s);
     uint8x16_t keep = vdupq_n_u8(0);
-    if (tf) keep = vld1q_u8(out + n);
-    int i = 0, lim = tf ? n : (n >= 25 ? ((n - 9) >> 4) << 4 : 0);
-    for (; i < lim; i += 16)
-        pivcoh__d5_chunk16(out + i, bm + ((i * 5) >> 3), c2s_vec);
-    if (tf) { vst1q_u8(out + n, keep); return; }
+    if (slack) keep = vld1q_u8(out + n);
+    int i = 0, lim = slack ? n : (n >= 25 ? ((n - 9) >> 4) << 4 : 0);
+    for (; i < lim; i += 16) {
+        uint16x8_t x = vreinterpretq_u16_u8(
+            vqtbl1q_u8(vld1q_u8(bm + ((i * 5) >> 3)), pair_shuf));
+        x = vshlq_u16(x, hshift);
+        uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), bshr);
+        vst1q_u8(out + i, vqtbl2q_u8(c2s_vec, vandq_u8(y, vdupq_n_u8(0x1f))));
+    }
+    if (slack) { vst1q_u8(out + n, keep); return; }
     for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 5, 5)];
 }
 
-/* D=6: same pair-gather as D=5 (12-bit pairs); 64-byte c2s => vqtbl4q. */
-static void pivcoh__flat_d6(uint8_t *out, int n, const uint8_t *bm,
-                            const uint8_t *c2s, int tf)
+/* D=6: same pair-gather as D=5 (12-bit pairs, 12 of 16 loaded bytes
+ * consumed); 64-byte c2s => vqtbl4q. */
+static void pivcoh__unpack_d6(uint8_t *out, int n, const uint8_t *bm,
+                              const uint8_t *c2s, int slack)
 {
+    static const uint8_t pair_shuf_a[16] = { 0,1, 1,2, 3,4, 4,5, 6,7, 7,8, 9,10, 10,11 };
+    static const int16_t hshift_a[8]     = { 2,-2, 2,-2, 2,-2, 2,-2 };
+    static const int8_t  bshr_a[16]      = { -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0, -2,0 };
+    const uint8x16_t pair_shuf = vld1q_u8(pair_shuf_a);
+    const int16x8_t  hshift    = vld1q_s16(hshift_a);
+    const int8x16_t  bshr      = vld1q_s8(bshr_a);
     uint8x16x4_t c2s_vec = vld1q_u8_x4(c2s);
     uint8x16_t keep = vdupq_n_u8(0);
-    if (tf) keep = vld1q_u8(out + n);
-    int i = 0, lim = tf ? n : (n >= 24 ? ((n - 8) >> 4) << 4 : 0);
-    for (; i < lim; i += 16)
-        pivcoh__d6_chunk16(out + i, bm + ((i * 6) >> 3), c2s_vec);
-    if (tf) { vst1q_u8(out + n, keep); return; }
+    if (slack) keep = vld1q_u8(out + n);
+    int i = 0, lim = slack ? n : (n >= 24 ? ((n - 8) >> 4) << 4 : 0);
+    for (; i < lim; i += 16) {
+        uint16x8_t x = vreinterpretq_u16_u8(
+            vqtbl1q_u8(vld1q_u8(bm + ((i * 6) >> 3)), pair_shuf));
+        x = vshlq_u16(x, hshift);
+        uint8x16_t y = vshlq_u8(vreinterpretq_u8_u16(x), bshr);
+        vst1q_u8(out + i, vqtbl4q_u8(c2s_vec, vandq_u8(y, vdupq_n_u8(0x3f))));
+    }
+    if (slack) { vst1q_u8(out + n, keep); return; }
     for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 6, 6)];
 }
 
 /* D=7: 128-entry c2s = vqtbl4 low half + vqtbx4 high half (vqtbx keeps
  * the first result for out-of-range lanes — no OR-merge).  16-wide
  * while whole chunks fit, 8-wide finish. */
-static void pivcoh__flat_d7(uint8_t *out, int n, const uint8_t *bm,
-                            const uint8_t *c2s, int tf)
+static void pivcoh__unpack_d7(uint8_t *out, int n, const uint8_t *bm,
+                              const uint8_t *c2s, int slack)
 {
     uint8x16x4_t lo = vld1q_u8_x4(c2s), hi = vld1q_u8_x4(c2s + 64);
     uint8x16_t sub64q = vdupq_n_u8(64);
     uint8x8_t  sub64  = vdup_n_u8(64);
     uint8x16_t keep = vdupq_n_u8(0);
-    if (tf) keep = vld1q_u8(out + n);
-    int i = 0, fast_end = tf ? n : (n >= 24 ? n - 24 : 0);
+    if (slack) keep = vld1q_u8(out + n);
+    int i = 0, fast_end = slack ? n : (n >= 24 ? n - 24 : 0);
     for (; i < fast_end - 15; i += 16) {
-        uint8x8_t cl = pivcoh__d7_unpack(bm + ((i      * 7) >> 3));
-        uint8x8_t ch = pivcoh__d7_unpack(bm + (((i + 8) * 7) >> 3));
+        uint8x8_t cl = pivcoh__d7_codes8(bm + ((i      * 7) >> 3));
+        uint8x8_t ch = pivcoh__d7_codes8(bm + (((i + 8) * 7) >> 3));
         uint8x16_t codes = vcombine_u8(cl, ch);
         uint8x16_t s = vqtbl4q_u8(lo, codes);
         s = vqtbx4q_u8(s, hi, vsubq_u8(codes, sub64q));
         vst1q_u8(out + i, s);
     }
-    for (; i < (tf ? n : fast_end - 7); i += 8) {
-        uint8x8_t codes = pivcoh__d7_unpack(bm + ((i * 7) >> 3));
+    for (; i < (slack ? n : fast_end - 7); i += 8) {
+        uint8x8_t codes = pivcoh__d7_codes8(bm + ((i * 7) >> 3));
         uint8x8_t s = vqtbl4_u8(lo, codes);
         s = vqtbx4_u8(s, hi, vsub_u8(codes, sub64));
         vst1_u8(out + i, s);
     }
-    if (tf) { vst1q_u8(out + n, keep); return; }
+    if (slack) { vst1q_u8(out + n, keep); return; }
     for (; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * 7, 7)];
 }
 
 /* Dispatcher.  D=8 is a full-alphabet equal-length code: c2s is the
  * identity, so the byte-aligned codes ARE the symbols — memcpy (exact
- * either way; tf is moot). */
-static void pivcoh__merge_flat(uint8_t *out, int n, const uint8_t *bm, int D,
-                               const uint8_t *c2s, int tf)
+ * either way; slack is moot). */
+static void pivcoh__unpack_dN(uint8_t *out, int n, const uint8_t *bm, int D,
+                              const uint8_t *c2s, int slack)
 {
     switch (D) {
-    case 1: pivcoh__flat_d1(out, n, bm, c2s, tf); break;
-    case 2: pivcoh__flat_d2(out, n, bm, c2s, tf); break;
-    case 3: pivcoh__flat_d3(out, n, bm, c2s, tf); break;
-    case 4: pivcoh__flat_d4(out, n, bm, c2s, tf); break;
-    case 5: pivcoh__flat_d5(out, n, bm, c2s, tf); break;
-    case 6: pivcoh__flat_d6(out, n, bm, c2s, tf); break;
-    case 7: pivcoh__flat_d7(out, n, bm, c2s, tf); break;
+    case 1: pivcoh__unpack_d1(out, n, bm, c2s, slack); break;
+    case 2: pivcoh__unpack_d2(out, n, bm, c2s, slack); break;
+    case 3: pivcoh__unpack_d3(out, n, bm, c2s, slack); break;
+    case 4: pivcoh__unpack_d4(out, n, bm, c2s, slack); break;
+    case 5: pivcoh__unpack_d5(out, n, bm, c2s, slack); break;
+    case 6: pivcoh__unpack_d6(out, n, bm, c2s, slack); break;
+    case 7: pivcoh__unpack_d7(out, n, bm, c2s, slack); break;
     case 8: memcpy(out, bm, (size_t)n); break;
-    default:
-        for (int i = 0; i < n; i++) out[i] = c2s[pivcoh__extract_bits(bm, i * D, D)];
-        break;
     }
 }
 
 /* ---- decode tree walk ---- */
 
 /* Read a node's post-order raw bitmap: sets *bm and returns the input
- * pointer advanced past it, or NULL on truncation.  (v4: the v3 per-
- * node FSE marker byte is gone — there is no FSE mode to mark.) */
+ * pointer advanced past it, or NULL on truncation. */
 static inline const uint8_t *pivcoh__read_bm(const uint8_t **bm, int K,
                                              const uint8_t *p, const uint8_t *end)
 {
@@ -2317,14 +2270,14 @@ static inline const uint8_t *pivcoh__dec_child(const pivcoh_table *t, int idx,
         size_t nb = ((size_t)K * (size_t)D + 7) >> 3;
         size_t avail = (size_t)(end - p);
         if (avail < nb) return NULL;
-        pivcoh__merge_flat(out, K, p, (int)D, t->rank_to_sym + rec->param,
-                           avail - nb >= 16);
+        pivcoh__unpack_dN(out, K, p, (int)D, t->rank_to_sym + rec->param,
+                          avail - nb >= 16);
         return p + nb;
     }
     return pivcoh__dec_internal(t, idx, K, out, tmp, p, end);
 }
 
-/* Iterative interior walk (exp 5): an explicit continuation stack replaces
+/* Iterative interior walk: an explicit continuation stack replaces
  * recursion.  t, p, end and the rank map stay live in registers across the
  * loop instead of being reshuffled through call arguments; flat children
  * are decoded inline.  Two states — descend (open a node, start its big
@@ -2373,8 +2326,8 @@ try_child:          /* decode child (cidx, cK, cout, ctmp) */
             size_t nb = ((size_t)cK * (size_t)D + 7) >> 3;
             size_t avail = (size_t)(end - p);
             if (avail < nb) return NULL;
-            pivcoh__merge_flat(cout, cK, p, (int)D, t->rank_to_sym + crec->param,
-                               avail - nb >= 16);
+            pivcoh__unpack_dN(cout, cK, p, (int)D, t->rank_to_sym + crec->param,
+                              avail - nb >= 16);
             p += nb;
         } else {                                   /* internal: descend */
             idx = cidx; K = cK; out = cout; tmp = ctmp;
@@ -2392,14 +2345,14 @@ try_child:          /* decode child (cidx, cK, cout, ctmp) */
         const uint8_t *bm;
         if (!(p = pivcoh__read_bm(&bm, f->K, p, end))) return NULL;
         if (f->kind == PIVCOH__LEAFL) {
-            if (pivcoh__merge_cst_vec(bm, f->K, f->sym, f->out + f->KL, f->KR, f->out))
+            if (pivcoh__mcv(bm, f->K, f->sym, f->out + f->KL, f->KR, f->out, 1))
                 return NULL;
         } else {
             int smallK = f->right_big ? f->KL : f->KR;
             uint8_t *big_out = f->out + smallK;
             uint8_t *lbuf = f->right_big ? f->tmp : big_out;
             uint8_t *rbuf = f->right_big ? big_out : f->tmp;
-            if (pivcoh__merge_vec_vec(bm, f->K, lbuf, f->KL, rbuf, f->KR, f->out))
+            if (pivcoh__mvv(bm, f->K, lbuf, f->KL, rbuf, f->KR, f->out, 1))
                 return NULL;
         }
         sp--;
@@ -2424,9 +2377,9 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
         int D = root->kd >> 2;
         size_t nb = ((size_t)N * (size_t)D + 7) >> 3;
         if ((size_t)(end - p) < nb) return -1;
-        /* tf=0: out is the caller's buffer (no scribble allowed), and a
+        /* slack=0: out is the caller's buffer (no scribble allowed), and a
          * flat root's region really can end the stream. */
-        pivcoh__merge_flat(out, N, p, D, t->rank_to_sym + root->param, 0);
+        pivcoh__unpack_dN(out, N, p, D, t->rank_to_sym + root->param, 0);
         if (consumed) *consumed = (size_t)(p + nb - in);
         return N;
     }
@@ -2435,7 +2388,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
      * read their sources with 16 bytes of slack — guarantees the
      * caller's `out` doesn't offer.  So the root's children decode into
      * the arena, and only the root's own merge, whose writes are exact
-     * (the EXACT `_x` kernels), targets `out`. */
+     * (slack = 0), targets `out`. */
     pivcoh__init_dec();
     int KR;
     if (!(p = pivcoh__read_kr(&KR, N, p, end))) return -1;
@@ -2450,7 +2403,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
          * space after it as ping-pong partner. */
         if (KR > 0) p = pivcoh__dec_child(t, root->right, KR, sc, sc + KR, p, end);
         if (p && (p = pivcoh__read_bm(&bm, N, p, end)) != NULL &&
-            pivcoh__merge_cst_vec_x(bm, N, t->rank_to_sym[root->param], sc, KR, out))
+            pivcoh__mcv(bm, N, t->rank_to_sym[root->param], sc, KR, out, 0))
             p = NULL;
     } else {
         /* FULL root, hybrid hole-reuse: both children decode into the
@@ -2470,7 +2423,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
             if (p && KR > 0) p = pivcoh__dec_child(t, root->right, KR, rbuf, sc + N, p, end);
         }
         if (p && (p = pivcoh__read_bm(&bm, N, p, end)) != NULL &&
-            pivcoh__merge_vec_vec_x(bm, N, lbuf, KL, rbuf, KR, out))
+            pivcoh__mvv(bm, N, lbuf, KL, rbuf, KR, out, 0))
             p = NULL;
     }
     if (!scratch) free(sc);
@@ -2479,10 +2432,10 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
     return N;
 }
 
-/* ================= encode kernels (ports of primitives_neon) ================ */
+/* ========================== encode kernels ========================== */
 
 /* Per-mask LUTs:
- *   ctab8[m][0:8]  right source lanes packed at [0,n_right), 0xff fill
+ *   ptab8[m][0:8]  right source lanes packed at [0,n_right), 0xff fill
  *                  (vtbl1 returns 0 for out-of-range indices)
  * p16rev partition LUTs (part_full): one combined index per 16-lane group
  * packs {left, forward, front} | {right, reversed, back}; left+right tile
@@ -2490,7 +2443,7 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
  *   ptabA[m0]      low byte: left -> front, right -> back reversed
  *   ptabB0[m1]     high byte, pc0=0 layout; pc0>0 is the same table
  *                  loaded at byte offset pc0 (padded to 32 B/entry). */
-static uint8_t pivcoh__ctab8[256][16]   __attribute__((aligned(16)));
+static uint8_t pivcoh__ptab8[256][16]   __attribute__((aligned(16)));
 static uint8_t pivcoh__ptabA[256][16]   __attribute__((aligned(16)));
 static uint8_t pivcoh__ptabB0[256][32]  __attribute__((aligned(32)));
 
@@ -2499,11 +2452,11 @@ static void pivcoh__init_enc(void)
     static int built = 0;
     if (built) return;
     for (int m = 0; m < 256; m++) {
-        memset(pivcoh__ctab8[m], 0xff, 16);
+        memset(pivcoh__ptab8[m], 0xff, 16);
         int qr = 0, ql = 0;
         for (int k = 0; k < 8; k++) {
-            if (m & (1 << k)) pivcoh__ctab8[m][qr++]     = (uint8_t)k;
-            else              pivcoh__ctab8[m][8 + ql++] = (uint8_t)k;
+            if (m & (1 << k)) pivcoh__ptab8[m][qr++]     = (uint8_t)k;
+            else              pivcoh__ptab8[m][8 + ql++] = (uint8_t)k;
         }
     }
     for (int m0 = 0; m0 < 256; m0++) {
@@ -2531,9 +2484,9 @@ static void pivcoh__init_enc(void)
  * callers vcnt the byte popcounts BEFORE the lane move, so the cursor
  * chain never round-trips GPR->SIMD (that fmov costs a load-port uop
  * and ~6 cycles mid-chain). */
-static inline uint8x8_t pivcoh__masks64v(uint8x16_t v0, uint8x16_t v1,
-                                         uint8x16_t v2, uint8x16_t v3,
-                                         uint8x16_t vt, uint8x16_t bw)
+static inline uint8x8_t pivcoh__gtmasks64v(uint8x16_t v0, uint8x16_t v1,
+                                           uint8x16_t v2, uint8x16_t v3,
+                                           uint8x16_t vt, uint8x16_t bw)
 {
     uint8x16_t w0 = vandq_u8(vcgtq_u8(v0, vt), bw);
     uint8x16_t w1 = vandq_u8(vcgtq_u8(v1, vt), bw);
@@ -2545,12 +2498,12 @@ static inline uint8x8_t pivcoh__masks64v(uint8x16_t v0, uint8x16_t v1,
     return vget_low_u8(vpaddq_u8(u0, u0));
 }
 
-static inline uint64_t pivcoh__masks64(uint8x16_t v0, uint8x16_t v1,
-                                       uint8x16_t v2, uint8x16_t v3,
-                                       uint8x16_t vt, uint8x16_t bw)
+static inline uint64_t pivcoh__gtmasks64(uint8x16_t v0, uint8x16_t v1,
+                                         uint8x16_t v2, uint8x16_t v3,
+                                         uint8x16_t vt, uint8x16_t bw)
 {
     return vget_lane_u64(vreinterpret_u64_u8(
-               pivcoh__masks64v(v0, v1, v2, v3, vt, bw)), 0);
+               pivcoh__gtmasks64v(v0, v1, v2, v3, vt, bw)), 0);
 }
 
 /* ranks[i] = s2r[sym[i]]: the s2r table lives in 16 NEON regs; each
@@ -2561,8 +2514,8 @@ static inline uint64_t pivcoh__masks64(uint8x16_t v0, uint8x16_t v1,
  * indexed by sym - umin, one vqtbl4 + one vqtbx4.  Out-of-window
  * symbols (frequency zero) index past both tables and map to rank 0 --
  * the same valid-but-meaningless-stream contract as the full path. */
-static void pivcoh__enc_init(uint8_t *ranks, int n, const uint8_t *sym,
-                             const uint8_t *s2r, unsigned umin, unsigned span1)
+static void pivcoh__enc_ranks(uint8_t *ranks, int n, const uint8_t *sym,
+                              const uint8_t *s2r, unsigned umin, unsigned span1)
 {
     int i = 0;
     if (n >= 20 && span1 < 128) {
@@ -2614,7 +2567,7 @@ static void pivcoh__enc_init(uint8_t *ranks, int n, const uint8_t *sym,
 /* 16-lane movemask via two GPR magic multiplies: for 0x00/0xFF compare
  * bytes, x * 0x103070F1F3F80 accumulates each u64 half's byte-MSBs into
  * its top byte (all 256 patterns verified per half).  Cheaper than the
- * masks64 reduction tree at narrow-tail widths. */
+ * gtmasks64 reduction tree at narrow-tail widths. */
 static inline uint32_t pivcoh__movemask16(uint8x16_t cm)
 {
     const uint64_t magic = 0x103070F1F3F80ull;
@@ -2681,13 +2634,13 @@ static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
     if (j + 64 <= n) {
         uint8x16_t c0 = vld1q_u8(ranks + j),      c1 = vld1q_u8(ranks + j + 16);
         uint8x16_t c2 = vld1q_u8(ranks + j + 32), c3 = vld1q_u8(ranks + j + 48);
-        uint8x8_t mv = pivcoh__masks64v(c0, c1, c2, c3, vt, bw);
+        uint8x8_t mv = pivcoh__gtmasks64v(c0, c1, c2, c3, vt, bw);
         uint64_t w   = vget_lane_u64(vreinterpret_u64_u8(mv), 0);
         uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(mv)), 0);
         for (; j + 128 <= n; j += 64) {
             uint8x16_t n0 = vld1q_u8(ranks + j + 64), n1 = vld1q_u8(ranks + j + 80);
             uint8x16_t n2 = vld1q_u8(ranks + j + 96), n3 = vld1q_u8(ranks + j + 112);
-            uint8x8_t nmv = pivcoh__masks64v(n0, n1, n2, n3, vt, bw);
+            uint8x8_t nmv = pivcoh__gtmasks64v(n0, n1, n2, n3, vt, bw);
             uint64_t nw   = vget_lane_u64(vreinterpret_u64_u8(nmv), 0);
             uint64_t npcw = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(nmv)), 0);
             memcpy(bm + (j >> 3), &w, 8);
@@ -2730,7 +2683,7 @@ static int pivcoh__part_full(uint8_t *ranks, int n, uint8_t thr,
     return n_right;
 }
 
-/* Scatter one 64-rank group-set's right side via ctab8 (8-lane
+/* Scatter one 64-rank group-set's right side via ptab8 (8-lane
  * chunks); same phantom-left masking argument as part64_full.
  * Returns the group-set's right count. */
 __attribute__((always_inline)) static inline
@@ -2747,7 +2700,7 @@ int pivcoh__part64_right(uint8x16_t v0, uint8x16_t v1, uint8x16_t v2,
     };
 #define PIVCOH__PART1(K_) do {                                               \
         uint32_t cr = (K_)==0 ? 0u : (uint32_t)((pfx >> (8*((K_)-1))) & 0xFF); \
-        const uint8_t *tab = pivcoh__ctab8[(uint8_t)(mask_word >> (8*(K_)))]; \
+        const uint8_t *tab = pivcoh__ptab8[(uint8_t)(mask_word >> (8*(K_)))]; \
         vst1_u8(rdst + cr, vtbl1_u8(cv[K_], vld1_u8(tab)));                  \
     } while (0)
     PIVCOH__PART1(0); PIVCOH__PART1(1); PIVCOH__PART1(2); PIVCOH__PART1(3);
@@ -2758,8 +2711,7 @@ int pivcoh__part64_right(uint8x16_t v0, uint8x16_t v1, uint8x16_t v2,
 
 /* One-sided partition: bitmap + the right side compacted into tmp (a
  * LEAF_LEFT node's left side is dead).  Tail-free and pipelined like
- * part_full.  (The old EMIT_RIGHT=0 pure-bitmap mode moved into the
- * dedicated pack_d1.) */
+ * part_full. */
 static int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
                              uint8_t *bm, uint8_t *tmp)
 {
@@ -2770,13 +2722,13 @@ static int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
     if (j + 64 <= n) {
         uint8x16_t c0 = vld1q_u8(ranks + j),      c1 = vld1q_u8(ranks + j + 16);
         uint8x16_t c2 = vld1q_u8(ranks + j + 32), c3 = vld1q_u8(ranks + j + 48);
-        uint8x8_t mv = pivcoh__masks64v(c0, c1, c2, c3, vt, bw);
+        uint8x8_t mv = pivcoh__gtmasks64v(c0, c1, c2, c3, vt, bw);
         uint64_t w   = vget_lane_u64(vreinterpret_u64_u8(mv), 0);
         uint64_t pcw = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(mv)), 0);
         for (; j + 128 <= n; j += 64) {
             uint8x16_t n0 = vld1q_u8(ranks + j + 64), n1 = vld1q_u8(ranks + j + 80);
             uint8x16_t n2 = vld1q_u8(ranks + j + 96), n3 = vld1q_u8(ranks + j + 112);
-            uint8x8_t nmv = pivcoh__masks64v(n0, n1, n2, n3, vt, bw);
+            uint8x8_t nmv = pivcoh__gtmasks64v(n0, n1, n2, n3, vt, bw);
             uint64_t nw   = vget_lane_u64(vreinterpret_u64_u8(nmv), 0);
             uint64_t npcw = vget_lane_u64(vreinterpret_u64_u8(vcnt_u8(nmv)), 0);
             memcpy(bm + (j >> 3), &w, 8);
@@ -2796,10 +2748,10 @@ static int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
         uint16_t m16 = (uint16_t)m;
         memcpy(bm + (j >> 3), &m16, 2);
         vst1_u8(tmp + n_right,
-                vtbl1_u8(vget_low_u8(v), vld1_u8(pivcoh__ctab8[m & 0xFF])));
+                vtbl1_u8(vget_low_u8(v), vld1_u8(pivcoh__ptab8[m & 0xFF])));
         n_right += __builtin_popcount(m & 0xFF);
         vst1_u8(tmp + n_right,
-                vtbl1_u8(vget_high_u8(v), vld1_u8(pivcoh__ctab8[m >> 8])));
+                vtbl1_u8(vget_high_u8(v), vld1_u8(pivcoh__ptab8[m >> 8])));
         n_right += __builtin_popcount(m >> 8);
     }
     return n_right;
@@ -2816,7 +2768,7 @@ static int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
  * are zeroed by one byte RMW in the dispatcher, store-forwarded from
  * the final vector store. */
 
-/* D=1: the bit IS (rank > base) — the partition's masks64 bitmap
+/* D=1: the bit IS (rank > base) — the partition's gtmasks64 bitmap
  * build (rank == base + 1 exactly when rank > base on a D=1 region)
  * without the compaction, popcount accumulation, or tail trimming:
  * the 16-rank remainder stores junk bits past n and rides the packs'
@@ -2824,14 +2776,15 @@ static int pivcoh__part_core(uint8_t *ranks, int n, uint8_t thr,
  * zeroes the last partial byte). */
 static inline void pivcoh__pack_d1(uint8_t *out, const uint8_t *ranks, int n, uint8_t base)
 {
+    static const uint8_t bw_a[16] = {1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
     uint8x16_t vt = vdupq_n_u8(base);
-    uint8x16_t bw = vld1q_u8(pivcoh__d1_bit_tab);
+    uint8x16_t bw = vld1q_u8(bw_a);
     int i = 0;
     for (; i + 64 <= n; i += 64) {
-        uint64_t w = pivcoh__masks64(vld1q_u8(ranks + i),
-                                     vld1q_u8(ranks + i + 16),
-                                     vld1q_u8(ranks + i + 32),
-                                     vld1q_u8(ranks + i + 48), vt, bw);
+        uint64_t w = pivcoh__gtmasks64(vld1q_u8(ranks + i),
+                                       vld1q_u8(ranks + i + 16),
+                                       vld1q_u8(ranks + i + 32),
+                                       vld1q_u8(ranks + i + 48), vt, bw);
         memcpy(out + (i >> 3), &w, 8);
     }
     for (; i < n; i += 16) {
@@ -2912,9 +2865,7 @@ static inline void pivcoh__pack_d4(uint8_t *out, const uint8_t *ranks, int n, ui
  * 24-bit quad at [0,24) -- costs a shr+sli pair per level, one op
  * more: a sub-lane field can't cross its own byte/lane boundary with
  * a single per-lane shift, which is exactly what the converging
- * meet-at-the-boundary placement avoids.)
- * (History: ryg's multiply-as-shift vmull pyramid, then a 6-op
- * USHR+SLI ladder, each replaced in turn.)  Each 16-byte store carries
+ * meet-at-the-boundary placement avoids.)  Each 16-byte store carries
  * 16-2D trailing junk bytes, overwritten by the next iter / next
  * record (the caller's out_cap >= PIVCOH_ENCODE_BOUND keeps even the
  * last one in bounds). */
@@ -3050,19 +3001,19 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
         *pp = p + ((n * D + 7) >> 3);
         return;
     }
-    /* Decode-order record (wire v0.7): the K_right header goes at the
-     * node's PRE-order position, the marker+bitmap at its POST-order
-     * position, the children's regions between, larger-K child first.
-     * The bitmap is staged across the child recursion (its stream
-     * position depends on the children's encoded sizes) at the base of
-     * this node's scratch, NOT the stack: as a VLA it was live across
-     * the recursion, ~90KB of stack on a worst-case 64K block.  +8 pads
-     * the partition tail's 2-byte mask stores (<= 1 byte past nbytes)
-     * with margin.  The
-     * children's scratch starts 64 bytes past the right ranks: a
-     * node's tail-free left scatter overshoots up to 63 bytes past its
-     * OWN ranks region, and a right child's ranks end exactly where
-     * its scratch (holding its live stage) would otherwise begin. */
+    /* Decode-order record: the K_right header goes at the node's
+     * PRE-order position, the bitmap at its POST-order position, the
+     * children's regions between, larger-K child first.  The bitmap is
+     * staged across the child recursion (its stream position depends
+     * on the children's encoded sizes) at the base of this node's
+     * scratch, NOT the stack (a stack stage would be live across the
+     * recursion: ~90KB on a worst-case 64K block).  +8 pads the
+     * partition tail's 2-byte mask stores (<= 1 byte past nbytes) with
+     * margin.  The children's scratch starts 64 bytes past the right
+     * ranks: a node's tail-free left scatter overshoots up to 63 bytes
+     * past its OWN ranks region, and a right child's ranks end exactly
+     * where its scratch (holding its live stage) would otherwise
+     * begin. */
     int nbytes = (n + 7) >> 3;
     uint8_t *bm_stage = tmp;
     uint8_t *rout = tmp + nbytes + 8;
@@ -3123,7 +3074,7 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
         int lo = 255, hi = 0;
         for (int s = 0; s < 256; s++)
             if (t->code_len[s]) { if (s < lo) lo = s; if (s > hi) hi = s; }
-        if (lo > 128) lo = 128; /* keep enc_init's 128-byte window inside
+        if (lo > 128) lo = 128; /* keep enc_ranks's 128-byte window inside
                                    sym_to_rank; span1 stays < 128 (hi <=
                                    255) so all-high alphabets keep the
                                    half-size path, and symbols below the
@@ -3140,8 +3091,8 @@ PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
                                                   strays <= 63 B past a ranks
                                                   region; children get the same
                                                   gap in enc_node) */
-    pivcoh__enc_init(ranks, (int)n, in, t->sym_to_rank,
-                     t->enc_umin, t->enc_span1);
+    pivcoh__enc_ranks(ranks, (int)n, in, t->sym_to_rank,
+                      t->enc_umin, t->enc_span1);
     vst1q_u8(ranks + n, vdupq_n_u8(0));        /* root tail-read window:
                                                   with enc_node's
                                                   per-partition twin,
