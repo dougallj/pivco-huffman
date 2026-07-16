@@ -53,6 +53,14 @@ int lz4_split_decompress(const uint8_t *literals, size_t literals_len,
  * inputs.  Caller must guarantee the streams are well-formed and have
  * ≥64 B trailing pad.  Used only for benchmark diagnostics — never
  * call in production.  Returns 0 always. */
+/* Plane form: offsets as two separate n_off-byte lo/hi streams. */
+int lz4_split_decompress_planes(const uint8_t *literals, size_t literals_len,
+                                const uint8_t *tokens,   size_t tokens_len,
+                                const uint8_t *off_lo,   const uint8_t *off_hi,
+                                size_t n_off,
+                                const uint8_t *overflow, size_t overflow_len,
+                                uint8_t *out, size_t out_size);
+
 int lz4_split_decompress_trust(const uint8_t *literals,
                                 const uint8_t *tokens, size_t tokens_len,
                                 const uint8_t *offsets,

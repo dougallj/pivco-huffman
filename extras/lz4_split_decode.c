@@ -62,19 +62,26 @@ static inline void match_copy_small_offset(uint8_t *dst, const uint8_t *src,
     if (dst < end) wildCopy8(dst, src, end);
 }
 
-int lz4_split_decompress(const uint8_t *literals, size_t literals_len,
-                          const uint8_t *tokens,   size_t tokens_len,
-                          const uint8_t *offsets,  size_t offsets_len,
-                          const uint8_t *overflow, size_t overflow_len,
-                          uint8_t *out, size_t out_size)
+/* Core parameterized over the offset layout: interleaved 2-byte pairs
+ * (off_step 2, the classic stream) or two separate lo/hi planes
+ * (off_step 1) so each plane can be entropy-coded on its own.  Always
+ * inlined; both wrappers specialize the step at compile time. */
+static inline __attribute__((always_inline))
+int lz4_split_core(const uint8_t *literals, size_t literals_len,
+                   const uint8_t *tokens,   size_t tokens_len,
+                   const uint8_t *off_lo,   const uint8_t *off_hi,
+                   int off_step, size_t n_off,
+                   const uint8_t *overflow, size_t overflow_len,
+                   uint8_t *out, size_t out_size)
 {
     const uint8_t *lit_p = literals;
     const uint8_t *tok_p = tokens;
-    const uint8_t *off_p = offsets;
+    const uint8_t *olo_p = off_lo;
+    const uint8_t *ohi_p = off_hi;
+    size_t off_left = n_off;
     const uint8_t *ovf_p = overflow;
     const uint8_t *const lit_end = literals + literals_len;
     const uint8_t *const tok_end = tokens   + tokens_len;
-    const uint8_t *const off_end = offsets  + offsets_len;
     const uint8_t *const ovf_end = overflow + overflow_len;
 
     uint8_t       *out_p   = out;
@@ -111,8 +118,8 @@ int lz4_split_decompress(const uint8_t *literals, size_t literals_len,
         if (out_p >= out_end) goto done;
 
         /* --- offset + match length --- */
-        offset = (uint16_t)off_p[0] | ((uint16_t)off_p[1] << 8);
-        off_p += 2;
+        offset = (uint16_t)olo_p[0] | ((uint16_t)ohi_p[0] << 8);
+        olo_p += off_step; ohi_p += off_step; off_left--;
 
         match_len = (size_t)(token & 0xf);
         if (match_len == 15) {
@@ -151,9 +158,9 @@ tail_literal:
     lit_p += lit_len;
     if (out_p >= out_end) goto done;
 
-    if (off_p + 2 > off_end) return -3;
-    offset = (uint16_t)off_p[0] | ((uint16_t)off_p[1] << 8);
-    off_p += 2;
+    if (off_left == 0) return -3;
+    offset = (uint16_t)olo_p[0] | ((uint16_t)ohi_p[0] << 8);
+    olo_p += off_step; ohi_p += off_step; off_left--;
 
     match_len = (size_t)(token & 0xf);
     if (match_len == 15) {
@@ -199,9 +206,9 @@ safe_loop:
 
         if (out_p >= out_end) break;
 
-        if (off_p + 2 > off_end) return -3;
-        offset = (uint16_t)off_p[0] | ((uint16_t)off_p[1] << 8);
-        off_p += 2;
+        if (off_left == 0) return -3;
+        offset = (uint16_t)olo_p[0] | ((uint16_t)ohi_p[0] << 8);
+        olo_p += off_step; ohi_p += off_step; off_left--;
         if (offset == 0 || (size_t)offset > (size_t)(out_p - out)) return -4;
 
         match_len = (size_t)(token & 0xf);
@@ -230,6 +237,31 @@ safe_loop:
 done:
     if (out_p != out_end) return -7;
     return 0;
+}
+
+int lz4_split_decompress(const uint8_t *literals, size_t literals_len,
+                          const uint8_t *tokens,   size_t tokens_len,
+                          const uint8_t *offsets,  size_t offsets_len,
+                          const uint8_t *overflow, size_t overflow_len,
+                          uint8_t *out, size_t out_size)
+{
+    return lz4_split_core(literals, literals_len, tokens, tokens_len,
+                          offsets, offsets + 1, 2, offsets_len / 2,
+                          overflow, overflow_len, out, out_size);
+}
+
+/* Plane form: offsets arrive as two n_off-byte streams (low bytes,
+ * high bytes) so each can be entropy-coded independently. */
+int lz4_split_decompress_planes(const uint8_t *literals, size_t literals_len,
+                                const uint8_t *tokens,   size_t tokens_len,
+                                const uint8_t *off_lo,   const uint8_t *off_hi,
+                                size_t n_off,
+                                const uint8_t *overflow, size_t overflow_len,
+                                uint8_t *out, size_t out_size)
+{
+    return lz4_split_core(literals, literals_len, tokens, tokens_len,
+                          off_lo, off_hi, 1, n_off,
+                          overflow, overflow_len, out, out_size);
 }
 
 /* =========================================================================
