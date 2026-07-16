@@ -498,28 +498,50 @@ static inline uint8x8_t pivcoh__eqmasks64(uint8x16_t v0, uint8x16_t v1,
 
 PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256])
 {
-    /* Transposed classify: load code_len once and build all 11 length
-     * bitmaps per 64-symbol group while its 4 vectors stay live (the old
-     * scheme re-read all 256 lengths once per length class).  A running
-     * vmax rejects any byte > MAXLEN; the all-zero case is caught by the
-     * used count.  (NEON has no byte movemask; the eqmasks vpaddq tree
-     * folds four 16-lane equals into 8 bitmap bytes per class.) */
+    /* Transposed classify in two passes.  Pass 1 scans code_len once for the
+     * shortest and longest code present (vmin/vmax); pass 2 re-loads each
+     * 64-symbol group (still hot in L1) and builds the length bitmaps only
+     * for the live classes [minlen, maxlen] -- the empty bottom and top
+     * classes never cost an eqmasks fold.  Fusing the scan and the classify
+     * (the former single pass) would force all 11 classes, since min/max
+     * aren't known mid-scan; on real code lengths minlen sits at ~3-4 and
+     * maxlen at ~9-11, so the two passes run ~4*(range) ~= 28 folds vs 44,
+     * and the reload is far cheaper than the eqmasks it removes.  minlen is
+     * the max of the byte-wise two's-complement negations of the lengths:
+     * an absent symbol (length 0) negates to 0 and drops out of the max,
+     * while length L maps to 256-L, so the largest negation is the shortest
+     * length -- no compare, and the all-zero case gives minlen=256 > maxlen,
+     * caught by the used count.  (NEON has no byte movemask; the eqmasks
+     * vpaddq tree folds four 16-lane equals into 8 bitmap bytes per class.) */
     static const uint8_t bw_a[16] =
         {1,2,4,8,16,32,64,128, 1,2,4,8,16,32,64,128};
     const uint8x16_t bw = vld1q_u8(bw_a);
     uint64_t cmask[PIVCOH__MAXLEN][4];        /* [L-1][group]: bit s set iff
                                                  symbol 64g+s has length L */
-    uint8x16_t vmax = vdupq_n_u8(0);
-    for (int g = 0; g < 4; g++) {
+    const uint8x16_t vz = vdupq_n_u8(0);
+    uint8x16_t vmax = vz, vlo = vz;           /* vlo = max of negated lengths */
+    for (int g = 0; g < 4; g++) {             /* pass 1: shortest/longest only */
         const uint8_t *b = code_len + 64 * g;
         uint8x16_t x0 = vld1q_u8(b),      x1 = vld1q_u8(b + 16),
                    x2 = vld1q_u8(b + 32), x3 = vld1q_u8(b + 48);
+        /* min-of-present first: its negate->max path is a step longer than
+         * vmax's, so issue it before the plain vmax to give it slack. */
+        uint8x16_t g0 = vsubq_u8(vz, x0), g1 = vsubq_u8(vz, x1),
+                   g2 = vsubq_u8(vz, x2), g3 = vsubq_u8(vz, x3);
+        vlo  = vmaxq_u8(vlo,  vmaxq_u8(vmaxq_u8(g0, g1), vmaxq_u8(g2, g3)));
         vmax = vmaxq_u8(vmax, vmaxq_u8(vmaxq_u8(x0, x1), vmaxq_u8(x2, x3)));
-        for (int L = 1; L <= PIVCOH__MAXLEN; L++)
+    }
+    int maxlen = vmaxvq_u8(vmax);                     /* longest code present */
+    if (maxlen > PIVCOH__MAXLEN) return 0;            /* invalid length */
+    int minlen = 256 - vmaxvq_u8(vlo);               /* shortest; 256 if all-zero */
+    for (int g = 0; g < 4; g++) {             /* pass 2: classify live range only */
+        const uint8_t *b = code_len + 64 * g;
+        uint8x16_t x0 = vld1q_u8(b),      x1 = vld1q_u8(b + 16),
+                   x2 = vld1q_u8(b + 32), x3 = vld1q_u8(b + 48);
+        for (int L = minlen; L <= maxlen; L++)
             cmask[L - 1][g] = vget_lane_u64(vreinterpret_u64_u8(
                 pivcoh__eqmasks64(x0, x1, x2, x3, vdupq_n_u8((uint8_t)L), bw)), 0);
     }
-    if (vmaxvq_u8(vmax) > PIVCOH__MAXLEN) return 0;   /* invalid length */
 
     /* Extract items[] in (length, symbol) order + per-length counts.  Each
      * non-empty class byte scatters through select8 + one 8-byte store
@@ -529,7 +551,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
     uint8_t items[256 + 8];
     int cnt[PIVCOH__MAXLEN + 1], n_used = 0, s;
     const uint8x8_t iota8 = vcreate_u8(0x0706050403020100ull);
-    for (int L = 1; L <= PIVCOH__MAXLEN; L++) {
+    for (int L = minlen; L <= maxlen; L++) {         /* only live length classes */
         int start = n_used;
         for (int g = 0; g < 4; g++) {
             uint64_t m = cmask[L - 1][g];
@@ -566,7 +588,7 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
 #ifndef PIVCOH_DIRECT_CHUNKGEN
         /* Default: generate (length asc, bit desc), then stable depth-sort. */
         int i, j, acc, L;
-        for (L = 1, acc = 0; L <= PIVCOH__MAXLEN; acc += cnt[L], L++)
+        for (L = minlen, acc = 0; L <= maxlen; acc += cnt[L], L++)
             for (i = 8, j = acc; i >= 0; i--)
                 if (cnt[L] & (1 << i)) {
                     ch[nch].bit = (uint8_t)i;
@@ -589,9 +611,9 @@ PIVCOHDEF int pivcoh_table_from_lens(pivcoh_table *t, const uint8_t code_len[256
          * (helps full-alphabet binaries ~5-13%, hurts small-alphabet text
          * ~12-16%). */
         int base[PIVCOH__MAXLEN + 1], acc = 0;
-        for (int L = 1; L <= PIVCOH__MAXLEN; L++) { base[L] = acc; acc += cnt[L]; }
-        for (int depth = 0; depth <= PIVCOH__MAXLEN; depth++)
-            for (int L = 1; L <= PIVCOH__MAXLEN; L++) {
+        for (int L = minlen; L <= maxlen; L++) { base[L] = acc; acc += cnt[L]; }
+        for (int depth = 0; depth <= maxlen; depth++)
+            for (int L = minlen; L <= maxlen; L++) {
                 int b = L - depth;
                 if ((unsigned)b <= 8 && (cnt[L] & (1 << b))) {
                     int earlier = cnt[L] & ~((1 << (b + 1)) - 1);
