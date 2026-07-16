@@ -1,0 +1,219 @@
+diff --git a/lib/common/pivcoh_glue.h b/lib/common/pivcoh_glue.h
+new file mode 100644
+index 0000000..5743af1
+--- /dev/null
++++ b/lib/common/pivcoh_glue.h
+@@ -0,0 +1,22 @@
++/* pivcoh literals backend for zstd — experiment glue (pivco-huffman repo).
++ * Build with -DZSTD_PIVCOH_LITERALS to replace HUF literals with pivcoh
++ * blocks: compressed literals = [pivcoh lens wire][pivcoh block...],
++ * treeless literals = [pivcoh block...] against the previous table.
++ * NON-STANDARD FRAMES: only this build can decode its own output.
++ * The pivcoh table is smuggled inside the existing HUF entropy regions
++ * (956 B fits both ZSTD_hufCTables_t.CTable and entropy.hufTable), with
++ * a magic word so dictionary-loaded HUF state can never be mistaken
++ * for ours.  Dictionaries and targetCBlockSize are not supported. */
++#ifndef PIVCOH_GLUE_H
++#define PIVCOH_GLUE_H
++#include "pivcoh.h"
++
++#define PVZ_BLOCK 32767
++#define PVZ_MAGIC 0x34435650u   /* "PVC4" */
++
++extern __thread uint8_t pvz_escratch[PIVCOH_SCRATCH_SIZE(PVZ_BLOCK)];
++extern __thread uint8_t pvz_jscratch[PIVCOH_JOINT_SCRATCH_SIZE];
++extern __thread uint8_t pvz_stage[PIVCOH_ENCODE_BOUND(PVZ_BLOCK)];
++extern __thread uint8_t pvz_dscratch[PIVCOH_DECODE_SCRATCH_SIZE(PVZ_BLOCK)];
++
++#endif /* PIVCOH_GLUE_H */
+diff --git a/lib/common/pivcoh_impl.c b/lib/common/pivcoh_impl.c
+new file mode 100644
+index 0000000..37437b8
+--- /dev/null
++++ b/lib/common/pivcoh_impl.c
+@@ -0,0 +1,11 @@
++/* pivcoh implementation TU + thread-local scratch for the literals
++ * backend experiment.  Empty in vanilla builds. */
++typedef int pivcoh_impl_c_not_empty;
++#ifdef ZSTD_PIVCOH_LITERALS
++#define PIVCOH_IMPLEMENTATION
++#include "pivcoh_glue.h"
++__thread uint8_t pvz_escratch[PIVCOH_SCRATCH_SIZE(PVZ_BLOCK)];
++__thread uint8_t pvz_jscratch[PIVCOH_JOINT_SCRATCH_SIZE];
++__thread uint8_t pvz_stage[PIVCOH_ENCODE_BOUND(PVZ_BLOCK)];
++__thread uint8_t pvz_dscratch[PIVCOH_DECODE_SCRATCH_SIZE(PVZ_BLOCK)];
++#endif
+diff --git a/lib/compress/zstd_compress_literals.c b/lib/compress/zstd_compress_literals.c
+index 06036de..4ca8262 100644
+--- a/lib/compress/zstd_compress_literals.c
++++ b/lib/compress/zstd_compress_literals.c
+@@ -12,6 +12,9 @@
+  *  Dependencies
+  ***************************************/
+ #include "zstd_compress_literals.h"
++#ifdef ZSTD_PIVCOH_LITERALS
++#include "../common/pivcoh_glue.h"
++#endif
+ 
+ 
+ /* **************************************************************
+@@ -159,6 +162,79 @@ size_t ZSTD_compressLiterals (
+         return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
+ 
+     RETURN_ERROR_IF(dstCapacity < lhSize+1, dstSize_tooSmall, "not enough space for compression");
++#ifdef ZSTD_PIVCOH_LITERALS
++    /* pivcoh literals: [lens wire][pivcoh block...] (fresh) or
++     * [pivcoh block...] against the previous table (set_repeat). */
++    {   uint64_t freq[256];
++        pivcoh_table* const pt = (pivcoh_table*)(void*)nextHuf->CTable;
++        uint32_t* const magic = (uint32_t*)(void*)((char*)nextHuf->CTable + sizeof(pivcoh_table));
++        const pivcoh_table* const ppt = (const pivcoh_table*)(const void*)prevHuf->CTable;
++        int sigma = 0, cover, s;
++        pivcoh_histogram(freq, src, srcSize);
++        for (s = 0; s < 256; s++) sigma += freq[s] != 0;
++        if (sigma == 1) {
++            ZSTD_memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
++            return ZSTD_compressRleLiteralsBlock(dst, dstCapacity, src, srcSize);
++        }
++        cover = prevHuf->repeatMode != HUF_repeat_none && *magic == PVZ_MAGIC;
++        if (cover)
++            for (s = 0; s < 256; s++)
++                if (freq[s] && !ppt->code_len[s]) { cover = 0; break; }
++        {   pivcoh_table ft;
++            uint8_t lw[PIVCOH_LENS_WIRE_BOUND];
++            int lwn, ok;
++            uint64_t fresh_bits, rep_bits = 0;
++            if (strategy >= ZSTD_greedy) {
++                pivcoh_joint jp = PIVCOH_JOINT_DEFAULTS;
++                jp.gran = -1;                     /* BALANCED tier */
++                ok = pivcoh_table_from_freqs_joint(&ft, freq, &jp, pvz_jscratch);
++            } else {
++                ok = pivcoh_table_from_freqs(&ft, freq);   /* SIMPLEST */
++            }
++            if (!ok) {
++                ZSTD_memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
++                return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
++            }
++            lwn = pivcoh_lens_wire_write(lw, ft.code_len);
++            fresh_bits = 8u * (uint64_t)lwn;
++            for (s = 0; s < 256; s++) fresh_bits += freq[s] * ft.code_len[s];
++            if (cover)
++                for (s = 0; s < 256; s++) rep_bits += freq[s] * ppt->code_len[s];
++            if (cover && rep_bits <= fresh_bits) {
++                hType = set_repeat;               /* pt == prev via the memcpy */
++            } else {
++                *pt = ft;
++                *magic = PVZ_MAGIC;
++                hType = set_compressed;
++            }
++            {   BYTE* const op = ostart + lhSize;
++                size_t const cap = dstCapacity - lhSize;
++                size_t cur = 0, b;
++                int bad = 0;
++                if (hType == set_compressed) {
++                    if ((size_t)lwn > cap) bad = 1;
++                    else { ZSTD_memcpy(op, lw, (size_t)lwn); cur = (size_t)lwn; }
++                }
++                for (b = 0; !bad && b < srcSize; b += PVZ_BLOCK) {
++                    size_t const bn = MIN((size_t)PVZ_BLOCK, srcSize - b);
++                    ptrdiff_t const el = pivcoh_encode(pt, (const uint8_t*)src + b, bn,
++                                                       pvz_stage, sizeof(pvz_stage),
++                                                       pvz_escratch);
++                    if (el < 0 || cur + (size_t)el > cap) { bad = 1; break; }
++                    ZSTD_memcpy(op + cur, pvz_stage, (size_t)el);
++                    cur += (size_t)el;
++                }
++                if (bad) {
++                    ZSTD_memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
++                    return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
++                }
++                cLitSize = cur;
++            }
++        }
++        (void)entropyWorkspace; (void)entropyWorkspaceSize;
++        (void)suspectUncompressible; (void)bmi2;
++    }
++#else
+     {   HUF_repeat repeat = prevHuf->repeatMode;
+         int const flags = 0
+             | (bmi2 ? HUF_flags_bmi2 : 0)
+@@ -183,12 +259,14 @@ size_t ZSTD_compressLiterals (
+             hType = set_repeat;
+         }
+     }
++#endif
+ 
+     {   size_t const minGain = ZSTD_minGain(srcSize, strategy);
+         if ((cLitSize==0) || (cLitSize >= srcSize - minGain) || ERR_isError(cLitSize)) {
+             ZSTD_memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
+             return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
+     }   }
++#ifndef ZSTD_PIVCOH_LITERALS
+     if (cLitSize==1) {
+         /* A return value of 1 signals that the alphabet consists of a single symbol.
+          * However, in some rare circumstances, it could be the compressed size (a single byte).
+@@ -199,6 +277,7 @@ size_t ZSTD_compressLiterals (
+             ZSTD_memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
+             return ZSTD_compressRleLiteralsBlock(dst, dstCapacity, src, srcSize);
+     }   }
++#endif
+ 
+     if (hType == set_compressed) {
+         /* using a newly constructed table */
+diff --git a/lib/decompress/zstd_decompress_block.c b/lib/decompress/zstd_decompress_block.c
+index 862785a..b85ba54 100644
+--- a/lib/decompress/zstd_decompress_block.c
++++ b/lib/decompress/zstd_decompress_block.c
+@@ -25,6 +25,9 @@
+ #include "zstd_decompress_internal.h"   /* ZSTD_DCtx */
+ #include "zstd_ddict.h"  /* ZSTD_DDictDictContent */
+ #include "zstd_decompress_block.h"
++#ifdef ZSTD_PIVCOH_LITERALS
++#include "../common/pivcoh_glue.h"
++#endif
+ #include "../common/bits.h"  /* ZSTD_highbit32 */
+ 
+ /*_*******************************************************
+@@ -197,6 +200,34 @@ static size_t ZSTD_decodeLiteralsBlock(ZSTD_DCtx* dctx,
+                     PREFETCH_AREA(dctx->HUFptr, sizeof(dctx->entropy.hufTable));
+                 }
+ 
++#ifdef ZSTD_PIVCOH_LITERALS
++                /* pivcoh literals: fresh blocks carry a lens wire; repeat
++                 * blocks reuse the table stored in the hufTable region. */
++                {   pivcoh_table* const pt = (pivcoh_table*)(void*)dctx->entropy.hufTable;
++                    const uint8_t* ip = istart + lhSize;
++                    size_t remaining = litCSize, dof = 0;
++                    hufSuccess = litSize;
++                    if (litEncType == set_compressed) {
++                        uint8_t lens[256];
++                        int const lb = pivcoh_lens_wire_read(lens, ip, remaining);
++                        if (lb < 0 || !pivcoh_table_from_lens(pt, lens))
++                            hufSuccess = ERROR(corruption_detected);
++                        else { ip += lb; remaining -= (size_t)lb; }
++                    }
++                    while (!ERR_isError(hufSuccess) && dof < litSize) {
++                        size_t consumed = 0;
++                        ptrdiff_t const dn = pivcoh_decode(pt, ip, remaining,
++                                                           dctx->litBuffer + dof,
++                                                           litSize - dof,
++                                                           &consumed, pvz_dscratch);
++                        if (dn <= 0) { hufSuccess = ERROR(corruption_detected); break; }
++                        ip += consumed; remaining -= consumed; dof += (size_t)dn;
++                    }
++                    if (!ERR_isError(hufSuccess) && remaining != 0)
++                        hufSuccess = ERROR(corruption_detected);
++                    (void)singleStream; (void)flags;
++                }
++#else
+                 if (litEncType==set_repeat) {
+                     if (singleStream) {
+                         hufSuccess = HUF_decompress1X_usingDTable(
+@@ -228,6 +259,7 @@ static size_t ZSTD_decodeLiteralsBlock(ZSTD_DCtx* dctx,
+                             sizeof(dctx->workspace), flags);
+                     }
+                 }
++#endif
+                 if (dctx->litBufferLocation == ZSTD_split)
+                 {
+                     assert(litSize > ZSTD_LITBUFFEREXTRASIZE);
