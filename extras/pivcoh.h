@@ -721,49 +721,92 @@ typedef struct { uint8_t r, D; double W; } pivcoh__jl_ch;
 /* Subtree at depth d spanning chunks ch[*i..): consumes them, returns
  * the subtree's decode-time units and its weight; *kind reports what
  * the parent sees (0 = lone leaf, 1 = internal).  pre marks the chunk
- * index holding the prefilled top symbol (-1 = none). */
+ * index holding the prefilled top symbol (-1 = none).
+ *
+ * Iterative: an explicit frame stack replaces the recursion, matching
+ * the decode walk's style — the tree is only <= MAXLEN + 1 deep, but
+ * the recursive form carried ten arguments per call and the guard runs
+ * the walk twice per window.  phase 0 frames are waiting on their left
+ * child, phase 1 on their right; combine order, cursor state at the
+ * prefill test, and the ((t + tl) + tr) association all match the
+ * recursive form exactly, so results are bit-identical. */
 static double pivcoh__jl_sim(const pivcoh__jl_ch *ch, int n, int *i, int d,
                              int pre, const pivcoh_joint *jp,
                              const double *kap, int *recs,
                              double *Wout, int *kind)
 {
-    if (d > PIVCOH__MAXLEN) {   /* non-tiling multiset: cut the recursion;
+    struct {
+        double tl, Wl;
+        int il, kl;
+        uint8_t d, phase;
+    } stk[PIVCOH__MAXLEN + 2];
+    int sp = 0;
+    double rt, rW;
+    int rkind;
+
+enter:
+    if (d > PIVCOH__MAXLEN) {   /* non-tiling multiset: cut the walk;
                                  * the caller's i != n check reports -1.
                                  * Unreachable from the in-header callers
                                  * (their multisets are Kraft-exact by
                                  * construction) — pure stack-safety.
                                  * Upstream fix 93b5a7e. */
-        *Wout = 0; *kind = 1;
-        return 0.0;
+        rt = 0.0; rW = 0; rkind = 1;
+        goto unwind;
     }
     if (*i < n && ch[*i].r == d) {
         const pivcoh__jl_ch *c = &ch[(*i)++];
-        *Wout = c->W;
-        if (c->D == 0) { *kind = 0; return 0.0; }
-        *kind = 1;
+        rW = c->W;
+        if (c->D == 0) { rkind = 0; rt = 0.0; goto unwind; }
+        rkind = 1;
         (*recs)++;                                 /* pair/flat record */
-        return c->W * kap[c->D];                   /* D=1 pair: kap[1] */
+        rt = c->W * kap[c->D];                     /* D=1 pair: kap[1] */
+        goto unwind;
     }
-    double Wl = 0, Wr = 0, tl, tr;
-    int kl, kr;
-    const int il = *i;
+    stk[sp].il = *i;
+    stk[sp].d = (uint8_t)d;
+    stk[sp].phase = 0;
+    sp++;
     (*recs)++;                                     /* merge record */
-    tl = pivcoh__jl_sim(ch, n, i, d + 1, pre, jp, kap, recs, &Wl, &kl);
-    tr = pivcoh__jl_sim(ch, n, i, d + 1, pre, jp, kap, recs, &Wr, &kr);
-    double W = Wl + Wr;
-    double t;
-    if (kl == 0 || kr == 0) {
-        t = W * jp->mu_cst;                   /* one lone leaf: cst_vec */
-        /* prefilled leaf: its side is memset ahead; the merge only
-         * moves the internal side */
-        if (pre >= 0 && ((kl == 0 && il == pre) ||
-                         (kr == 0 && *i - 1 == pre)))
-            t -= (kl == 0 ? Wl : Wr) * (double)jp->prefill * jp->mu_cst;
-    } else
-        t = W;                                /* full partition */
-    *Wout = W;
-    *kind = 1;
-    return t + tl + tr;
+    d++;
+    goto enter;
+
+unwind:
+    if (sp == 0) {
+        *Wout = rW;
+        *kind = rkind;
+        return rt;
+    }
+    if (stk[sp - 1].phase == 0) {                  /* left child done */
+        stk[sp - 1].tl = rt;
+        stk[sp - 1].Wl = rW;
+        stk[sp - 1].kl = rkind;
+        stk[sp - 1].phase = 1;
+        d = stk[sp - 1].d + 1;
+        goto enter;                                /* right child */
+    }
+    {                                              /* right child done */
+        const double Wl = stk[sp - 1].Wl, Wr = rW;
+        const double tl = stk[sp - 1].tl, tr = rt;
+        const int kl = stk[sp - 1].kl, kr = rkind;
+        const int il = stk[sp - 1].il;
+        const double W = Wl + Wr;
+        double t;
+        if (kl == 0 || kr == 0) {
+            t = W * jp->mu_cst;               /* one lone leaf: cst_vec */
+            /* prefilled leaf: its side is memset ahead; the merge only
+             * moves the internal side */
+            if (pre >= 0 && ((kl == 0 && il == pre) ||
+                             (kr == 0 && *i - 1 == pre)))
+                t -= (kl == 0 ? Wl : Wr) * (double)jp->prefill * jp->mu_cst;
+        } else
+            t = W;                            /* full partition */
+        rt = t + tl + tr;
+        rW = W;
+        rkind = 1;
+        sp--;
+        goto unwind;
+    }
 }
 
 /* Kind-aware decode time for a chunk list (any order; sorted here into
