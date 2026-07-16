@@ -237,6 +237,16 @@ int main(int argc, char **argv)
             return 1;
         }
 
+        /* >= 100 ms hot loop before any timing — DVFS ramp (house
+         * discipline from bench_pivcoh_lits; without it small-file
+         * decode ratios are unreliable). */
+        {   double w0 = now_sec();
+            do {
+                if (dec_pass(&st, n) != 0) return 1;
+                LZ4_decompress_safe((const char *)st.lz4wire, (char *)st.out,
+                                    st.lz4len, (int)n);
+            } while (now_sec() - w0 < 0.1);
+        }
         double te = 1e30, td = 1e30, tld = 1e30, tle = 1e30, tlit = 1e30;
         for (int r = 0; r < reps; r++) {
             double t0 = now_sec();
