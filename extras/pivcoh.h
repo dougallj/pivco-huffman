@@ -907,7 +907,12 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
     int border[8], nb;
     if (!pivcoh__jl_order(lam, kap, bcap, border, &nb))
         return -1.0;
-    const int W = (((sigma >> 1) + 2) + 3) & ~3;   /* compact row width */
+    /* sigma <= 32 rows fit five q-registers at a fixed W = 20: the take
+     * sweeps then run register-resident per diagonal (loads/stores once
+     * per row instead of per item), which is where the grouped tiers'
+     * time lives. */
+    const int small = sigma <= 32;
+    const int W = small ? 20 : (((sigma >> 1) + 2) + 3) & ~3;
     const size_t plane = (size_t)(sigma + 1) * (size_t)W;
     uint8_t *own = scratch ? NULL :
         (uint8_t *)malloc(plane * (4 + 2 * (size_t)lmax) + 8);
@@ -955,6 +960,91 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
             float *row = cost + (size_t)t * W;
             uint16_t *prow = archL + (size_t)t * W;   /* picks, archived
                                                        * in place */
+            if (small) {
+                /* Whole row in registers across every item.  No lane
+                 * masking: a candidate's dest is always above its
+                 * source, so lanes beyond jcap only ever contaminate
+                 * lanes beyond jcap, and nothing in band ever reads
+                 * them (same argument the in-place generic sweep
+                 * relies on).  Shift-ins at the low edge are +inf. */
+                float32x4_t r0 = vld1q_f32(row),      r1 = vld1q_f32(row + 4),
+                            r2 = vld1q_f32(row + 8),  r3 = vld1q_f32(row + 12),
+                            r4 = vld1q_f32(row + 16);
+                uint16x4_t p0 = vdup_n_u16(0), p1 = p0, p2 = p0, p3 = p0,
+                           p4 = p0;
+                const float32x4_t vinf = vdupq_n_f32(INFINITY);
+                const uint16x4_t z16 = vdup_n_u16(0);
+                for (int oi = 0; oi < nb; oi++) {
+                    const int b = border[oi];
+                    if (b > bmax) continue;
+                    const int jstep = 1 << (b - 1);
+                    if (jcap - jstep < 0) continue;
+                    const float a = (float)((double)L
+                                            + lam * ((double)(L - b) + kap[b]));
+                    const float32x4_t va = vdupq_n_f32(a);
+                    const float32x4_t vtc = vdupq_n_f32((float)tc1);
+                    const float *dpb = dPt[p][b];
+                    float32x4_t c0 = vaddq_f32(vfmaq_f32(r0, vld1q_f32(dpb), va), vtc);
+                    float32x4_t c1 = vaddq_f32(vfmaq_f32(r1, vld1q_f32(dpb + 4), va), vtc);
+                    float32x4_t c2 = vaddq_f32(vfmaq_f32(r2, vld1q_f32(dpb + 8), va), vtc);
+                    float32x4_t c3 = vaddq_f32(vfmaq_f32(r3, vld1q_f32(dpb + 12), va), vtc);
+                    float32x4_t c4 = vaddq_f32(vfmaq_f32(r4, vld1q_f32(dpb + 16), va), vtc);
+                    const uint16x4_t vbit = vdup_n_u16((uint16_t)(1u << b));
+                    uint16x4_t q0 = vorr_u16(p0, vbit), q1 = vorr_u16(p1, vbit),
+                               q2 = vorr_u16(p2, vbit), q3 = vorr_u16(p3, vbit),
+                               q4 = vorr_u16(p4, vbit);
+                    float32x4_t s0, s1, s2, s3, s4;
+                    uint16x4_t k0, k1, k2, k3, k4;
+                    switch (jstep) {
+                    case 1:
+                        s0 = vextq_f32(vinf, c0, 3); s1 = vextq_f32(c0, c1, 3);
+                        s2 = vextq_f32(c1, c2, 3);   s3 = vextq_f32(c2, c3, 3);
+                        s4 = vextq_f32(c3, c4, 3);
+                        k0 = vext_u16(z16, q0, 3);   k1 = vext_u16(q0, q1, 3);
+                        k2 = vext_u16(q1, q2, 3);    k3 = vext_u16(q2, q3, 3);
+                        k4 = vext_u16(q3, q4, 3);
+                        break;
+                    case 2:
+                        s0 = vextq_f32(vinf, c0, 2); s1 = vextq_f32(c0, c1, 2);
+                        s2 = vextq_f32(c1, c2, 2);   s3 = vextq_f32(c2, c3, 2);
+                        s4 = vextq_f32(c3, c4, 2);
+                        k0 = vext_u16(z16, q0, 2);   k1 = vext_u16(q0, q1, 2);
+                        k2 = vext_u16(q1, q2, 2);    k3 = vext_u16(q2, q3, 2);
+                        k4 = vext_u16(q3, q4, 2);
+                        break;
+                    case 4:
+                        s0 = vinf; s1 = c0; s2 = c1; s3 = c2; s4 = c3;
+                        k0 = z16;  k1 = q0; k2 = q1; k3 = q2; k4 = q3;
+                        break;
+                    case 8:
+                        s0 = vinf; s1 = vinf; s2 = c0; s3 = c1; s4 = c2;
+                        k0 = z16;  k1 = z16;  k2 = q0; k3 = q1; k4 = q2;
+                        break;
+                    default: /* 16 */
+                        s0 = vinf; s1 = vinf; s2 = vinf; s3 = vinf; s4 = c0;
+                        k0 = z16;  k1 = z16;  k2 = z16;  k3 = z16;  k4 = q0;
+                        break;
+                    }
+                    uint32x4_t m;
+                    m = vcltq_f32(s0, r0); r0 = vbslq_f32(m, s0, r0);
+                    p0 = vbsl_u16(vmovn_u32(m), k0, p0);
+                    m = vcltq_f32(s1, r1); r1 = vbslq_f32(m, s1, r1);
+                    p1 = vbsl_u16(vmovn_u32(m), k1, p1);
+                    m = vcltq_f32(s2, r2); r2 = vbslq_f32(m, s2, r2);
+                    p2 = vbsl_u16(vmovn_u32(m), k2, p2);
+                    m = vcltq_f32(s3, r3); r3 = vbslq_f32(m, s3, r3);
+                    p3 = vbsl_u16(vmovn_u32(m), k3, p3);
+                    m = vcltq_f32(s4, r4); r4 = vbslq_f32(m, s4, r4);
+                    p4 = vbsl_u16(vmovn_u32(m), k4, p4);
+                }
+                vst1q_f32(row, r0);      vst1q_f32(row + 4, r1);
+                vst1q_f32(row + 8, r2);  vst1q_f32(row + 12, r3);
+                vst1q_f32(row + 16, r4);
+                vst1_u16(prow, p0);      vst1_u16(prow + 4, p1);
+                vst1_u16(prow + 8, p2);  vst1_u16(prow + 12, p3);
+                vst1_u16(prow + 16, p4);
+                continue;
+            }
             memset(prow, 0, (size_t)(jcap + 1) * sizeof(uint16_t));
             for (int oi = 0; oi < nb; oi++) {
                 const int b = border[oi];
@@ -973,13 +1063,36 @@ static double pivcoh__jl_slots(const double *P, int sigma, double lam,
                  * everything is L1-resident, so blending beats the
                  * data-dependent branch of an "improved?" early-out. */
                 const float32x4_t va = vdupq_n_f32(a);
+                const float32x4_t vtc = vdupq_n_f32(tc);
                 const uint16x4_t vbit = vdup_n_u16((uint16_t)(1u << b));
+                for (; j >= 7; j -= 8) {
+                    const int b1 = j - 3, b2 = j - 7;
+                    float32x4_t s1 = vld1q_f32(row + b1);
+                    float32x4_t s2 = vld1q_f32(row + b2);
+                    float32x4_t c1 = vaddq_f32(
+                        vfmaq_f32(s1, vld1q_f32(dpb + b1), va), vtc);
+                    float32x4_t c2 = vaddq_f32(
+                        vfmaq_f32(s2, vld1q_f32(dpb + b2), va), vtc);
+                    float32x4_t d1 = vld1q_f32(row + b1 + jstep);
+                    float32x4_t d2 = vld1q_f32(row + b2 + jstep);
+                    uint32x4_t m1 = vcltq_f32(c1, d1);
+                    uint32x4_t m2 = vcltq_f32(c2, d2);
+                    vst1q_f32(row + b1 + jstep, vbslq_f32(m1, c1, d1));
+                    vst1q_f32(row + b2 + jstep, vbslq_f32(m2, c2, d2));
+                    uint16x4_t pv1 = vorr_u16(vld1_u16(prow + b1), vbit);
+                    uint16x4_t pv2 = vorr_u16(vld1_u16(prow + b2), vbit);
+                    uint16x4_t qv1 = vld1_u16(prow + b1 + jstep);
+                    uint16x4_t qv2 = vld1_u16(prow + b2 + jstep);
+                    vst1_u16(prow + b1 + jstep,
+                             vbsl_u16(vmovn_u32(m1), pv1, qv1));
+                    vst1_u16(prow + b2 + jstep,
+                             vbsl_u16(vmovn_u32(m2), pv2, qv2));
+                }
                 for (; j >= 3; j -= 4) {
                     const int base = j - 3;
                     float32x4_t src = vld1q_f32(row + base);
                     float32x4_t cand = vaddq_f32(
-                        vfmaq_f32(src, vld1q_f32(dpb + base), va),
-                        vdupq_n_f32(tc));
+                        vfmaq_f32(src, vld1q_f32(dpb + base), va), vtc);
                     float32x4_t dst = vld1q_f32(row + base + jstep);
                     uint32x4_t m = vcltq_f32(cand, dst);
                     vst1q_f32(row + base + jstep, vbslq_f32(m, cand, dst));
