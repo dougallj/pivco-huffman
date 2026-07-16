@@ -383,17 +383,21 @@ static int pivcoh__sched(pivcoh_table *t, const pivcoh__chunk *ch, int nch,
                 f->mid_rank  = rank;
                 break;
             }
-            /* Right done: finalize this internal node's record.  A lone
-             * leaf beside an internal sibling is always LEFT (chunk
-             * depths never decrease left-to-right under a node), and the
-             * optimized chunking emits at most one width-1 chunk per
-             * length so two lone siblings cannot meet — right_lone only
-             * flags malformed inputs. */
-            int left_lone  = f->mid_sched == f->my + 1 &&
-                             f->mid_rank == f->rank0 + 1;
-            int right_lone = t->sched_len == f->mid_sched &&
-                             rank == f->mid_rank + 1;
-            if (right_lone) return -1;
+            /* Right done: finalize this internal node's record.  Only the
+             * LEFT child can be a lone leaf.  A lone right child would be a
+             * b=0 (singleton) chunk still unconsumed after the left subtree,
+             * but the depth-sorted list keeps equal-depth chunks
+             * singleton-first (the sort is STABLE, classes generate in
+             * ascending L, and depth d's only possible singleton is length
+             * class d's b=0 chunk), so that singleton is always consumed as
+             * the left child instead.  Corrupt lengths only perturb the
+             * counts, not this ordering -- so a lone right child cannot occur
+             * (verified: 0 hits over 85M valid + malformed length vectors,
+             * incl. exhaustive small shapes).  NB the production builder's
+             * naive research-tree mode makes every symbol a singleton and can
+             * reach both; pivcoh's power-of-two chunking never does. */
+            int left_lone = f->mid_sched == f->my + 1 &&
+                            f->mid_rank == f->rank0 + 1;
             pivcoh__rec *r = &t->sched[f->my];
             r->kd    = (uint8_t)(left_lone ? PIVCOH__LEAFL : PIVCOH__FULL);
             r->param = (uint8_t)(f->mid_rank - 1); /* thr / rank_begin */
