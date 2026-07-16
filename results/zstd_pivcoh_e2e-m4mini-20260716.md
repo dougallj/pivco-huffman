@@ -48,3 +48,21 @@ Reading:
 * zstd's optimal-parser literal-cost estimates still model HUF; at 19
   the parser slightly misprices literals for the actual backend —
   untouched, and evidently benign.
+
+## Addendum: levels 1-3 with BALANCED everywhere (-DZSTD_PIVCOH_ALL_BALANCED)
+
+|     | vanilla            | pivcoh SIMPLEST      | pivcoh ALL_BALANCED     |
+|-----|--------------------|----------------------|-------------------------|
+| 1   | 2.892 / 1623 / 2003 | 2.886 / 1580 / 2415 | 2.882 / **1620** / **2594** |
+| 2   | 3.053 / 1224 / 1844 | 3.048 / 1191 / 2060 | 3.045 / **1225** / **2171** |
+| 3   | 3.200 /  963 / 1789 | 3.195 /  931 / 1925 | 3.191 /  946  / **2011** |
+
+BALANCED at the fast levels decompresses another +5-7% over SIMPLEST
+(+29.5% / +17.7% / +12.4% over vanilla) and — the twist — COMPRESSES
+faster than the SIMPLEST build, back to vanilla parity at levels 1-2:
+the joint solve (~2-4 us/table) is repaid by pivcoh's flatter trees
+encoding faster (fewer partition passes), the same
+whole-file-compress effect measured back on the frame API.  Cost:
+size +0.33/+0.26/+0.26 % vs vanilla (about +0.1-0.15 pp over
+SIMPLEST).  ALL_BALANCED looks like the better default unless the
+extra ~0.1 % size matters.

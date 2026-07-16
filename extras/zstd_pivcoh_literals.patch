@@ -44,7 +44,7 @@ index 0000000..37437b8
 +__thread uint8_t pvz_dscratch[PIVCOH_DECODE_SCRATCH_SIZE(PVZ_BLOCK)];
 +#endif
 diff --git a/lib/compress/zstd_compress_literals.c b/lib/compress/zstd_compress_literals.c
-index 06036de..4ca8262 100644
+index 06036de..2c1cbb4 100644
 --- a/lib/compress/zstd_compress_literals.c
 +++ b/lib/compress/zstd_compress_literals.c
 @@ -12,6 +12,9 @@
@@ -57,7 +57,7 @@ index 06036de..4ca8262 100644
  
  
  /* **************************************************************
-@@ -159,6 +162,79 @@ size_t ZSTD_compressLiterals (
+@@ -159,6 +162,83 @@ size_t ZSTD_compressLiterals (
          return ZSTD_noCompressLiterals(dst, dstCapacity, src, srcSize);
  
      RETURN_ERROR_IF(dstCapacity < lhSize+1, dstSize_tooSmall, "not enough space for compression");
@@ -83,7 +83,11 @@ index 06036de..4ca8262 100644
 +            uint8_t lw[PIVCOH_LENS_WIRE_BOUND];
 +            int lwn, ok;
 +            uint64_t fresh_bits, rep_bits = 0;
++#ifdef ZSTD_PIVCOH_ALL_BALANCED
++            if (1) {
++#else
 +            if (strategy >= ZSTD_greedy) {
++#endif
 +                pivcoh_joint jp = PIVCOH_JOINT_DEFAULTS;
 +                jp.gran = -1;                     /* BALANCED tier */
 +                ok = pivcoh_table_from_freqs_joint(&ft, freq, &jp, pvz_jscratch);
@@ -137,7 +141,7 @@ index 06036de..4ca8262 100644
      {   HUF_repeat repeat = prevHuf->repeatMode;
          int const flags = 0
              | (bmi2 ? HUF_flags_bmi2 : 0)
-@@ -183,12 +259,14 @@ size_t ZSTD_compressLiterals (
+@@ -183,12 +263,14 @@ size_t ZSTD_compressLiterals (
              hType = set_repeat;
          }
      }
@@ -152,7 +156,7 @@ index 06036de..4ca8262 100644
      if (cLitSize==1) {
          /* A return value of 1 signals that the alphabet consists of a single symbol.
           * However, in some rare circumstances, it could be the compressed size (a single byte).
-@@ -199,6 +277,7 @@ size_t ZSTD_compressLiterals (
+@@ -199,6 +281,7 @@ size_t ZSTD_compressLiterals (
              ZSTD_memcpy(nextHuf, prevHuf, sizeof(*prevHuf));
              return ZSTD_compressRleLiteralsBlock(dst, dstCapacity, src, srcSize);
      }   }
