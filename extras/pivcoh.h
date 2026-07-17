@@ -2305,10 +2305,19 @@ static inline int pivcoh__popcnt_bits(const uint8_t *bm, int K,
     int nb = (K + 7) >> 3;
     int fb = (K & 7) ? nb - 1 : nb;    /* bytes fully inside K */
     int i = 0, total;
-    uint16x8_t acc = vdupq_n_u16(0);
+    /* 4 accumulators: vpadalq is a ~3 c dependent op, and this popcount
+     * sits on the walk's serial descend chain — a single-acc chain costs
+     * ~90 c on a 4 K root's 512-byte bitmap where four cut it to ~25. */
+    uint16x8_t a0 = vdupq_n_u16(0), a1 = a0, a2 = a0, a3 = a0;
+    for (; i + 64 <= fb; i += 64) {
+        a0 = vpadalq_u8(a0, vcntq_u8(vld1q_u8(bm + i)));
+        a1 = vpadalq_u8(a1, vcntq_u8(vld1q_u8(bm + i + 16)));
+        a2 = vpadalq_u8(a2, vcntq_u8(vld1q_u8(bm + i + 32)));
+        a3 = vpadalq_u8(a3, vcntq_u8(vld1q_u8(bm + i + 48)));
+    }
     for (; i + 16 <= fb; i += 16)
-        acc = vpadalq_u8(acc, vcntq_u8(vld1q_u8(bm + i)));
-    total = (int)vaddvq_u16(acc);
+        a0 = vpadalq_u8(a0, vcntq_u8(vld1q_u8(bm + i)));
+    total = (int)vaddvq_u16(vaddq_u16(vaddq_u16(a0, a1), vaddq_u16(a2, a3)));
     for (; i + 8 <= fb; i += 8) {
         uint64_t x; memcpy(&x, bm + i, 8);
         total += __builtin_popcountll(x);
