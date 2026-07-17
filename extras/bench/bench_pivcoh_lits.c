@@ -73,7 +73,7 @@ static uint64_t (*FR)[256];         /* per-window histogram (for *build) */
 static uint8_t  (*LEN)[256];        /* per-window pivcoh code lengths */
 static uint8_t  (*LENP)[256];       /* per-window production code lengths */
 static uint8_t  *ENC, *DEC;         /* pivcoh ciphertext (+ WOFF), decode sink */
-static uint8_t  *ENC2;              /* production ciphertext (+ WOFFP): the v4
+static uint8_t  *ENC2;              /* production ciphertext (+ WOFFP): the v5
                                        pivcoh wire is not production-decodable
                                        (or vice versa), so each engine keeps
                                        its own streams */
@@ -278,11 +278,11 @@ static double timeit(void (*fn)(void), int reps)
 }
 
 /* Untimed setup + gates: each engine encodes its own ciphertext (the
- * v4 pivcoh wire is not production-decodable), both round-trip, and in
+ * v5 pivcoh wire is not production-decodable), both round-trip, and in
  * plain mode the code LENGTHS are still gated identical — the tree
  * logic is unchanged, only the wire around it moved.  Sizes include
  * each side's own per-window table header (production: 128 B nibbles;
- * pivcoh: the v4 lens wire).  Returns 0 on success. */
+ * pivcoh: the v5 lens wire).  Returns 0 on success. */
 static int setup_and_gate(const char *base)
 {
     j_adopt = j_bytes = p_bytes = 0;

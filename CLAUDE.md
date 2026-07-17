@@ -103,8 +103,11 @@ five phases ending 2026-05-14; before that, each backend had its own
 - `extras/pivcoh.h` — stb-style single-header PH-only codec (NEON).  Since
   v4 its wire DIVERGES from production (no FSE marker byte, 1-byte K_right
   where the node's count fits, RLE lens wire ~30-60 B instead of 128, varint
-  frame with raw-store segments); trees stay production-identical
-  (`extras/bench/bench_pivcoh_check.c` verifies tables + self-roundtrip)
+  frame with raw-store segments); v5 reorders the block body into
+  kernel-order sections (headers, then flat regions, then bitmaps — decode
+  = plan/unpack/merge phases, same byte count); trees stay
+  production-identical (`extras/bench/bench_pivcoh_check.c` verifies
+  tables + self-roundtrip)
 - `extras/pivco_huffman_neon_prefix.c` — retired research prefix-radix backend (moved to extras 2026-05-14; BU on the standard 2-way wire format beat it on every dist/host)
 - `extras/legacy_td/README.md` — git-archaeology pointer for the retired top-down decoders
 - `bench/bench_main.c` — benchmark harness (4M × repeats methodology)
