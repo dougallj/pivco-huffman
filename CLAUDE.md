@@ -101,9 +101,11 @@ five phases ending 2026-05-14; before that, each backend had its own
 - `src/pivco_huffman_x86_flat.h` — D=4 SSE unpack helper
 - `src/pivco_huffman_avx512_flat.h` — D=2..6 AVX-512 VBMI2 unpack helpers
 - `extras/pivcoh.h` — stb-style single-header PH-only codec (NEON).  Since
-  v4 its wire DIVERGES from production (no FSE marker byte, 1-byte K_right
-  where the node's count fits, RLE lens wire ~30-60 B instead of 128, varint
-  frame with raw-store segments); trees stay production-identical
+  v4 its wire DIVERGES from production (no FSE marker byte, RLE lens wire
+  ~30-60 B instead of 128, varint frame with raw-store segments); this
+  branch carries wire v6: pre-order bitmaps whose popcount IS the split —
+  no K_right headers at all — plus a PIVCOH_RIGHT_FIRST child-order wire
+  switch; trees stay production-identical
   (`extras/bench/bench_pivcoh_check.c` verifies tables + self-roundtrip)
 - `extras/pivco_huffman_neon_prefix.c` — retired research prefix-radix backend (moved to extras 2026-05-14; BU on the standard 2-way wire format beat it on every dist/host)
 - `extras/legacy_td/README.md` — git-archaeology pointer for the retired top-down decoders

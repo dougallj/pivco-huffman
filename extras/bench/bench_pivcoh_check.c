@@ -3,7 +3,7 @@
  *   - table_from_freqs code_len == pivco_huffman_build_table code_len,
  *     and the derived schedule/rank tables match (the TREE is still
  *     production-identical; only the wire around it is v4's own)
- *   - mini roundtrips its own v4 wire (malloc and caller-scratch paths,
+ *   - mini roundtrips its own v6 wire (malloc and caller-scratch paths,
  *     deterministic re-encode), production roundtrips its own; outputs
  *     equal the input on both sides.  Byte-identity of the streams died
  *     with wire v4 (no FSE marker, 1-byte K_right, lens wire).
@@ -83,7 +83,7 @@ static void one_case(const uint64_t freq[256], const char *tag, int id)
         if (m2 != mini_len || memcmp(enc_mini2, enc_mini, (size_t)mini_len))
             FAIL("malloc-path wire N=%zu", N);
 
-        /* mini roundtrips its own v4 stream; production its own */
+        /* mini roundtrips its own v6 stream; production its own */
         size_t cons = 0;
         memset(dec_buf, 0xAA, N);
         ptrdiff_t dn = pivcoh_decode(&mini, enc_mini, (size_t)mini_len, dec_buf, sizeof(dec_buf), &cons, dscratch);
@@ -101,7 +101,7 @@ static void one_case(const uint64_t freq[256], const char *tag, int id)
 
         /* hostile: single-byte mutations + truncations must never crash */
         size_t fz_len = (size_t)mini_len;
-        memcpy(enc_ref, enc_mini, fz_len);     /* fuzz base: mini's own v4 stream */
+        memcpy(enc_ref, enc_mini, fz_len);     /* fuzz base: mini's own v6 stream */
         for (int f = 0; f < 40; f++) {
             memcpy(enc_mini, enc_ref, fz_len);
             enc_mini[rng() % fz_len] ^= (uint8_t)(1u << (rng() & 7));
@@ -219,7 +219,7 @@ int main(void)
      * pass (defaults keep exact parity above), so these are consistency
      * checks: every tier's lengths form a table both engines accept
      * (production still validates and builds from them — the TREE
-     * remains interchangeable even though the v4 wire is not), the
+     * remains interchangeable even though the v6 wire is not), the
      * scratch and malloc paths agree byte-for-byte, and joint streams
      * roundtrip through a lengths-only pivcoh rebuild. */
     { const char *tag = "joint"; int id = 0;
@@ -423,7 +423,7 @@ int main(void)
              "utilities consistent\n", n_frames);
     }
 
-    printf("pivcoh check PASS: %d tables, %d blocks round-tripped (v4 wire, trees production-identical), "
+    printf("pivcoh check PASS: %d tables, %d blocks round-tripped (v6 wire, trees production-identical), "
            "%d hostile decodes survived\n", n_tables, n_blocks, n_fuzz);
     return 0;
 }

@@ -1,18 +1,23 @@
-/* pivcoh.h - v4.0 - single-file PIVCO-Huffman block codec
+/* pivcoh.h - v6.0 - single-file PIVCO-Huffman block codec
  *
  * Based on https://github.com/MarcinZukowski/pivco-huffman
  *
  * AArch64/NEON-only.
  *
- * v4 WIRE: this codec's stream format diverges from the production
- * pivco-huffman wire (v0.7) to stop paying its small-chunk taxes:
- * per-node FSE marker bytes are gone (there is no FSE mode to mark),
- * K_right headers shrink to one byte wherever the node's symbol count
- * fits (the decoder always knows it), code lengths travel as a
- * run-length nibble wire (typically 30..60 bytes instead of a flat
- * 128), and the one-shot frame uses a varint size plus raw-store
- * segment escapes for incompressible spans.  v3.x streams (production
- * wire) are NOT decodable by v4 or vice versa.
+ * v6 WIRE (pre-order bitmaps, popcounted splits): every per-node
+ * K_right header is gone.  Each internal node's record is now just
+ * its raw bitmap at the node's PRE-order position (v4 put it at the
+ * post-order position, after the children), followed by the
+ * children's regions; the decoder popcounts the bitmap at node entry
+ * to derive the split — the redundancy the header paid 1-2 bytes per
+ * node to duplicate.  Child-region order is larger-K first as in v4,
+ * or always right-child first with PIVCOH_RIGHT_FIRST (a build-time
+ * wire switch: both sides must agree).  Everything else is v4:
+ * no FSE marker bytes, RLE nibble lens wire (typically 30..60 bytes
+ * instead of a flat 128), varint frame with raw-store segment
+ * escapes.  v4 streams are NOT decodable by v6 or vice versa.  (v5
+ * was the sectioned kernel-order wire — an unmerged experiment on
+ * branch pivcoh-kernel-order.)
  *
  * Do this in ONE C file to create the implementation:
  *     #define PIVCOH_IMPLEMENTATION
@@ -60,11 +65,12 @@
  * scribble up to 16 junk bytes past the returned length — always inside
  * out_cap (>= PIVCOH_ENCODE_BOUND(n) is required).  Decode is safe on
  * hostile input: it never reads past `in + in_len`, never writes past N
- * symbols, and returns -1 on any malformed stream — truncation,
- * structural errors, and bitmaps whose popcount contradicts their
- * K_right header (each merge checks its final cursor position against
- * the header; monotone cursors make that one compare an exact
- * full-bitmap validation).
+ * symbols, and returns -1 on truncation.  With the split derived from
+ * the bitmap itself there is no header for a bitmap to contradict —
+ * merge cursors land exactly by construction, so undetectably-garbled
+ * streams decode to garbage bytes rather than -1 (the v4 K_right
+ * cross-check was the format's only non-structural redundancy, and
+ * removing it is the point of v6).
  *
  * License: Apache-2.0, same as the pivco-huffman repository.
  */
@@ -80,26 +86,53 @@
 #define PIVCOHDEF extern
 #endif
 
+/* Wire switch: 0 (default) emits each FULL node's larger-K child
+ * region first (ties left-first, the v4 order); 1 always emits the
+ * right child's region first.  This changes the STREAM, not just the
+ * decoder: encoder and decoder must be built with the same value. */
+#ifndef PIVCOH_RIGHT_FIRST
+#define PIVCOH_RIGHT_FIRST 0
+#endif
+
+/* DIAGNOSTIC wire switch (A/B decomposition only, not a product
+ * config): 1 stores v4's K_right header immediately BEFORE each
+ * pre-order bitmap and the decoder reads it instead of popcounting,
+ * isolating the bitmap-position move from the popcount substitution.
+ * Trusting a stored split reopens v4's bounded hostile-stray window,
+ * whose pad math was only done for the larger-first order — so this
+ * knob refuses to combine with PIVCOH_RIGHT_FIRST. */
+#ifndef PIVCOH_DIAG_STORE_KR
+#define PIVCOH_DIAG_STORE_KR 0
+#endif
+#if PIVCOH_DIAG_STORE_KR && PIVCOH_RIGHT_FIRST
+#error "PIVCOH_DIAG_STORE_KR requires the larger-first order"
+#endif
+
 /* Worst-case encoded size of one n-symbol block (payload is at most 11
- * bits/symbol plus per-node headers and byte rounding). */
+ * bits/symbol plus byte rounding; v6 has no per-node headers, so the
+ * v4-era bound holds with margin). */
 #define PIVCOH_ENCODE_BOUND(n)  ((11 * (size_t)(n) + 7) / 8 + 1024)
 
 /* Scratch bytes for encode or decode of blocks up to n symbols.  The
  * encoder dominates: a ranks buffer (n + 64) plus, per recursion level
- * (max 11), one staged bitmap, one compacted right-half and a 64-byte
- * overshoot gap (~9n/8 + 73 per level) for the tail-free partition's
- * scatter, which strays up to 63 bytes past a ranks region. */
+ * (max 11), one compacted right-half and a 64-byte overshoot gap
+ * (~n + 64 per level) for the tail-free partition's scatter, which
+ * strays up to 63 bytes past a ranks region.  (Bitmaps stream straight
+ * to the wire in v6, so the macro — sized for v4's staged bitmaps —
+ * now has slack; kept for drop-in compatibility.) */
 #define PIVCOH_SCRATCH_SIZE(n)  (14 * (size_t)(n) + 1024)
 
 /* Scratch bytes for DECODE ONLY of blocks up to n symbols.  The decode
  * walk ping-pongs children through (out, partner) buffer pairs instead
- * of growing an arena, so a valid stream touches at most 1.5n + 128
- * bytes (the root's children plus the largest partner).  The other
- * 0.5n is hostile-input headroom: a bitmap that lies about its K_right
- * can walk a merge cursor up to K bytes past its side before the
- * end-of-merge check rejects the stream, and keeping that in-bounds by
- * padding is free where in-loop cursor guards would cost ~2% decode
- * speed.  PIVCOH_SCRATCH_SIZE also always suffices. */
+ * of growing an arena: with larger-K-first regions a stream touches at
+ * most 1.5n + 128 bytes (the root's children plus the largest
+ * partner), and hostile input cannot stray past that — the split IS
+ * the bitmap's popcount, so merge cursors always land exactly.  The
+ * other 0.5n (v4's hostile-stray headroom) is real capacity under
+ * PIVCOH_RIGHT_FIRST: when a smaller right child decodes first, its
+ * result parks in the partner while the larger sibling ping-pongs
+ * beyond it, growing the deepest partner chain toward 2n.
+ * PIVCOH_SCRATCH_SIZE also always suffices. */
 #define PIVCOH_DECODE_SCRATCH_SIZE(n)  (2 * (size_t)(n) + 128)
 
 /* ---- optional joint length/shape optimization (encoder side) ----
@@ -1700,15 +1733,13 @@ PIVCOHDEF int pivcoh_table_from_freqs_joint(pivcoh_table *t,
  *
  * Buffer contract: a merge kernel may read up to 16 bytes past a source
  * cursor and — interior (slack != 0) merges only — overwrite up to 15
- * bytes past out+K, saved and restored around the merge.  Validation is
- * the end-of-merge r_end equality: cursors are monotone, so final
- * r == r_end proves no prefix of the bitmap ever overdrew either side
- * (each output consumes exactly one input, so the l side is implied) —
- * an exact "bitmap popcount == K_right" test for one compare per merge,
- * nothing per iteration (in-loop guards were tried and cost ~2%).  On a
- * stream that fails it the cursors strayed mid-merge first: by at most
- * K bytes past a side plus the 64-byte iteration window, absorbed by
- * the decode arena's pad.  Writes of slack = 0 merges (the root,
+ * bytes past out+K, saved and restored around the merge.  The
+ * end-of-merge r_end equality check is kept from v4, where it
+ * validated the bitmap's popcount against the stored K_right; under
+ * the v6 wire KR IS the (tail-masked) popcount, so cursors land
+ * exactly on every stream, hostile or not, and the compare is a free
+ * always-true invariant (one compare per merge; in-loop guards were
+ * tried and cost ~2%).  Writes of slack = 0 merges (the root,
  * targeting the caller's buffer) are exactly bounded to out[0,K).
  * Bitmap reads
  * never pass ceil(K/8) bytes, flat-region reads never pass ceil(K*D/8)
@@ -1802,8 +1833,9 @@ static inline unsigned pivcoh__tailmask(const uint8_t *bm, int j, unsigned rem)
  * merge, which targets the caller's buffer): whole chunks while they
  * fit, then a plain scalar tail (<= 15 elements, once per block).
  *
- * Both variants validate at the end — see the section comment.  Returns
- * 0, or -1 when the bitmap contradicts the K_right header. */
+ * Both variants keep the end-of-merge cursor check — see the section
+ * comment.  Returns 0, or -1 if the cursors did not land exactly
+ * (always-true invariant on the v6 wire; kept as a defensive check). */
 #define PIVCOH__PFX8(p) (vget_lane_u64(vreinterpret_u64_u8(                \
                              vcnt_u8(vld1_u8(p))), 0) * 0x0101010101010101ull)
 __attribute__((always_inline)) static inline
@@ -2192,7 +2224,7 @@ static void pivcoh__unpack_dN(uint8_t *out, int n, const uint8_t *bm, int D,
 
 /* ---- decode tree walk ---- */
 
-/* Read a node's post-order raw bitmap: sets *bm and returns the input
+/* Read a node's pre-order raw bitmap: sets *bm and returns the input
  * pointer advanced past it, or NULL on truncation. */
 static inline const uint8_t *pivcoh__read_bm(const uint8_t **bm, int K,
                                              const uint8_t *p, const uint8_t *end)
@@ -2203,9 +2235,27 @@ static inline const uint8_t *pivcoh__read_bm(const uint8_t **bm, int K,
     return p + nb;
 }
 
-/* Read a node's K_right header: one byte when the node's K fits one,
- * two (LE) otherwise — the decoder always knows K at node entry.
- * Returns the advanced pointer or NULL on truncation / KR > K. */
+/* Byte popcounts for the split derivation's small-K fast path: on
+ * Apple cores a 256-byte L1 table load is ~5 c on an LSU pipe where
+ * __builtin_popcount's GPR->SIMD->GPR cnt chain is ~10 c of serial
+ * vector-pipe latency (IDEAS.md, compress_popcnt) — and the split
+ * popcount sits on the walk's only serial chain. */
+#define PIVCOH__B2(n) n, n + 1, n + 1, n + 2
+#define PIVCOH__B4(n) PIVCOH__B2(n), PIVCOH__B2(n + 1), \
+                      PIVCOH__B2(n + 1), PIVCOH__B2(n + 2)
+#define PIVCOH__B6(n) PIVCOH__B4(n), PIVCOH__B4(n + 1), \
+                      PIVCOH__B4(n + 1), PIVCOH__B4(n + 2)
+static const uint8_t pivcoh__popc8[256] = {
+    PIVCOH__B6(0), PIVCOH__B6(1), PIVCOH__B6(1), PIVCOH__B6(2)
+};
+#undef PIVCOH__B2
+#undef PIVCOH__B4
+#undef PIVCOH__B6
+
+#if PIVCOH_DIAG_STORE_KR
+/* Diagnostic path: read the v4-style K_right header (one byte when the
+ * node's K fits one, two LE otherwise) stored ahead of the pre-order
+ * bitmap.  Returns the advanced pointer or NULL on truncation/KR > K. */
 static inline const uint8_t *pivcoh__read_kr(int *KR, int K,
                                              const uint8_t *p, const uint8_t *end)
 {
@@ -2223,34 +2273,86 @@ static inline const uint8_t *pivcoh__read_kr(int *KR, int K,
     *KR = kr;
     return p;
 }
+#endif
+
+/* Popcount of the first K bits of bm — the pre-order bitmap IS the
+ * split header: 1-bits go right, so K_right is derived, never stored.
+ * Bits past K in the last byte (always zero from our encoder) are
+ * masked out, so even a hostile stream cannot make the split
+ * contradict the bitmap — every merge's cursors land exactly by
+ * construction.  Reads stay inside [bm, end): the u64 fast path is
+ * end-guarded, everything else stays within ceil(K/8) bytes. */
+static inline int pivcoh__popcnt_bits(const uint8_t *bm, int K,
+                                      const uint8_t *end)
+{
+    if (K <= 8)                        /* deep-tree nodes: one table load */
+        return pivcoh__popc8[bm[0] & (uint32_t)((1u << K) - 1)];
+    if (K <= 16)                       /* two parallel table loads */
+        return pivcoh__popc8[bm[0]] +
+               pivcoh__popc8[bm[1] & (uint32_t)((1u << (K - 8)) - 1)];
+    if (K <= 64) {                     /* mid node: one u64 window */
+        uint64_t x;
+        if ((size_t)(end - bm) >= 8) {
+            memcpy(&x, bm, 8);
+        } else {                       /* block-tail node: exact bytes */
+            int nb = (K + 7) >> 3;
+            x = 0;
+            for (int i = 0; i < nb; i++) x |= (uint64_t)bm[i] << (8 * i);
+        }
+        if (K < 64) x &= ((uint64_t)1 << K) - 1;
+        return __builtin_popcountll(x);
+    }
+    int nb = (K + 7) >> 3;
+    int fb = (K & 7) ? nb - 1 : nb;    /* bytes fully inside K */
+    int i = 0, total;
+    uint16x8_t acc = vdupq_n_u16(0);
+    for (; i + 16 <= fb; i += 16)
+        acc = vpadalq_u8(acc, vcntq_u8(vld1q_u8(bm + i)));
+    total = (int)vaddvq_u16(acc);
+    for (; i + 8 <= fb; i += 8) {
+        uint64_t x; memcpy(&x, bm + i, 8);
+        total += __builtin_popcountll(x);
+    }
+    for (; i < fb; i++)
+        total += __builtin_popcount((unsigned)bm[i]);
+    if (K & 7)
+        total += __builtin_popcount((unsigned)bm[nb - 1] &
+                                    ((1u << (K & 7)) - 1));
+    return total;
+}
 
 /* Interior walk: decodes a subtree's K symbols into out[0,K), returning
  * the advanced input pointer or NULL on invalid input.  The wire is in
- * decode order (K_right at node entry, children larger-K first, the
- * marker+bitmap at the node's post-order position, read right at merge
- * time), so the input cursor moves strictly forward, single-touch.
+ * decode order (the raw bitmap at node entry — its popcount is the
+ * split, its pointer is kept for the merge — then the children's
+ * regions), so the input cursor moves strictly forward; each bitmap is
+ * touched twice, once for the split popcount and once by the merge.
  *
  * Scratch placement is a two-buffer ping-pong (out, tmp):
  *
  *   - the LARGER child decodes IN PLACE into out's tail out[K_small, K):
  *     safe under the merge, whose write cursor cannot overtake its
  *     tail-side read cursor — by the time it writes out[i] it has
- *     consumed at least i - K_small tail bytes (on a bitmap that lies,
- *     the merge's memory use stays inside the arena bound and the r_end
- *     check reports -1; whatever garbage was written is discarded);
+ *     consumed at least i - K_small tail bytes;
  *   - the SMALLER child decodes into tmp[0, K_small), and its own
  *     recursion uses out's still-empty prefix out[0, K_small) as ITS
  *     partner — the pair (tmp, out-prefix) ping-pongs down the
  *     smaller-child spine instead of growing an arena.
  *
- * The caller guarantees tmp capacity floor(K/2): a smaller child is at
- * most floor(K/2), and everything its subtree puts in ITS partner stays
- * inside out[0, K_small), by induction.  A subtree's whole valid-stream
- * footprint is out[0,K) plus at most floor(K/2) partner bytes plus the
- * kernels' read/scribble slack; PIVCOH_DECODE_SCRATCH_SIZE's extra pad
- * absorbs a lying bitmap's bounded pre-detection strays (kernel section
- * comment).  A FLAT node never touches tmp (so a flat root runs
- * scratch-free). */
+ * Wire order vs placement: placement is fixed (big -> out tail, small
+ * -> tmp), but which child DECODES first follows the wire.  Default,
+ * larger-K first: the big child runs while tmp is still free, so tmp
+ * capacity floor(K/2) suffices — small ends in tmp only after big is
+ * done with it.  PIVCOH_RIGHT_FIRST: when the right child is the
+ * smaller it runs FIRST into tmp[0, K_small), so the big child's
+ * partner shifts to tmp + K_small to keep the small result live —
+ * partner capacity grows to K_small + cap(K_big) <= K, which
+ * PIVCOH_DECODE_SCRATCH_SIZE (2n + 128) still covers: the derived
+ * split cannot contradict its bitmap, so v4's 0.5n hostile-stray
+ * headroom is exactly the capacity this order needs.  A subtree's
+ * whole footprint is out[0,K) plus at most cap(K) partner bytes plus
+ * the kernels' read/scribble slack.  A FLAT node never touches tmp
+ * (so a flat root runs scratch-free). */
 static const uint8_t *pivcoh__dec_internal(const pivcoh_table *t, int idx, int K,
                                            uint8_t *out, uint8_t *tmp,
                                            const uint8_t *p, const uint8_t *end);
@@ -2280,15 +2382,18 @@ static inline const uint8_t *pivcoh__dec_child(const pivcoh_table *t, int idx,
 /* Iterative interior walk: an explicit continuation stack replaces
  * recursion.  t, p, end and the rank map stay live in registers across the
  * loop instead of being reshuffled through call arguments; flat children
- * are decoded inline.  Two states — descend (open a node, start its big
- * child) and complete (a child finished: start the sibling, else read the
- * post-order bitmap, merge, pop).  Depth is bounded by the tree height. */
+ * are decoded inline.  Two states — descend (open a node: read +
+ * popcount its bitmap, start its first child) and complete (a child
+ * finished: start the sibling, else merge with the entry bitmap, pop).
+ * Depth is bounded by the tree height. */
 static const uint8_t *pivcoh__dec_internal(const pivcoh_table *t, int idx, int K,
                                            uint8_t *out, uint8_t *tmp,
                                            const uint8_t *p, const uint8_t *end)
 {
-    struct cont { int K, KR, KL, small_idx, small_K; uint8_t *out, *tmp;
-                  uint8_t kind, phase, right_big, sym; } stk[PIVCOH__MAXLEN + 2];
+    struct cont { const uint8_t *bm; int K, KR, KL, second_idx, second_K;
+                  uint8_t *out, *tmp;
+                  uint8_t kind, phase, right_big, first_small, sym;
+                } stk[PIVCOH__MAXLEN + 2];
     int sp = 0;
     int cidx = 0, cK = 0; uint8_t *cout = out, *ctmp = tmp;
 
@@ -2296,25 +2401,41 @@ descend:            /* (idx, K, out, tmp) is an INTERNAL subtree */
     if (sp >= (int)(sizeof stk / sizeof *stk)) return NULL;   /* defensive */
     {
         const pivcoh__rec *rec = &t->sched[idx];
+        const uint8_t *bm;
+#if PIVCOH_DIAG_STORE_KR
         int KR;
         if (!(p = pivcoh__read_kr(&KR, K, p, end))) return NULL;
+        if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
+#else
+        if (!(p = pivcoh__read_bm(&bm, K, p, end))) return NULL;
+        int KR = pivcoh__popcnt_bits(bm, K, end);
+#endif
         int KL = K - KR;
         int kind = rec->kd & 3;
         struct cont *f = &stk[sp++];
+        f->bm = bm;
         f->K = K; f->KR = KR; f->KL = KL; f->out = out; f->tmp = tmp;
         f->kind = (uint8_t)kind; f->phase = 0;
         if (kind == PIVCOH__LEAFL) {
             f->sym = t->rank_to_sym[rec->param];   /* the one child, in place */
             cidx = idx + rec->right; cK = KR; cout = out + KL; ctmp = tmp;
-        } else {                                   /* FULL: larger child first */
+        } else {
             int rb = (KR > KL);
+            int smallK = rb ? KL : KR;
             f->right_big = (uint8_t)rb;
-            f->small_idx = rb ? idx + 1 : idx + rec->right;
-            f->small_K   = rb ? KL : KR;
-            cidx = rb ? idx + rec->right : idx + 1;
-            cK   = rb ? KR : KL;
-            cout = out + (rb ? KL : KR);           /* big child in out's tail */
-            ctmp = tmp;
+#if PIVCOH_RIGHT_FIRST
+            int first_right = 1;
+#else
+            int first_right = rb;                  /* larger child first */
+#endif
+            int first_small = (first_right != rb); /* right-first, right small */
+            f->first_small = (uint8_t)first_small;
+            f->second_idx = first_right ? idx + 1 : idx + rec->right;
+            f->second_K   = first_right ? KL : KR;
+            cidx = first_right ? idx + rec->right : idx + 1;
+            cK   = first_right ? KR : KL;
+            if (first_small) { cout = tmp; ctmp = out; }
+            else { cout = out + smallK; ctmp = tmp; } /* big in out's tail */
         }
     }
 try_child:          /* decode child (cidx, cK, cout, ctmp) */
@@ -2337,22 +2458,27 @@ try_child:          /* decode child (cidx, cK, cout, ctmp) */
     /* child finished: advance the frames that are now complete */
     while (sp > 0) {
         struct cont *f = &stk[sp - 1];
-        if (f->kind == PIVCOH__FULL && f->phase == 0) {   /* big done; do small */
+        if (f->kind == PIVCOH__FULL && f->phase == 0) {   /* start the sibling */
             f->phase = 1;
-            cidx = f->small_idx; cK = f->small_K; cout = f->tmp; ctmp = f->out;
+            int smallK = f->right_big ? f->KL : f->KR;
+            cidx = f->second_idx; cK = f->second_K;
+            if (f->first_small) {  /* second = big: out tail, partner shifted
+                                    * past the small result parked in tmp */
+                cout = f->out + smallK; ctmp = f->tmp + smallK;
+            } else {               /* second = small: classic ping-pong */
+                cout = f->tmp; ctmp = f->out;
+            }
             goto try_child;
         }
-        const uint8_t *bm;
-        if (!(p = pivcoh__read_bm(&bm, f->K, p, end))) return NULL;
         if (f->kind == PIVCOH__LEAFL) {
-            if (pivcoh__mcv(bm, f->K, f->sym, f->out + f->KL, f->KR, f->out, 1))
+            if (pivcoh__mcv(f->bm, f->K, f->sym, f->out + f->KL, f->KR, f->out, 1))
                 return NULL;
         } else {
             int smallK = f->right_big ? f->KL : f->KR;
             uint8_t *big_out = f->out + smallK;
             uint8_t *lbuf = f->right_big ? f->tmp : big_out;
             uint8_t *rbuf = f->right_big ? big_out : f->tmp;
-            if (pivcoh__mvv(bm, f->K, lbuf, f->KL, rbuf, f->KR, f->out, 1))
+            if (pivcoh__mvv(f->bm, f->K, lbuf, f->KL, rbuf, f->KR, f->out, 1))
                 return NULL;
         }
         sp--;
@@ -2390,28 +2516,36 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
      * the arena, and only the root's own merge, whose writes are exact
      * (slack = 0), targets `out`. */
     pivcoh__init_dec();
+    const uint8_t *bm;
+#if PIVCOH_DIAG_STORE_KR
     int KR;
     if (!(p = pivcoh__read_kr(&KR, N, p, end))) return -1;
+    if (!(p = pivcoh__read_bm(&bm, N, p, end))) return -1;
+#else
+    if (!(p = pivcoh__read_bm(&bm, N, p, end))) return -1;
+    int KR = pivcoh__popcnt_bits(bm, N, end);
+#endif
     int KL = N - KR;
     uint8_t *sc = scratch ? (uint8_t *)scratch
                           : (uint8_t *)malloc(PIVCOH_DECODE_SCRATCH_SIZE(N));
     if (!sc) return -1;
-    const uint8_t *bm;
 
     if (kind == PIVCOH__LEAFL) {
         /* One internal child: it decodes at the arena base with the
          * space after it as ping-pong partner. */
         if (KR > 0) p = pivcoh__dec_child(t, root->right, KR, sc, sc + KR, p, end);
-        if (p && (p = pivcoh__read_bm(&bm, N, p, end)) != NULL &&
-            pivcoh__mcv(bm, N, t->rank_to_sym[root->param], sc, KR, out, 0))
+        if (p && pivcoh__mcv(bm, N, t->rank_to_sym[root->param], sc, KR, out, 0))
             p = NULL;
     } else {
         /* FULL root, hybrid hole-reuse: both children decode into the
-         * arena's first N bytes, [larger | smaller].  The larger child
-         * (first on the wire) borrows the smaller sibling's still-empty
-         * slot as its partner — spilling past N only when a spine
-         * smaller-child outgrows it — and the smaller child follows
-         * with a fresh partner beyond N. */
+         * arena's first N bytes, [larger | smaller].  When the larger
+         * child is first on the wire it borrows the smaller sibling's
+         * still-empty slot as its partner — spilling past N only when
+         * a spine smaller-child outgrows it — and the smaller child
+         * follows with a fresh partner beyond N.  Under
+         * PIVCOH_RIGHT_FIRST a smaller right child instead runs first
+         * with the beyond-N partner, and the larger left child reuses
+         * that partner (dead once the right child completes). */
         uint8_t *lbuf, *rbuf;
         if (KR > KL) {
             rbuf = sc; lbuf = sc + KR;
@@ -2419,11 +2553,15 @@ PIVCOHDEF ptrdiff_t pivcoh_decode(const pivcoh_table *t,
             if (p && KL > 0) p = pivcoh__dec_child(t, 1, KL, lbuf, sc + N, p, end);
         } else {
             lbuf = sc; rbuf = sc + KL;
+#if PIVCOH_RIGHT_FIRST
+            if (KR > 0) p = pivcoh__dec_child(t, root->right, KR, rbuf, sc + N, p, end);
+            if (p) p = pivcoh__dec_child(t, 1, KL, lbuf, sc + N, p, end);
+#else
             p = pivcoh__dec_child(t, 1, KL, lbuf, rbuf, p, end);
             if (p && KR > 0) p = pivcoh__dec_child(t, root->right, KR, rbuf, sc + N, p, end);
+#endif
         }
-        if (p && (p = pivcoh__read_bm(&bm, N, p, end)) != NULL &&
-            pivcoh__mvv(bm, N, lbuf, KL, rbuf, KR, out, 0))
+        if (p && pivcoh__mvv(bm, N, lbuf, KL, rbuf, KR, out, 0))
             p = NULL;
     }
     if (!scratch) free(sc);
@@ -3001,25 +3139,29 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
         *pp = p + ((n * D + 7) >> 3);
         return;
     }
-    /* Decode-order record: the K_right header goes at the node's
-     * PRE-order position, the bitmap at its POST-order position, the
-     * children's regions between, larger-K child first.  The bitmap is
-     * staged across the child recursion (its stream position depends
-     * on the children's encoded sizes) at the base of this node's
-     * scratch, NOT the stack (a stack stage would be live across the
-     * recursion: ~90KB on a worst-case 64K block).  +8 pads the
-     * partition tail's 2-byte mask stores (<= 1 byte past nbytes) with
-     * margin.  The children's scratch starts 64 bytes past the right
-     * ranks: a node's tail-free left scatter overshoots up to 63 bytes
-     * past its OWN ranks region, and a right child's ranks end exactly
-     * where its scratch (holding its live stage) would otherwise
-     * begin. */
+    /* Pre-order record: the raw bitmap IS the header — it sits at the
+     * node's entry position and its popcount is the split, so the
+     * partition streams it straight to the wire (no staged bitmap, no
+     * post-order memcpy: the v4 stage existed only because the bitmap's
+     * stream position depended on the children's encoded sizes).  The
+     * partition tail's 2-byte mask stores stray <= 1 byte past nbytes
+     * into the first child's position — written before the children
+     * are, so the stray is always overwritten or lands in the
+     * out-slack the encode contract already grants.  The children's
+     * scratch starts 64 bytes past the right ranks: a node's tail-free
+     * left scatter overshoots up to 63 bytes past its OWN ranks
+     * region, and a right child's ranks end exactly where its scratch
+     * would otherwise begin. */
     int nbytes = (n + 7) >> 3;
-    uint8_t *bm_stage = tmp;
-    uint8_t *rout = tmp + nbytes + 8;
+    uint8_t *rout = tmp;
+#if PIVCOH_DIAG_STORE_KR
+    uint8_t *bmp = p + 1 + (n > 255);          /* header ahead of the bitmap */
+#else
+    uint8_t *bmp = p;
+#endif
     int n_right = (kind == PIVCOH__LEAFL)
-        ? pivcoh__part_core(ranks, n, rec->param, bm_stage, rout)
-        : pivcoh__part_full(ranks, n, rec->param, bm_stage, rout);
+        ? pivcoh__part_core(ranks, n, rec->param, bmp, rout)
+        : pivcoh__part_full(ranks, n, rec->param, bmp, rout);
     /* Define the 16 bytes past the fresh right half (inside its 64-byte
      * gap): the child's tail-free partition/pack loads read up to 15
      * bytes past its ranks region.  Phantom lanes never reach the wire
@@ -3033,14 +3175,19 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
      * defined once the root window (pivcoh_encode) is. */
     vst1q_u8(rout + n_right, vdupq_n_u8(0));
     int n_left = n - n_right;
-    *p++ = (uint8_t)n_right;                   /* K_right: 1 byte when the
-                                                * node's n fits one (the
-                                                * decoder knows n) */
-    if (n > 255)
-        *p++ = (uint8_t)(n_right >> 8);
-    *pp = p;
-    if (kind == PIVCOH__FULL && n_right > n_left) {
-        pivcoh__enc_node(t, idx + rec->right, rout, n_right, pp, rout + n_right + 64);
+#if PIVCOH_DIAG_STORE_KR
+    p[0] = (uint8_t)n_right;
+    if (n > 255) p[1] = (uint8_t)(n_right >> 8);
+#endif
+    *pp = bmp + nbytes;
+#if PIVCOH_RIGHT_FIRST
+    int right_first = (kind == PIVCOH__FULL);  /* LEAFL emits right only */
+#else
+    int right_first = (kind == PIVCOH__FULL && n_right > n_left);
+#endif
+    if (right_first) {
+        if (n_right > 0)
+            pivcoh__enc_node(t, idx + rec->right, rout, n_right, pp, rout + n_right + 64);
         if (n_left > 0)
             pivcoh__enc_node(t, idx + 1, ranks, n_left, pp, rout + n_right + 64);
     } else {
@@ -3049,9 +3196,6 @@ static void pivcoh__enc_node(const pivcoh_table *t, int idx,
         if (n_right > 0)
             pivcoh__enc_node(t, idx + rec->right, rout, n_right, pp, rout + n_right + 64);
     }
-    p = *pp;
-    memcpy(p, bm_stage, (size_t)nbytes);       /* post-order raw bitmap */
-    *pp = p + nbytes;
 }
 
 PIVCOHDEF ptrdiff_t pivcoh_encode(const pivcoh_table *t,
