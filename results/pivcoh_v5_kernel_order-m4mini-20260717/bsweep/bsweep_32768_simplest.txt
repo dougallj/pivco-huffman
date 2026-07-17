@@ -1,0 +1,15 @@
+ab_wire  B=32768 T=65535 joint=off  (A = wire v5, B = wire v4; ratio>1 = v5 faster)
+file              windows |     decA     decB  d-A/B |     encA     encB  e-A/B
+dickens.lits           20 |     9021     9414 0.958 |     5331     5412 0.985
+mozilla.lits          344 |     9784    10199 0.959 |     5430     5555 0.977
+mr.lits                48 |     8798     9233 0.953 |     4973     5064 0.982
+nci.lits               24 |    10018    10462 0.958 |     5680     5763 0.986
+ooffice.lits           52 |     7938     8375 0.948 |     4508     4619 0.976
+osdb.lits              62 |     8471     9110 0.930 |     4800     4916 0.976
+reymont.lits           10 |    12381    12073 1.026 |     6378     6586 0.968
+samba.lits             72 |     9949    10346 0.962 |     5735     5830 0.984
+sao.lits              118 |     8754     9121 0.960 |     5344     5400 0.990
+webster.lits           88 |     8932     9463 0.944 |     5252     5349 0.982
+x-ray.lits            146 |     8452     8819 0.958 |     5061     5133 0.986
+xml.lits                4 |     9582    10136 0.945 |     5618     5705 0.985
+geomean dec 0.958  enc 0.981  (12 files)
